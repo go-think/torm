@@ -33,16 +33,24 @@ func (m *Migrator) table() string {
 	return m.Table
 }
 
-// Migrate 创建迁移表（如缺失）并执行未运行迁移；同一批使用相同 batch。
+// Migrate 创建迁移表（仅缺失时，对齐 Laravel repositoryExists）并执行未运行
+// 迁移；同一批使用相同 batch，每个迁移包裹在事务中（对齐 Migrator::runMigration
+// 的 supportsSchemaTransactions 语义）。
 func (m *Migrator) Migrate() (ran []string, err error) {
 	s := m.Conn.Schema()
 
-	if err := s.CreateTable(m.table(), func(t *grammar.Blueprint) {
-		t.Increments("id")
-		t.String("migration")
-		t.Integer("batch")
-	}); err != nil {
+	exists, err := s.HasTable(m.table())
+	if err != nil {
 		return nil, err
+	}
+	if !exists {
+		if err := s.CreateTable(m.table(), func(t *grammar.Blueprint) {
+			t.Increments("id")
+			t.String("migration")
+			t.Integer("batch")
+		}); err != nil {
+			return nil, err
+		}
 	}
 
 	ranSet, err := m.ranNames()
@@ -59,7 +67,9 @@ func (m *Migrator) Migrate() (ran []string, err error) {
 		if ranSet[mig.Name] {
 			continue
 		}
-		if err := mig.Up(s); err != nil {
+		if err := m.Conn.Transaction(func(c *torm.Connection) error {
+			return mig.Up(s)
+		}); err != nil {
 			return ran, fmt.Errorf("migration [%s] failed: %w", mig.Name, err)
 		}
 		if _, _, err := m.Conn.Insert(
@@ -73,19 +83,11 @@ func (m *Migrator) Migrate() (ran []string, err error) {
 	return ran, nil
 }
 
-// Rollback 回滚最后一批迁移（逆序执行 Down）。
-func (m *Migrator) Rollback() (rolled []string, err error) {
+// RollbackBatch 回滚指定 batch（逆序执行 Down）。
+func (m *Migrator) RollbackBatch(batch int) (rolled []string, err error) {
 	s := m.Conn.Schema()
 
-	last, err := m.lastBatch()
-	if err != nil {
-		return nil, err
-	}
-	if last == 0 {
-		return nil, nil
-	}
-
-	names, err := m.batchNames(last)
+	names, err := m.batchNames(batch)
 	if err != nil {
 		return nil, err
 	}
@@ -108,6 +110,62 @@ func (m *Migrator) Rollback() (rolled []string, err error) {
 		rolled = append(rolled, name)
 	}
 	return rolled, nil
+}
+
+// Reset 回滚全部已运行迁移（按 batch 从新到旧，对齐 Migrator::reset）。
+func (m *Migrator) Reset() (rolled []string, err error) {
+	for {
+		last, err := m.lastBatch()
+		if err != nil {
+			return rolled, err
+		}
+		if last == 0 {
+			return rolled, nil
+		}
+		batchRolled, err := m.RollbackBatch(last)
+		if err != nil {
+			return rolled, err
+		}
+		if len(batchRolled) == 0 {
+			// 该批无可回滚迁移：删除记录避免死循环（对齐 Laravel 跳过语义）
+			if err := m.deleteBatch(last); err != nil {
+				return rolled, err
+			}
+			continue
+		}
+		rolled = append(rolled, batchRolled...)
+	}
+}
+
+// Refresh 回滚全部迁移后重新执行（对齐 Migrator::refresh）。
+func (m *Migrator) Refresh() (rolled []string, ran []string, err error) {
+	if rolled, err = m.Reset(); err != nil {
+		return nil, nil, err
+	}
+	if ran, err = m.Migrate(); err != nil {
+		return rolled, nil, err
+	}
+	return rolled, ran, nil
+}
+
+// deleteBatch 删除指定批次的迁移记录（Down 缺失时避免 Reset 死循环）。
+func (m *Migrator) deleteBatch(batch int) error {
+	_, err := m.Conn.Delete(
+		"delete from `"+m.table()+"` where `batch` = ?", batch,
+	)
+	return err
+}
+
+// Rollback 回滚最后一批迁移（逆序执行 Down）。
+func (m *Migrator) Rollback() (rolled []string, err error) {
+	last, err := m.lastBatch()
+	if err != nil {
+		return nil, err
+	}
+	if last == 0 {
+		return nil, nil
+	}
+	return m.RollbackBatch(last)
 }
 
 func (m *Migrator) find(name string) *Migration {

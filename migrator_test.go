@@ -17,6 +17,8 @@ func TestMigratorRunsPendingMigrations(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// HasTable（repositoryExists）：首次运行表缺失
+	st.On("select * from information_schema.tables where table_schema = ? and table_name = ? and table_type = 'BASE TABLE'", &faketb.Result{})
 	createMigTable := "create table `migrations` (`id` int unsigned not null auto_increment primary key, `migration` varchar(255) not null, `batch` int not null)"
 	st.On(createMigTable, &faketb.Result{})
 	// ranNames：空
@@ -67,6 +69,8 @@ func TestMigratorSkipsRan(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// HasTable（repositoryExists）：表已存在
+	st.On("select * from information_schema.tables where table_schema = ? and table_name = ? and table_type = 'BASE TABLE'", &faketb.Result{Rows: [][]driver.Value{{1}}})
 	st.On("create table `migrations` (`id` int unsigned not null auto_increment primary key, `migration` varchar(255) not null, `batch` int not null)", &faketb.Result{})
 	st.On("select `migration` from `migrations`", &faketb.Result{
 		Columns: []string{"migration"},

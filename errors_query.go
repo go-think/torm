@@ -48,13 +48,20 @@ func classifyError(err error) ErrorKind {
 		return KindUniqueConstraint
 	case strings.Contains(msg, "1213") && strings.Contains(msg, "deadlock"),
 		strings.Contains(msg, "1205") && strings.Contains(msg, "lock wait timeout"),
-		strings.Contains(msg, "40k01"), strings.Contains(msg, "40001"):
+		strings.Contains(msg, "40001"), strings.Contains(msg, "40p01"),
+		strings.Contains(msg, "deadlock detected"):
+		return KindDeadlock
+	case strings.Contains(msg, "database is locked"),
+		strings.Contains(msg, "the database file is locked"),
+		strings.Contains(msg, "database table is locked"):
 		return KindDeadlock
 	case strings.Contains(msg, "server has gone away"),
 		strings.Contains(msg, "connection refused"),
 		strings.Contains(msg, "connection reset"),
 		strings.Contains(msg, "bad connection"),
-		strings.Contains(msg, "broken pipe"):
+		strings.Contains(msg, "broken pipe"),
+		strings.Contains(msg, "invalid connection"),
+		strings.Contains(msg, "lost connection"):
 		return KindLostConnection
 	}
 

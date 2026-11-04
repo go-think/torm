@@ -164,3 +164,128 @@ func TestOnQueryHook(t *testing.T) {
 		t.Errorf("time = %d", got.TimeNs)
 	}
 }
+
+func TestRollbackDiscardsAfterCommitHooks(t *testing.T) {
+	conn, st := newFakeDB(t)
+	st.On("BEGIN", &fakeResult{})
+	st.On("ROLLBACK", &fakeResult{})
+
+	discarded := false
+	err := conn.Transaction(func(c *Connection) error {
+		c.AfterCommit(func() { discarded = true })
+		return errors.New("boom")
+	})
+	if err == nil {
+		t.Fatal("want error")
+	}
+	if discarded {
+		t.Error("afterCommit hooks of a rolled-back transaction must be discarded")
+	}
+
+	// 后续无关提交：新回调正常触发，被丢弃的回调不得触发
+	st.On("BEGIN", &fakeResult{})
+	st.On("COMMIT", &fakeResult{})
+	fresh := false
+	if err := conn.Transaction(func(c *Connection) error {
+		c.AfterCommit(func() { fresh = true })
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !fresh {
+		t.Error("fresh afterCommit hook should fire")
+	}
+	if discarded {
+		t.Error("discarded hooks must not run on an unrelated commit")
+	}
+}
+
+func TestAfterRollBackHookFires(t *testing.T) {
+	conn, st := newFakeDB(t)
+	st.On("BEGIN", &fakeResult{})
+	st.On("ROLLBACK", &fakeResult{})
+
+	fired := false
+	err := conn.Transaction(func(c *Connection) error {
+		c.AfterRollBack(func() { fired = true })
+		return errors.New("boom")
+	})
+	if err == nil {
+		t.Fatal("want error")
+	}
+	if !fired {
+		t.Error("afterRollBack hook should fire on rollback")
+	}
+}
+
+func TestNestedTransactionConcurrencyNoRetry(t *testing.T) {
+	conn, st := newFakeDB(t)
+	// 外层 BEGIN + SAVEPOINT，内层错误 → ROLLBACK TO SAVEPOINT，外层随后 ROLLBACK
+	st.On("SAVEPOINT trans2", &fakeResult{})
+	st.On("ROLLBACK TO SAVEPOINT trans2", &fakeResult{})
+
+	outerBegan := 0
+	innerCalls := 0
+	deadlockErr := errors.New("Error 1213 (40001): Deadlock found when trying to get lock")
+
+	err := conn.Transaction(func(c *Connection) error {
+		outerBegan++
+		return conn.Transaction(func(inner *Connection) error {
+			innerCalls++
+			return deadlockErr
+		})
+	})
+	if err == nil {
+		t.Fatal("want deadlock error to propagate")
+	}
+	if outerBegan != 1 || innerCalls != 1 {
+		t.Errorf("outerBegan=%d innerCalls=%d — nested transactions must not retry",
+			outerBegan, innerCalls)
+	}
+	if conn.TransactionLevel() != 0 {
+		t.Errorf("level = %d, want 0", conn.TransactionLevel())
+	}
+}
+
+func TestOutermostTransactionRetriesOnDeadlock(t *testing.T) {
+	conn, st := newFakeDB(t)
+	st.On("BEGIN", &fakeResult{})
+	st.On("ROLLBACK", &fakeResult{})
+	st.On("COMMIT", &fakeResult{})
+
+	calls := 0
+	deadlockErr := errors.New("SQLSTATE 40001: deadlock detected")
+	err := conn.Transaction(func(c *Connection) error {
+		calls++
+		if calls == 1 {
+			return deadlockErr
+		}
+		return nil
+	}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Errorf("calls = %d, want 2 (one retry)", calls)
+	}
+}
+
+func TestTransactionHooksRunOutsideLock(t *testing.T) {
+	conn, st := newFakeDB(t)
+	st.On("BEGIN", &fakeResult{})
+	st.On("COMMIT", &fakeResult{})
+
+	err := conn.Transaction(func(c *Connection) error {
+		c.AfterCommit(func() {
+			// 回调在锁外执行：这些调用在持锁实现下会自死锁
+			if conn.TransactionLevel() != 0 {
+				t.Errorf("level = %d inside afterCommit hook, want 0", conn.TransactionLevel())
+			}
+			c.AfterCommit(func() {})
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}

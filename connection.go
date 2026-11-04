@@ -26,7 +26,8 @@ type Connection struct {
 	txMu             sync.Mutex
 	tx               *sql.Tx
 	level            int
-	afterCommitHooks []func()
+	afterCommitHooks []txHook
+	afterRollbackHooks []txHook
 
 	// 查询事件钩子（对应 Laravel QueryExecuted/DB::listen）
 	onQuery func(QueryExecuted)
