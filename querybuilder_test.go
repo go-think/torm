@@ -1218,7 +1218,8 @@ func TestSqlServerTopAndOffsetRows(t *testing.T) {
 	}
 
 	b2 := sqlServerBuilder(t).Select("*").From("users").Limit(5).Offset(10)
-	want2 := "select * from [users] offset 10 rows fetch next 5 rows only"
+	// P0-2：offset 无 order by 时注入 order by (SELECT 0) 兜底（SqlServerGrammar.php:51-59）
+	want2 := "select * from [users] order by (SELECT 0) offset 10 rows fetch next 5 rows only"
 	if got := b2.ToSql(); got != want2 {
 		t.Errorf("sql = %s, want %s", got, want2)
 	}
@@ -1269,5 +1270,445 @@ func TestGoldenGroupLimitWithOffset(t *testing.T) {
 	want := `select * from (select "posts".*, row_number() over (partition by "user_id" order by "created_at" desc) as "laravel_row" from "posts") as "laravel_table" where "laravel_row" <= 12 and "laravel_row" > 10 order by "laravel_row"`
 	if got := b.ToSql(); got != want {
 		t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+	}
+}
+
+// ---- P0/P1 修复回归 golden ----
+
+// P0-1：PG JSON 路径数组下标取方括号内内容（PostgresGrammar.php:825-840）
+func TestGoldenPostgresJsonArrayPath(t *testing.T) {
+	runGoldenPG(t, []goldenCase{
+		{
+			name:     "array index selector",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").Where("data->tags[0]", "=", "x") },
+			wantBase: `select * from "users" where "data"->'tags'->>0 = ?`,
+		},
+		{
+			name:     "nested array indexes",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").Where("meta->a[0][1]->name", "=", "x") },
+			wantBase: `select * from "users" where "meta"->'a'->0->1->>'name' = ?`,
+		},
+	})
+}
+
+func TestGoldenPostgresJsonUpdateColumnArrayPath(t *testing.T) {
+	g := grammar.NewPostgresGrammar()
+	b := NewBuilder(nil, g).From("users").Where("id", "=", 1)
+	sql := g.CompileUpdate(b.Query, map[string]any{"data->tags[0]": "x"})
+	want := `update "users" set "data" = jsonb_set("data"::jsonb, '{"tags",0}', ?) where "id" = ?`
+	if sql != want {
+		t.Errorf("sql =\n  %s\nwant\n  %s", sql, want)
+	}
+}
+
+// P0-5：PG 带 joins/limit 的 delete 走 ctid 重写（PostgresGrammar.php:693-717）
+func TestGoldenPostgresDeleteCtid(t *testing.T) {
+	g := grammar.NewPostgresGrammar()
+
+	// limit → delete ... where ctid in (select ... limit 1)
+	b := NewBuilder(nil, g).From("users").Where("email", "=", "foo").Limit(1)
+	want := `delete from "users" where "ctid" in (select "users"."ctid" from "users" where "email" = ? limit 1)`
+	if got := g.CompileDelete(b.Query); got != want {
+		t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+	}
+
+	// joins → 子查询保留 join
+	b2 := NewBuilder(nil, g).From("users").
+		Join("contacts", "users.id", "=", "contacts.user_id").
+		Where("email", "=", "foo")
+	want2 := `delete from "users" where "ctid" in (select "users"."ctid" from "users" inner join "contacts" on "users"."id" = "contacts"."user_id" where "email" = ?)`
+	if got := g.CompileDelete(b2.Query); got != want2 {
+		t.Errorf("sql =\n  %s\nwant\n  %s", got, want2)
+	}
+
+	// 无 joins/limit → 普通 delete
+	b3 := NewBuilder(nil, g).From("users").Where("email", "=", "foo")
+	want3 := `delete from "users" where "email" = ?`
+	if got := g.CompileDelete(b3.Query); got != want3 {
+		t.Errorf("sql =\n  %s\nwant\n  %s", got, want3)
+	}
+}
+
+// P0-2：SqlServer offset 无 order by 时注入 order by (SELECT 0)
+func TestGoldenSqlServerOffsetOrderFallback(t *testing.T) {
+	b := sqlServerBuilder(t).Select("*").From("users").Offset(10)
+	want := "select * from [users] order by (SELECT 0) offset 10 rows"
+	if got := b.ToSql(); got != want {
+		t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+	}
+
+	// 已有 order by → 不注入
+	b2 := sqlServerBuilder(t).Select("*").From("users").OrderBy("email").Offset(10)
+	want2 := "select * from [users] order by [email] asc offset 10 rows"
+	if got := b2.ToSql(); got != want2 {
+		t.Errorf("sql =\n  %s\nwant\n  %s", got, want2)
+	}
+}
+
+// P0-3：SqlServer compileExists → select top 1 1 [exists]
+func TestGoldenSqlServerCompileExists(t *testing.T) {
+	g := grammar.NewSqlServerGrammar()
+	b := sqlServerBuilder(t).From("users").Where("email", "=", "foo")
+	want := "select top 1 1 [exists] from [users] where [email] = ?"
+	if got := g.CompileExists(b.Query); got != want {
+		t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+	}
+
+	// offset 无 orders 时 exists 内同样注入兜底（limit(1) 经 offset 组件输出 fetch next）
+	b2 := sqlServerBuilder(t).From("users").Offset(10)
+	want2 := "select 1 [exists] from [users] order by (SELECT 0) offset 10 rows fetch next 1 rows only"
+	if got := g.CompileExists(b2.Query); got != want2 {
+		t.Errorf("sql =\n  %s\nwant\n  %s", got, want2)
+	}
+}
+
+// P0-4：SqlServer lock 拼进 from 之后，语句末尾无 lock
+func TestGoldenSqlServerLockInFrom(t *testing.T) {
+	b := sqlServerBuilder(t).Select("*").From("users").Where("email", "=", "foo").LockForUpdate()
+	want := "select * from [users] with(rowlock,updlock,holdlock) where [email] = ?"
+	if got := b.ToSql(); got != want {
+		t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+	}
+
+	b2 := sqlServerBuilder(t).Select("*").From("users").SharedLock()
+	want2 := "select * from [users] with(rowlock,holdlock)"
+	if got := b2.ToSql(); got != want2 {
+		t.Errorf("sql =\n  %s\nwant\n  %s", got, want2)
+	}
+
+	b3 := sqlServerBuilder(t).Select("*").From("users").Lock("with (nolock)")
+	want3 := "select * from [users] with (nolock)"
+	if got := b3.ToSql(); got != want3 {
+		t.Errorf("sql =\n  %s\nwant\n  %s", got, want3)
+	}
+}
+
+// P1-5：reorder 清 unionOrders 与 order/unionOrder 段绑定
+func TestGoldenReorderClearsUnionOrders(t *testing.T) {
+	b := baseBuilder(t).Select("*").From("users")
+	b.Union(func(nb *Builder) *Builder {
+		return nb.Select("*").From("contacts")
+	})
+	b.OrderByRaw("email = ?", 1) // 有 union → 进 unionOrders / unionOrder 绑定
+	b.Reorder()
+
+	want := `(select * from "users") union (select * from "contacts")`
+	if got := b.ToSql(); got != want {
+		t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+	}
+	if got := b.GetBindings(); len(got) != 0 {
+		t.Errorf("bindings = %#v, want empty", got)
+	}
+}
+
+// ★ whereLike 族（Builder.php:1379-1432）
+func TestGoldenWhereLike(t *testing.T) {
+	runGolden(t, []goldenCase{
+		{
+			name:     "where like case insensitive base",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").WhereLike("name", "%foo%", false) },
+			wantBase: `select * from "users" where "name" like ?`, wantMySQL: "select * from `users` where `name` like ?",
+			bindings: []interface{}{"%foo%"},
+		},
+		{
+			name:     "where like case sensitive mysql",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").WhereLike("name", "%foo%", true) },
+			wantBase: "", wantMySQL: "select * from `users` where `name` like binary ?",
+		},
+		{
+			name:     "where not like",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").WhereNotLike("name", "%foo%", false) },
+			wantBase: `select * from "users" where "name" not like ?`, wantMySQL: "select * from `users` where `name` not like ?",
+		},
+		{
+			name: "or where not like",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").Where("id", "=", 1).OrWhereNotLike("name", "%foo%", false)
+			},
+			wantBase: `select * from "users" where "id" = ? or "name" not like ?`,
+		},
+	})
+}
+
+func TestGoldenWhereLikePostgres(t *testing.T) {
+	runGoldenPG(t, []goldenCase{
+		{
+			name:     "pg ilike default",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").WhereLike("name", "%foo%", false) },
+			wantBase: `select * from "users" where "name"::text ilike ?`,
+		},
+		{
+			name:     "pg like case sensitive",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").WhereLike("name", "%foo%", true) },
+			wantBase: `select * from "users" where "name"::text like ?`,
+		},
+		{
+			name:     "pg not like case sensitive",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").WhereNotLike("name", "%foo%", true) },
+			wantBase: `select * from "users" where "name"::text not like ?`,
+		},
+	})
+}
+
+// 基础方言 caseSensitive 的 like 抛错（Query\Grammars\Grammar.php:349-353）
+func TestBaseWhereLikeCaseSensitivePanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expect panic for case sensitive like on base grammar")
+		}
+	}()
+	baseBuilder(t).Select("*").From("users").WhereLike("name", "%foo%", true).ToSql()
+}
+
+// ★ whereBetweenColumns 族（Builder.php:1696-1778）
+func TestGoldenWhereBetweenColumns(t *testing.T) {
+	runGolden(t, []goldenCase{
+		{
+			name: "where between columns",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").WhereBetweenColumns("created_at", []interface{}{"updated_at", "deleted_at"})
+			},
+			wantBase:  `select * from "users" where "created_at" between "updated_at" and "deleted_at"`,
+			wantMySQL: "select * from `users` where `created_at` between `updated_at` and `deleted_at`",
+		},
+		{
+			name: "or where not between columns",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").Where("id", "=", 1).
+					OrWhereNotBetweenColumns("created_at", []interface{}{"updated_at", "deleted_at"})
+			},
+			wantBase: `select * from "users" where "id" = ? or "created_at" not between "updated_at" and "deleted_at"`,
+		},
+		{
+			name: "where not between columns",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").WhereNotBetweenColumns("created_at", []interface{}{"updated_at", "deleted_at"})
+			},
+			wantBase: `select * from "users" where "created_at" not between "updated_at" and "deleted_at"`,
+		},
+	})
+}
+
+// ★ whereExists 族 + addWhereExistsQuery（Builder.php:2199-2266）
+func TestGoldenWhereExists(t *testing.T) {
+	existsSub := func(nb *Builder) *Builder {
+		return nb.SelectRaw("1").From("orders").WhereColumn("orders.user_id", "users.id")
+	}
+	runGolden(t, []goldenCase{
+		{
+			name:     "where exists",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").WhereExists(existsSub) },
+			wantBase: `select * from "users" where exists (select 1 from "orders" where "orders"."user_id" = "users"."id")`,
+		},
+		{
+			name: "or where exists",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").Where("id", "=", 1).OrWhereExists(existsSub)
+			},
+			wantBase: `select * from "users" where "id" = ? or exists (select 1 from "orders" where "orders"."user_id" = "users"."id")`,
+		},
+		{
+			name:     "where not exists",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").WhereNotExists(existsSub) },
+			wantBase: `select * from "users" where not exists (select 1 from "orders" where "orders"."user_id" = "users"."id")`,
+		},
+		{
+			name: "or where not exists",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").Where("id", "=", 1).OrWhereNotExists(existsSub)
+			},
+			wantBase: `select * from "users" where "id" = ? or not exists (select 1 from "orders" where "orders"."user_id" = "users"."id")`,
+		},
+		{
+			name: "exists sub bindings",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").WhereExists(func(nb *Builder) *Builder {
+					return nb.SelectRaw("1").From("orders").Where("orders.total", ">", 100)
+				})
+			},
+			wantBase: `select * from "users" where exists (select 1 from "orders" where "orders"."total" > ?)`,
+			bindings: []interface{}{100},
+		},
+	})
+}
+
+// ★ whereRowValues（Builder.php:2279-2313）
+func TestGoldenWhereRowValues(t *testing.T) {
+	runGolden(t, []goldenCase{
+		{
+			name: "where row values",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").
+					WhereRowValues([]interface{}{"a", "b"}, "=", []interface{}{1, 2})
+			},
+			wantBase:  `select * from "users" where ("a", "b") = (?, ?)`,
+			wantMySQL: "select * from `users` where (`a`, `b`) = (?, ?)",
+			bindings:  []interface{}{1, 2},
+		},
+		{
+			name: "or where row values",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").Where("id", "=", 1).
+					OrWhereRowValues([]interface{}{"a", "b"}, "<", []interface{}{1, 2})
+			},
+			wantBase: `select * from "users" where "id" = ? or ("a", "b") < (?, ?)`,
+		},
+	})
+}
+
+func TestWhereRowValuesCountMismatchPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expect panic when columns/values length mismatch")
+		}
+	}()
+	baseBuilder(t).From("users").WhereRowValues([]interface{}{"a"}, "=", []interface{}{1, 2})
+}
+
+// ★ having 族（Builder.php:2830-2968）
+func TestGoldenHavingFamily(t *testing.T) {
+	runGolden(t, []goldenCase{
+		{
+			name: "having null",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").GroupBy("email").HavingNull("email")
+			},
+			wantBase:  `select * from "users" group by "email" having "email" is null`,
+			wantMySQL: "select * from `users` group by `email` having `email` is null",
+		},
+		{
+			name: "or having not null",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").GroupBy("email").HavingNull("email").OrHavingNotNull("email")
+			},
+			wantBase: `select * from "users" group by "email" having "email" is null or "email" is not null`,
+		},
+		{
+			name: "having between",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").GroupBy("category").HavingBetween("category", []interface{}{1, 5})
+			},
+			wantBase: `select * from "users" group by "category" having "category" between ? and ?`,
+			bindings: []interface{}{1, 5},
+		},
+		{
+			name: "having not between",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").GroupBy("category").HavingNotBetween("category", []interface{}{1, 5})
+			},
+			wantBase: `select * from "users" group by "category" having "category" not between ? and ?`,
+		},
+		{
+			name: "having nested",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").GroupBy("email").HavingNested(func(nb *Builder) {
+					nb.Having("email", "=", "foo").OrHaving("email", "=", "bar")
+				})
+			},
+			wantBase: `select * from "users" group by "email" having ("email" = ? or "email" = ?)`,
+			bindings: []interface{}{"foo", "bar"},
+		},
+	})
+}
+
+// ★ whereIntegerInRaw 族（Builder.php:1560-1604）
+func TestGoldenWhereIntegerInRaw(t *testing.T) {
+	runGolden(t, []goldenCase{
+		{
+			name: "where integer in raw",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").WhereIntegerInRaw("id", []interface{}{1, "2", 3})
+			},
+			wantBase:  `select * from "users" where "id" in (1, 2, 3)`,
+			wantMySQL: "select * from `users` where `id` in (1, 2, 3)",
+		},
+		{
+			name: "where integer not in raw",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").WhereIntegerNotInRaw("id", []interface{}{1, 2})
+			},
+			wantBase: `select * from "users" where "id" not in (1, 2)`,
+		},
+		{
+			name: "or where integer in raw",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").Where("email", "=", "foo").OrWhereIntegerInRaw("id", []interface{}{1})
+			},
+			wantBase: `select * from "users" where "email" = ? or "id" in (1)`,
+			bindings: []interface{}{"foo"},
+		},
+	})
+}
+
+// ★ whereNull 多列 + boolean 参数（Builder.php:1624-1633）
+func TestGoldenWhereNullMultipleColumns(t *testing.T) {
+	runGolden(t, []goldenCase{
+		{
+			name: "where null multi columns",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").WhereNull([]string{"first_name", "last_name"})
+			},
+			wantBase:  `select * from "users" where "first_name" is null and "last_name" is null`,
+			wantMySQL: "select * from `users` where `first_name` is null and `last_name` is null",
+		},
+		{
+			name: "where not null with or boolean",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").WhereNull("first_name").WhereNotNull("last_name", "or")
+			},
+			wantBase: `select * from "users" where "first_name" is null or "last_name" is not null`,
+		},
+		{
+			name: "or where null",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").Where("id", "=", 1).OrWhereNull("first_name")
+			},
+			wantBase: `select * from "users" where "id" = ? or "first_name" is null`,
+		},
+	})
+}
+
+// ★ WhereRaw / HavingRaw 的 boolean 参数（Builder.php:1291/3000）
+func TestGoldenRawBooleanParameter(t *testing.T) {
+	runGolden(t, []goldenCase{
+		{
+			name: "where raw or boolean",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").Where("id", "=", 1).WhereRaw("email = ?", "foo", "or")
+			},
+			wantBase: `select * from "users" where "id" = ? or email = ?`,
+			bindings: []interface{}{1, "foo"},
+		},
+		{
+			name: "or where raw",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").Where("id", "=", 1).OrWhereRaw("email = ?", "foo")
+			},
+			wantBase: `select * from "users" where "id" = ? or email = ?`,
+		},
+		{
+			name: "having raw or boolean",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").GroupBy("email").Having("email", "=", "x").HavingRaw("email = ?", "foo", "or")
+			},
+			wantBase: `select * from "users" group by "email" having "email" = ? or email = ?`,
+		},
+	})
+}
+
+// P1-7：insertOrIgnoreUsing golden（编译形态）
+func TestGoldenInsertOrIgnoreUsingPostgres(t *testing.T) {
+	b := pgBuilder(t).From("users")
+	sql, bindings := b.createSub(func(nb *Builder) *Builder {
+		return nb.Select("email").From("contacts").Where("x", "=", 5)
+	})
+	stmt := b.GetGrammar().CompileInsertOrIgnoreUsing(b.Query, []any{"email"}, sql)
+	want := `insert into "users" ("email") select "email" from "contacts" where "x" = ? on conflict do nothing`
+	if stmt != want {
+		t.Errorf("sql =\n  %s\nwant\n  %s", stmt, want)
+	}
+	if got := cleanBindings(bindings); len(got) != 1 || got[0] != 5 {
+		t.Errorf("bindings = %#v", got)
 	}
 }

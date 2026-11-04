@@ -488,11 +488,14 @@ func (b *Builder) OrWhereColumn(first interface{}, args ...interface{}) *Builder
 }
 
 // WhereRaw / OrWhereRaw
+// 对应 Laravel whereRaw($sql, $bindings=[], $boolean='and')：可选末位 string 参数
+// 为 boolean 关键字（and / or / and not / or not）。
 func (b *Builder) WhereRaw(sql interface{}, bindings ...interface{}) *Builder {
+	boolean, bindings := splitRawBoolean("and", bindings)
 	b.Query.Wheres = append(b.Query.Wheres, &query.Where{
 		Type:    "Raw",
 		Sql:     sql,
-		Boolean: "and",
+		Boolean: boolean,
 	})
 	if len(bindings) != 0 {
 		b.AddBinding(bindings, "where")
@@ -501,15 +504,29 @@ func (b *Builder) WhereRaw(sql interface{}, bindings ...interface{}) *Builder {
 }
 
 func (b *Builder) OrWhereRaw(sql interface{}, bindings ...interface{}) *Builder {
+	boolean, bindings := splitRawBoolean("or", bindings)
 	b.Query.Wheres = append(b.Query.Wheres, &query.Where{
 		Type:    "Raw",
 		Sql:     sql,
-		Boolean: "or",
+		Boolean: boolean,
 	})
 	if len(bindings) != 0 {
 		b.AddBinding(bindings, "where")
 	}
 	return b
+}
+
+// splitRawBoolean 识别变参末位的 boolean 关键字（对应 Laravel 的显式 $boolean 形参）。
+func splitRawBoolean(defaultBoolean string, bindings []interface{}) (string, []interface{}) {
+	if n := len(bindings); n > 0 {
+		if s, ok := bindings[n-1].(string); ok {
+			switch s {
+			case "and", "or", "and not", "or not":
+				return s, bindings[:n-1]
+			}
+		}
+	}
+	return defaultBoolean, bindings
 }
 
 // WhereIn / OrWhereIn / WhereNotIn / OrWhereNotIn
@@ -584,34 +601,170 @@ func (b *Builder) whereInImpl(column interface{}, values interface{}, typ string
 	return b
 }
 
-// WhereNull / OrWhereNull / WhereNotNull / OrWhereNotNull
-func (b *Builder) WhereNull(column interface{}, args ...interface{}) *Builder {
-	return b.whereNullImpl(column, "and", false)
+// WhereIntegerInRaw / OrWhereIntegerInRaw / WhereIntegerNotInRaw / OrWhereIntegerNotInRaw
+// 对应 Laravel Builder.php:1560-1604：整型值以 raw 形式内联进 SQL，不产生绑定。
+func (b *Builder) WhereIntegerInRaw(column interface{}, values []interface{}) *Builder {
+	return b.whereIntegerInRawImpl(column, values, "and", false)
 }
 
-func (b *Builder) OrWhereNull(column interface{}) *Builder {
-	return b.whereNullImpl(column, "or", false)
+func (b *Builder) OrWhereIntegerInRaw(column interface{}, values []interface{}) *Builder {
+	return b.whereIntegerInRawImpl(column, values, "or", false)
 }
 
-func (b *Builder) WhereNotNull(column interface{}, args ...interface{}) *Builder {
-	return b.whereNullImpl(column, "and", true)
+func (b *Builder) WhereIntegerNotInRaw(column interface{}, values []interface{}) *Builder {
+	return b.whereIntegerInRawImpl(column, values, "and", true)
 }
 
-func (b *Builder) OrWhereNotNull(column interface{}) *Builder {
-	return b.whereNullImpl(column, "or", true)
+func (b *Builder) OrWhereIntegerNotInRaw(column interface{}, values []interface{}) *Builder {
+	return b.whereIntegerInRawImpl(column, values, "or", true)
 }
 
-func (b *Builder) whereNullImpl(column interface{}, boolean string, not bool) *Builder {
-	typ := "Null"
+func (b *Builder) whereIntegerInRawImpl(column interface{}, values []interface{}, boolean string, not bool) *Builder {
+	typ := "InRaw"
 	if not {
-		typ = "NotNull"
+		typ = "NotInRaw"
+	}
+	ints := make([]interface{}, 0, len(values))
+	for _, v := range flattenBindings(values) {
+		ints = append(ints, toIntValue(v))
 	}
 	b.Query.Wheres = append(b.Query.Wheres, &query.Where{
 		Type:    typ,
 		Column:  column,
+		Values:  ints,
 		Boolean: boolean,
 	})
 	return b
+}
+
+// toIntValue 对应 Laravel 的 (int) enum_value($value) 强转。
+func toIntValue(v interface{}) interface{} {
+	switch n := v.(type) {
+	case int:
+		return int64(n)
+	case int8:
+		return int64(n)
+	case int16:
+		return int64(n)
+	case int32:
+		return int64(n)
+	case int64:
+		return n
+	case uint:
+		return int64(n)
+	case uint8:
+		return int64(n)
+	case uint16:
+		return int64(n)
+	case uint32:
+		return int64(n)
+	case uint64:
+		return int64(n)
+	case float32:
+		return int64(n)
+	case float64:
+		return int64(n)
+	case string:
+		if parsed, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64); err == nil {
+			return parsed
+		}
+		return int64(0)
+	default:
+		return int64(0)
+	}
+}
+
+// WhereLike / OrWhereLike / WhereNotLike / OrWhereNotLike
+// 对应 Laravel Builder.php:1379-1432。
+func (b *Builder) WhereLike(column interface{}, value interface{}, caseSensitive bool) *Builder {
+	return b.addWhereLike(column, value, caseSensitive, "and", false)
+}
+
+func (b *Builder) OrWhereLike(column interface{}, value interface{}, caseSensitive bool) *Builder {
+	return b.addWhereLike(column, value, caseSensitive, "or", false)
+}
+
+func (b *Builder) WhereNotLike(column interface{}, value interface{}, caseSensitive bool) *Builder {
+	return b.addWhereLike(column, value, caseSensitive, "and", true)
+}
+
+func (b *Builder) OrWhereNotLike(column interface{}, value interface{}, caseSensitive bool) *Builder {
+	return b.addWhereLike(column, value, caseSensitive, "or", true)
+}
+
+func (b *Builder) addWhereLike(column interface{}, value interface{}, caseSensitive bool, boolean string, not bool) *Builder {
+	b.Query.Wheres = append(b.Query.Wheres, &query.Where{
+		Type:          "Like",
+		Column:        column,
+		Value:         value,
+		CaseSensitive: caseSensitive,
+		Boolean:       boolean,
+		Not:           not,
+	})
+	b.AddBinding(value, "where")
+	return b
+}
+
+// WhereNull / OrWhereNull / WhereNotNull / OrWhereNotNull
+// 对应 Laravel whereNull($columns, $boolean='and', $not=false)：columns 支持单列、
+// []string / []interface{} 多列（每列一条 where），第二参数为 boolean。
+func (b *Builder) WhereNull(columns interface{}, args ...interface{}) *Builder {
+	boolean := "and"
+	if len(args) > 0 {
+		if s, ok := args[0].(string); ok {
+			boolean = s
+		}
+	}
+	return b.whereNullImpl(columns, boolean, false)
+}
+
+func (b *Builder) OrWhereNull(columns interface{}) *Builder {
+	return b.whereNullImpl(columns, "or", false)
+}
+
+func (b *Builder) WhereNotNull(columns interface{}, args ...interface{}) *Builder {
+	boolean := "and"
+	if len(args) > 0 {
+		if s, ok := args[0].(string); ok {
+			boolean = s
+		}
+	}
+	return b.whereNullImpl(columns, boolean, true)
+}
+
+func (b *Builder) OrWhereNotNull(columns interface{}) *Builder {
+	return b.whereNullImpl(columns, "or", true)
+}
+
+func (b *Builder) whereNullImpl(columns interface{}, boolean string, not bool) *Builder {
+	typ := "Null"
+	if not {
+		typ = "NotNull"
+	}
+	for _, column := range wrapColumns(columns) {
+		b.Query.Wheres = append(b.Query.Wheres, &query.Where{
+			Type:    typ,
+			Column:  column,
+			Boolean: boolean,
+		})
+	}
+	return b
+}
+
+// wrapColumns 把 string / []string / []interface{} 归一为 []interface{}（Arr::wrap）。
+func wrapColumns(columns interface{}) []interface{} {
+	switch c := columns.(type) {
+	case []string:
+		out := make([]interface{}, len(c))
+		for i, v := range c {
+			out[i] = v
+		}
+		return out
+	case []interface{}:
+		return c
+	default:
+		return []interface{}{columns}
+	}
 }
 
 // WhereBetween / OrWhereBetween / WhereNotBetween / OrWhereNotBetween
@@ -668,6 +821,41 @@ func (b *Builder) whereBetweenImpl(column interface{}, values []interface{}, boo
 	return b
 }
 
+// WhereBetweenColumns / OrWhereBetweenColumns / WhereNotBetweenColumns / OrWhereNotBetweenColumns
+// 对应 Laravel Builder.php:1696-1714：两列比较的 between，values 为列名，不产生绑定。
+func (b *Builder) WhereBetweenColumns(column interface{}, values []interface{}) *Builder {
+	return b.whereBetweenColumnsImpl(column, values, "and", false)
+}
+
+func (b *Builder) OrWhereBetweenColumns(column interface{}, values []interface{}) *Builder {
+	return b.whereBetweenColumnsImpl(column, values, "or", false)
+}
+
+func (b *Builder) WhereNotBetweenColumns(column interface{}, values []interface{}) *Builder {
+	return b.whereBetweenColumnsImpl(column, values, "and", true)
+}
+
+func (b *Builder) OrWhereNotBetweenColumns(column interface{}, values []interface{}) *Builder {
+	return b.whereBetweenColumnsImpl(column, values, "or", true)
+}
+
+func (b *Builder) whereBetweenColumnsImpl(column interface{}, values []interface{}, boolean string, not bool) *Builder {
+	// 子查询列：whereBetweenColumns(sub, values)
+	if b.isQueryable(column) {
+		sql, bindings := b.createSub(column)
+		b.AddBinding(bindings, "where")
+		return b.whereBetweenColumnsImpl(grammar.NewExpression("("+sql+")"), values, boolean, not)
+	}
+	b.Query.Wheres = append(b.Query.Wheres, &query.Where{
+		Type:    "betweenColumns",
+		Column:  column,
+		Values:  values,
+		Boolean: boolean,
+		Not:     not,
+	})
+	return b
+}
+
 // When / Unless 条件执行（对应 Laravel 的 when/unless；Go 侧条件为 bool）。
 func (b *Builder) When(condition bool, callback func(*Builder), defaultCallback ...func(*Builder)) *Builder {
 	if condition {
@@ -714,6 +902,83 @@ func (b *Builder) addNestedWhereQuery(sub *Builder, boolean string) *Builder {
 		// 嵌套子查询的 where 绑定并入父查询（对应 Laravel 的 addBinding 合并）
 		b.AddBinding(sub.GetRawBindings()["where"], "where")
 	}
+	return b
+}
+
+// WhereExists / OrWhereExists / WhereNotExists / OrWhereNotExists
+// 对应 Laravel Builder.php:2199-2253；q 可为 func(*Builder)/func(*Builder) *Builder/
+// *Builder/*query.Query 闭包或子查询。
+func (b *Builder) WhereExists(q interface{}) *Builder {
+	return b.whereExistsImpl(q, "and", false)
+}
+
+func (b *Builder) OrWhereExists(q interface{}) *Builder {
+	return b.whereExistsImpl(q, "or", false)
+}
+
+func (b *Builder) WhereNotExists(q interface{}) *Builder {
+	return b.whereExistsImpl(q, "and", true)
+}
+
+func (b *Builder) OrWhereNotExists(q interface{}) *Builder {
+	return b.whereExistsImpl(q, "or", true)
+}
+
+func (b *Builder) whereExistsImpl(q interface{}, boolean string, not bool) *Builder {
+	// 闭包：在全新的子 builder 上构造（对应 Laravel 的 forSubQuery）
+	switch q.(type) {
+	case func(*Builder), func(*Builder) *Builder:
+		sub := NewBuilder(b.Connection, b.grammar)
+		sub = applySubQuery(sub, q)
+		return b.AddWhereExistsQuery(sub, boolean, not)
+	default:
+		sub, ok := q.(*Builder)
+		if !ok {
+			nb := NewBuilder(b.Connection, b.grammar)
+			nb = applySubQuery(nb, q)
+			sub = nb
+		}
+		return b.AddWhereExistsQuery(sub, boolean, not)
+	}
+}
+
+// AddWhereExistsQuery 对应 Laravel Builder.php:2260-2269。
+func (b *Builder) AddWhereExistsQuery(sub *Builder, boolean string, not bool) *Builder {
+	typ := "Exists"
+	if not {
+		typ = "NotExists"
+	}
+	b.Query.Wheres = append(b.Query.Wheres, &query.Where{
+		Type:    typ,
+		Query:   sub.Query,
+		Boolean: boolean,
+	})
+	b.AddBinding(sub.GetBindings(), "where")
+	return b
+}
+
+// WhereRowValues / OrWhereRowValues 对应 Laravel Builder.php:2279-2313：
+// 行值比较 (a, b) = (?, ?)；列数与值数必须一致。
+func (b *Builder) WhereRowValues(columns []interface{}, operator string, values []interface{}) *Builder {
+	return b.whereRowValuesImpl(columns, operator, values, "and")
+}
+
+func (b *Builder) OrWhereRowValues(columns []interface{}, operator string, values []interface{}) *Builder {
+	return b.whereRowValuesImpl(columns, operator, values, "or")
+}
+
+func (b *Builder) whereRowValuesImpl(columns []interface{}, operator string, values []interface{}, boolean string) *Builder {
+	if len(columns) != len(values) {
+		panic(ErrInvalid{"The number of columns must match the number of values"})
+	}
+	b.Query.Wheres = append(b.Query.Wheres, &query.Where{
+		Type:     "RowValues",
+		Columns:  columns,
+		Operator: operator,
+		Values:   values,
+		Boolean:  boolean,
+	})
+	b.AddBinding(cleanBindings(values), "where")
 	return b
 }
 
@@ -779,11 +1044,14 @@ func (b *Builder) OrHaving(column interface{}, args ...interface{}) *Builder {
 	return b
 }
 
+// HavingRaw / OrHavingRaw（对应 Laravel havingRaw($sql, $bindings=[], $boolean='and)：
+// 可选末位 string 参数为 boolean 关键字。
 func (b *Builder) HavingRaw(sql interface{}, bindings ...interface{}) *Builder {
+	boolean, bindings := splitRawBoolean("and", bindings)
 	b.Query.Havings = append(b.Query.Havings, &query.Where{
 		Type:    "Raw",
 		Sql:     sql,
-		Boolean: "and",
+		Boolean: boolean,
 	})
 	if len(bindings) != 0 {
 		b.AddBinding(bindings, "having")
@@ -792,15 +1060,139 @@ func (b *Builder) HavingRaw(sql interface{}, bindings ...interface{}) *Builder {
 }
 
 func (b *Builder) OrHavingRaw(sql interface{}, bindings ...interface{}) *Builder {
+	boolean, bindings := splitRawBoolean("or", bindings)
 	b.Query.Havings = append(b.Query.Havings, &query.Where{
 		Type:    "Raw",
 		Sql:     sql,
-		Boolean: "or",
+		Boolean: boolean,
 	})
 	if len(bindings) != 0 {
 		b.AddBinding(bindings, "having")
 	}
 	return b
+}
+
+// HavingNested / OrHavingNested / addNestedHavingQuery 对应 Laravel Builder.php:2830-2858。
+func (b *Builder) HavingNested(callback func(*Builder), boolean ...string) *Builder {
+	bol := "and"
+	if len(boolean) > 0 && boolean[0] != "" {
+		bol = boolean[0]
+	}
+	sub := b.forNestedWhere()
+	callback(sub)
+	return b.addNestedHavingQuery(sub, bol)
+}
+
+func (b *Builder) OrHavingNested(callback func(*Builder)) *Builder {
+	return b.HavingNested(callback, "or")
+}
+
+func (b *Builder) addNestedHavingQuery(sub *Builder, boolean string) *Builder {
+	if len(sub.Query.Havings) > 0 {
+		b.Query.Havings = append(b.Query.Havings, &query.Where{
+			Type:    "Nested",
+			Query:   sub.Query,
+			Boolean: boolean,
+		})
+		b.AddBinding(sub.GetRawBindings()["having"], "having")
+	}
+	return b
+}
+
+// HavingNull / OrHavingNull / HavingNotNull / OrHavingNotNull 对应 Laravel
+// Builder.php:2867-2913：columns 支持多列（每列一条 having）。
+func (b *Builder) HavingNull(columns interface{}, args ...interface{}) *Builder {
+	boolean := "and"
+	if len(args) > 0 {
+		if s, ok := args[0].(string); ok {
+			boolean = s
+		}
+	}
+	return b.havingNullImpl(columns, boolean, false)
+}
+
+func (b *Builder) OrHavingNull(columns interface{}) *Builder {
+	return b.havingNullImpl(columns, "or", false)
+}
+
+func (b *Builder) HavingNotNull(columns interface{}, args ...interface{}) *Builder {
+	boolean := "and"
+	if len(args) > 0 {
+		if s, ok := args[0].(string); ok {
+			boolean = s
+		}
+	}
+	return b.havingNullImpl(columns, boolean, true)
+}
+
+func (b *Builder) OrHavingNotNull(columns interface{}) *Builder {
+	return b.havingNullImpl(columns, "or", true)
+}
+
+func (b *Builder) havingNullImpl(columns interface{}, boolean string, not bool) *Builder {
+	typ := "Null"
+	if not {
+		typ = "NotNull"
+	}
+	for _, column := range wrapColumns(columns) {
+		b.Query.Havings = append(b.Query.Havings, &query.Where{
+			Type:    typ,
+			Column:  column,
+			Boolean: boolean,
+		})
+	}
+	return b
+}
+
+// HavingBetween / OrHavingBetween / HavingNotBetween / OrHavingNotBetween
+// 对应 Laravel Builder.php:2921-2950：绑定取 flatten 后前两个。
+func (b *Builder) HavingBetween(column interface{}, values []interface{}) *Builder {
+	return b.havingBetweenImpl(column, values, "and", false)
+}
+
+func (b *Builder) OrHavingBetween(column interface{}, values []interface{}) *Builder {
+	return b.havingBetweenImpl(column, values, "or", false)
+}
+
+func (b *Builder) HavingNotBetween(column interface{}, values []interface{}) *Builder {
+	return b.havingBetweenImpl(column, values, "and", true)
+}
+
+func (b *Builder) OrHavingNotBetween(column interface{}, values []interface{}) *Builder {
+	return b.havingBetweenImpl(column, values, "or", true)
+}
+
+func (b *Builder) havingBetweenImpl(column interface{}, values []interface{}, boolean string, not bool) *Builder {
+	b.Query.Havings = append(b.Query.Havings, &query.Where{
+		Type:    "between",
+		Column:  column,
+		Values:  values,
+		Boolean: boolean,
+		Not:     not,
+	})
+	flat := flattenBindings(values)
+	if len(flat) > 2 {
+		flat = flat[:2]
+	}
+	b.AddBinding(cleanBindings(flat), "having")
+	return b
+}
+
+// flattenBindings 对应 Laravel 的 Arr::flatten（一层层展平嵌套数组）。
+func flattenBindings(values []interface{}) []interface{} {
+	var out []interface{}
+	var flatten func(items []interface{})
+	flatten = func(items []interface{}) {
+		for _, v := range items {
+			if inner, ok := v.([]interface{}); ok {
+				flatten(inner)
+				continue
+			}
+			out = append(out, v)
+		}
+	}
+	flatten(values)
+	return out
 }
 
 // ---- Order ----
@@ -868,9 +1260,13 @@ func (b *Builder) InRandomOrder(seed ...interface{}) *Builder {
 	return b
 }
 
-// Reorder 清除或重设排序：Reorder() 清空；Reorder(col, dir...) 重设。
+// Reorder 清除或重设排序（对应 Laravel Builder.php:3319-3331）：
+// 清空 orders、unionOrders 及 order/unionOrder 段绑定；Reorder(col, dir...) 重设。
 func (b *Builder) Reorder(column ...interface{}) *Builder {
 	b.Query.Orders = nil
+	b.Query.UnionOrders = nil
+	b.Bindings["order"] = nil
+	b.Bindings["unionOrder"] = nil
 	if len(column) == 0 {
 		return b
 	}
@@ -954,14 +1350,16 @@ func (b *Builder) resolveUnionQuery(q interface{}) *Builder {
 
 // ---- 聚合 ----
 
-// SetAggregate 设置聚合组件（对应 Laravel 公开的 setAggregate）。
+// SetAggregate 设置聚合组件（对应 Laravel 公开的 setAggregate）：
+// groups 为空时清除 orders 与 order 段绑定（Laravel Builder.php:4166-4176）。
 func (b *Builder) SetAggregate(function string, columns []interface{}) *Builder {
 	if len(columns) == 0 {
 		columns = []interface{}{"*"}
 	}
 	b.Query.Aggregate = &query.Aggregate{Function: function, Columns: columns}
-	if b.Query.Distinct != nil && len(columns) > 0 && !isWildcardColumns(columns) {
-		// Laravel 保持 distinct 由 compileAggregate 处理，这里无需额外操作
+	if len(b.Query.Groups) == 0 {
+		b.Query.Orders = nil
+		b.Bindings["order"] = nil
 	}
 	return b
 }
@@ -970,10 +1368,15 @@ func isWildcardColumns(columns []interface{}) bool {
 	return len(columns) == 1 && fmtString(columns[0]) == "*"
 }
 
-// Aggregate 在克隆上执行聚合，不污染原查询（对应 Laravel 的 cloneWithout 语义；
-// 与 Laravel 一致：不清除 orders/limit）。
+// Aggregate 在克隆上执行聚合，不污染原查询（对应 Laravel Builder.php:4124-4134）：
+// 无 unions/havings 时 cloneWithout(['columns']) + cloneWithoutBindings(['select'])，
+// 再由 setAggregate 在 groups 为空时清除 orders 与 order 段绑定。
 func (b *Builder) Aggregate(function string, columns []interface{}, dest ...interface{}) error {
 	nb := b.Clone()
+	if len(nb.Query.Unions) == 0 && len(nb.Query.Havings) == 0 {
+		nb.Query.Columns = nil
+		nb.Bindings["select"] = nil
+	}
 	nb.SetAggregate(function, columns)
 	return nb.Scan(dest...)
 }
@@ -1112,25 +1515,50 @@ func (b *Builder) InsertOrIgnore(values []interface{}) (int64, error) {
 	return n, err
 }
 
-// InsertUsing insert ... select（子查询绑定并入 where 段之前）。
+// InsertUsing insert ... select（对应 Laravel Builder.php:4322-4332）：
+// 只使用子查询的 cleanBindings 执行，不并入 builder 的绑定段。
 func (b *Builder) InsertUsing(columns []string, q interface{}) (int64, error) {
 	sql, bindings := b.createSub(q)
-	b.AddBinding(bindings, "where")
 	cols := make([]interface{}, len(columns))
 	for i, c := range columns {
 		cols[i] = c
 	}
 	stmt := b.grammar.CompileInsertUsing(b.Query, cols, sql)
-	binds := b.GetBindings()
-	n, _, err := b.Connection.Insert(stmt, binds...)
+	n, _, err := b.Connection.Insert(stmt, cleanBindings(bindings)...)
 	return n, err
 }
 
-// Upsert upsert：uniqueBy 为唯一键列，update 为冲突时更新的列。
+// InsertOrIgnoreUsing insert ignore ... select（对应 Laravel Builder.php:4340-4350）。
+func (b *Builder) InsertOrIgnoreUsing(columns []string, q interface{}) (int64, error) {
+	sql, bindings := b.createSub(q)
+	cols := make([]interface{}, len(columns))
+	for i, c := range columns {
+		cols[i] = c
+	}
+	stmt := b.grammar.CompileInsertOrIgnoreUsing(b.Query, cols, sql)
+	n, _, err := b.Connection.Insert(stmt, cleanBindings(bindings)...)
+	return n, err
+}
+
+// Upsert upsert（对应 Laravel Builder.php:4434-4473）：uniqueBy 为唯一键列，update 为冲突时更新的列。
+// update 为空切片 → 普通 insert；update 为 nil → 全列更新（取首行的列）；
+// uniqueBy 为空抛错；values 为空返回 0。
 // map 行按 key 排序（对应 Laravel 的 ksort）；query.Row 保序。
 func (b *Builder) Upsert(values []interface{}, uniqueBy, update []string) (int64, error) {
-	if len(update) == 0 {
-		return b.InsertOrIgnore(values)
+	if len(uniqueBy) == 0 {
+		return 0, ErrInvalid{"The unique columns must not be empty."}
+	}
+	if len(values) == 0 {
+		return 0, nil
+	}
+	if update != nil && len(update) == 0 {
+		n, _, err := b.Inserts(values)
+		return n, err
+	}
+	if update == nil {
+		// 对应 Laravel 的 $update = array_keys(array_first($values))
+		first := normalizeRows(values[:1])[0]
+		update = first.Columns()
 	}
 	sql, bindings := b.grammar.CompileUpsert(b.Query, normalizeRows(values), uniqueBy, update)
 	n, _, err := b.Connection.Insert(sql, bindings...)

@@ -303,3 +303,190 @@ func TestExecExists(t *testing.T) {
 		t.Error("expect doesntExist")
 	}
 }
+
+// ---- P0/P1 修复回归（执行级，faketb 打桩）----
+
+// P0-6：聚合在 groups 为空时清除 orders 与 order 段绑定；无 unions/havings 时
+// 清除 columns 与 select 段绑定（Laravel Builder.php:4124-4184）。
+func TestExecAggregateClearsOrders(t *testing.T) {
+	b, st := execBaseBuilder(t)
+	sql := `select count(*) as "aggregate" from "users" where "x" = ?`
+	st.On(sql, &fakeResult{Columns: []string{"aggregate"}, Rows: [][]driver.Value{{int64(7)}}})
+	var n int64
+	if err := b.From("users").OrderBy("email").Where("x", "=", 1).Count(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 7 {
+		t.Fatalf("count = %d", n)
+	}
+	st.LastCall(t, sql) // 不允许出现 order by "email"
+
+	// select 段绑定同时被清除
+	b2, st2 := execBaseBuilder(t)
+	sqlNoWhere := `select count(*) as "aggregate" from "users"`
+	st2.On(sqlNoWhere, &fakeResult{Columns: []string{"aggregate"}, Rows: [][]driver.Value{{int64(7)}}})
+	var n2 int64
+	if err := b2.From("users").SelectRaw("price * ? as p", 2).Count(&n2); err != nil {
+		t.Fatal(err)
+	}
+	call := st2.LastCall(t, sqlNoWhere)
+	if len(call.Args) != 0 {
+		t.Errorf("args = %#v, want empty (select bindings cleared)", call.Args)
+	}
+}
+
+func TestExecAggregateKeepsOrdersWithGroups(t *testing.T) {
+	b, st := execBaseBuilder(t)
+	sql := `select count(*) as "aggregate" from "users" group by "account_id" order by "email" asc`
+	st.On(sql, &fakeResult{Columns: []string{"aggregate"}, Rows: [][]driver.Value{{int64(1)}}})
+	var n int64
+	if err := b.From("users").GroupBy("account_id").OrderBy("email").Count(&n); err != nil {
+		t.Fatal(err)
+	}
+	st.LastCall(t, sql)
+}
+
+// P0-3/P0-4 执行级：SqlServer exists / lock 形态。
+func TestExecSqlServerExistsAndLock(t *testing.T) {
+	conn, st := newFakeDB(t)
+	b := conn.Query()
+	b.grammar = grammar.NewSqlServerGrammar()
+
+	sql := "select top 1 1 [exists] from [users] where [email] = ?"
+	st.On(sql, &fakeResult{Columns: []string{"exists"}, Rows: [][]driver.Value{{int64(1)}}})
+	got, err := b.From("users").Where("email", "=", "foo").Exists()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got {
+		t.Error("expect exists")
+	}
+	call := st.LastCall(t, sql)
+	if !reflect.DeepEqual(asAny(call.Args), []any{"foo"}) {
+		t.Errorf("args = %#v", call.Args)
+	}
+
+	// lock 拼 from 之后（新 builder，避免叠加 exists 的 where）
+	sql2 := "select * from [users] with(rowlock,updlock,holdlock) where [email] = ?"
+	st.On(sql2, &fakeResult{Columns: []string{"id", "email"}, Rows: [][]driver.Value{{int64(1), "foo"}}})
+	type lockRow struct {
+		Id    int64  `torm:"column:id"`
+		Email string `torm:"column:email"`
+	}
+	var dest []lockRow
+	b2 := conn.Query()
+	b2.grammar = grammar.NewSqlServerGrammar()
+	if err := b2.From("users").Where("email", "=", "foo").LockForUpdate().Get(&dest); err != nil {
+		t.Fatal(err)
+	}
+	st.LastCall(t, sql2)
+}
+
+// P0-5 执行级：PG 带 limit 的 delete 走 ctid 重写。
+func TestExecPostgresDeleteCtid(t *testing.T) {
+	conn, st := newFakeDB(t)
+	b := conn.Query()
+	b.grammar = grammar.NewPostgresGrammar()
+
+	sql := `delete from "users" where "ctid" in (select "users"."ctid" from "users" where "email" = ? limit 1)`
+	st.On(sql, &fakeResult{Affected: 1})
+	if _, err := b.From("users").Where("email", "=", "foo").Limit(1).Delete(); err != nil {
+		t.Fatal(err)
+	}
+	call := st.LastCall(t, sql)
+	if !reflect.DeepEqual(asAny(call.Args), []any{"foo"}) {
+		t.Errorf("args = %#v", call.Args)
+	}
+}
+
+// P1-5 执行级：reorder 清空 order 段绑定。
+func TestExecReorderClearsOrderBindings(t *testing.T) {
+	b, st := execBaseBuilder(t)
+	sql := `select * from "users" order by "name" asc`
+	st.On(sql, &fakeResult{Columns: []string{"id"}, Rows: nil})
+	var dest []map[string]any
+	if err := b.From("users").OrderByRaw("email = ?", 1).Reorder("name").Get(&dest); err != nil {
+		t.Fatal(err)
+	}
+	call := st.LastCall(t, sql)
+	if len(call.Args) != 0 {
+		t.Errorf("args = %#v, want empty", call.Args)
+	}
+}
+
+// P1-6 执行级：upsert 空 update 语义（Builder.php:4434-4473）。
+func TestExecUpsertEmptyUpdateSemantics(t *testing.T) {
+	// update 为空切片 → 普通 insert
+	bm, stm := execMySQLBuilder(t)
+	sql := "insert into `users` (`email`) values (?)"
+	stm.On(sql, &fakeResult{Affected: 1})
+	if _, err := bm.From("users").Upsert([]interface{}{
+		query.Row{{Key: "email", Value: "foo"}},
+	}, []string{"email"}, []string{}); err != nil {
+		t.Fatal(err)
+	}
+	stm.LastCall(t, sql)
+
+	// update 为 nil → 全列更新（取首行列）
+	bm2, stm2 := execMySQLBuilder(t)
+	sql2 := "insert into `users` (`email`, `name`) values (?, ?) on duplicate key update `email` = values(`email`), `name` = values(`name`)"
+	stm2.On(sql2, &fakeResult{Affected: 1})
+	if _, err := bm2.From("users").Upsert([]interface{}{
+		query.Row{{Key: "email", Value: "foo"}, {Key: "name", Value: "bar"}},
+	}, []string{"email"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	call := stm2.LastCall(t, sql2)
+	if !reflect.DeepEqual(asAny(call.Args), []any{"foo", "bar"}) {
+		t.Errorf("args = %#v", call.Args)
+	}
+
+	// uniqueBy 为空 → 报错
+	bm3, _ := execMySQLBuilder(t)
+	if _, err := bm3.From("users").Upsert([]interface{}{
+		query.Row{{Key: "email", Value: "foo"}},
+	}, nil, nil); err == nil {
+		t.Error("expect error for empty uniqueBy")
+	}
+
+	// values 为空 → 返回 0，不执行 SQL
+	bm4, _ := execMySQLBuilder(t)
+	if n, err := bm4.From("users").Upsert(nil, []string{"email"}, nil); err != nil || n != 0 {
+		t.Errorf("n=%d err=%v", n, err)
+	}
+}
+
+// P1-7 执行级：insertUsing 只使用子查询绑定，builder 自身的 where 绑定不并入。
+func TestExecInsertUsingSubBindingsOnly(t *testing.T) {
+	b, st := execBaseBuilder(t)
+	sql := `insert into "users" ("email") select "email" from "contacts" where "x" = ?`
+	st.On(sql, &fakeResult{Affected: 1})
+	if _, err := b.From("users").Where("owner", "=", 9).InsertUsing([]string{"email"}, func(nq *Builder) *Builder {
+		return nq.Select("email").From("contacts").Where("x", "=", 5)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	call := st.LastCall(t, sql)
+	if !reflect.DeepEqual(asAny(call.Args), []any{int64(5)}) {
+		t.Errorf("args = %#v, want only sub binding [5]", call.Args)
+	}
+}
+
+// ★ 执行级：insertOrIgnoreUsing 入口（PG）。
+func TestExecInsertOrIgnoreUsing(t *testing.T) {
+	conn, st := newFakeDB(t)
+	b := conn.Query()
+	b.grammar = grammar.NewPostgresGrammar()
+
+	sql := `insert into "users" ("email") select "email" from "contacts" where "x" = ? on conflict do nothing`
+	st.On(sql, &fakeResult{Affected: 1})
+	if _, err := b.From("users").InsertOrIgnoreUsing([]string{"email"}, func(nq *Builder) *Builder {
+		return nq.Select("email").From("contacts").Where("x", "=", 5)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	call := st.LastCall(t, sql)
+	if !reflect.DeepEqual(asAny(call.Args), []any{int64(5)}) {
+		t.Errorf("args = %#v", call.Args)
+	}
+}

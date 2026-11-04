@@ -186,10 +186,7 @@ func (g *PostgresGrammar) wrapJsonSelector(value string) string {
 	field := g.wrapSegments(strings.Split(path[0], "."))
 	path = path[1:]
 
-	wrappedPath := make([]string, 0, len(path))
-	for _, p := range path {
-		wrappedPath = append(wrappedPath, g.parseJsonPathArrayKeys(p)...)
-	}
+	wrappedPath := g.wrapJsonPathAttributes(path, "'")
 
 	attribute := wrappedPath[len(wrappedPath)-1]
 	wrappedPath = wrappedPath[:len(wrappedPath)-1]
@@ -209,25 +206,57 @@ func (g *PostgresGrammar) wrapJsonBooleanValue(value string) string {
 	return "'" + value + "'::jsonb"
 }
 
-// parseJsonPathArrayKeys 把 "attr[0][1]" 拆为 ["attr", "[0]", "[1]"]；
-// 字符串属性加单引号，数组下标保持裸数字（对齐 Laravel wrapJsonPathAttributes）。
+// parseJsonPathArrayKeys 对应 Laravel PostgresGrammar::parseJsonPathArrayKeys：
+// 把 "attr[0][1]" 拆为 ["attr", "0", "1"]（取括号内内容，不带方括号）。
+// 返回原始片段，引号由 wrapJsonPathAttributes 按 quote 参数统一添加。
 func (g *PostgresGrammar) parseJsonPathArrayKeys(segment string) []string {
-	parts := jsonTrailingIndex.FindAllString(segment, -1)
-	if parts == nil {
-		return []string{pgQuotePath(segment)}
+	m := jsonTrailingIndex.FindStringSubmatch(segment)
+	if m == nil {
+		return []string{segment}
 	}
-	key := strings.TrimSuffix(segment, parts[len(parts)-1])
-	if key == "" {
-		return parts
+	// m[0] 为结尾的完整括号组（如 "[0][1]"），key 为其前的属性名
+	key := strings.TrimSuffix(segment, m[0])
+	keys := jsonArrayKeyPattern.FindAllStringSubmatch(m[0], -1)
+
+	out := make([]string, 0, len(keys)+1)
+	if key != "" {
+		out = append(out, key)
 	}
-	return append([]string{pgQuotePath(key)}, parts...)
+	for _, k := range keys {
+		// 对应 Laravel 的 ->diff('')：剔除空片段
+		if k[1] != "" {
+			out = append(out, k[1])
+		}
+	}
+	return out
 }
 
-func pgQuotePath(attr string) string {
+// jsonArrayKeyPattern 对应 Laravel 的 preg_match_all('/\[([^\]]+)\]/', ...)。
+var jsonArrayKeyPattern = regexp.MustCompile(`\[([^\]]+)\]`)
+
+// wrapJsonPathAttributes 对应 Laravel PostgresGrammar::wrapJsonPathAttributes：
+// 展开数组下标后逐段加引号；整数下标保持裸数字（filter_var FILTER_VALIDATE_INT）。
+func (g *PostgresGrammar) wrapJsonPathAttributes(path []string, quote string) []string {
+	var attrs []string
+	for _, attribute := range path {
+		attrs = append(attrs, g.parseJsonPathArrayKeys(attribute)...)
+	}
+	out := make([]string, len(attrs))
+	for i, attr := range attrs {
+		out[i] = pgQuotePath(attr, quote)
+	}
+	return out
+}
+
+func pgQuotePath(attr, quote string) string {
 	if isIntString(attr) {
 		return attr
 	}
-	return "'" + strings.ReplaceAll(attr, "'", "''") + "'"
+	attr = strings.ReplaceAll(attr, "'", "''")
+	if quote != "'" {
+		attr = strings.ReplaceAll(attr, quote, quote+quote)
+	}
+	return quote + attr + quote
 }
 
 func (g *PostgresGrammar) wrapJsonPathSegment(segment string) string {
@@ -243,10 +272,7 @@ func (g *PostgresGrammar) compileJsonUpdateColumn(key string, value any) string 
 	field := g.Wrap(segments[0])
 	segments = segments[1:]
 
-	attrs := make([]string, 0, len(segments))
-	for _, s := range segments {
-		attrs = append(attrs, g.parseJsonPathArrayKeys(s)...)
-	}
+	attrs := g.wrapJsonPathAttributes(segments, `"`)
 	path := "'{" + strings.Join(attrs, ",") + "}'"
 
 	return fmt.Sprintf("%s = jsonb_set(%s::jsonb, %s, %s)", field, field, path, g.Parameter(value))
@@ -303,12 +329,38 @@ func (g *PostgresGrammar) compileUpsert(q *query.Query, rows []query.Row, unique
 	return sql + strings.Join(cols, ", "), bindings
 }
 
+// CompileDelete 对应 Laravel PostgresGrammar::compileDelete：
+// 带 joins 或 limit 时改写为 delete ... where ctid in (select ctid ...)。
+func (g *PostgresGrammar) CompileDelete(q *query.Query) string {
+	if len(q.Joins) > 0 || q.Limit != nil {
+		return g.compileDeleteWithJoinsOrLimit(q)
+	}
+	return g.QueryGrammar.CompileDelete(q)
+}
+
+// compileDeleteWithJoinsOrLimit 对应 Laravel PostgresGrammar::compileDeleteWithJoinsOrLimit：
+// $query->select($alias.'.ctid') 后 compileSelect（joins/wheres/limit 保留在子查询内）。
+func (g *PostgresGrammar) compileDeleteWithJoinsOrLimit(q *query.Query) string {
+	table := g.WrapTable(q.From)
+
+	alias := fmtString(q.From)
+	if segs := splitAs(alias); len(segs) > 0 {
+		alias = segs[len(segs)-1]
+	}
+
+	sub := *q
+	sub.Columns = []any{alias + ".ctid"}
+	selectSql := g.CompileSelect(&sub)
+
+	return fmt.Sprintf("delete from %s where %s in (%s)", table, g.Wrap("ctid"), selectSql)
+}
+
 func (g *PostgresGrammar) compileUpdate(q *query.Query, values map[string]any) string {
 	// PG：带 join 或 limit 的 update 走 from/ctid 形式
 	if len(q.Joins) > 0 || q.Limit != nil {
 		return g.compileUpdateWithJoinsOrLimit(q, values)
 	}
-	return g.QueryGrammar.CompileUpdate(q, values)
+	return g.QueryGrammar.baseCompileUpdate(q, values)
 }
 
 func (g *PostgresGrammar) compileUpdateColumns(q *query.Query, values map[string]any) string {

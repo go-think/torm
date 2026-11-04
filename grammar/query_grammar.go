@@ -39,6 +39,7 @@ type dialectHooks struct {
 	compileLockFn     func(q *query.Query, value any) string
 	compileRandomFn   func(seed any) string
 	compileColumnsFn  func(q *query.Query, columns []any) string
+	compileFromFn     func(q *query.Query, table any) string
 	compileDistinctOn func(columns []any) string
 
 	// 写入族差异
@@ -284,6 +285,9 @@ func (g *QueryGrammar) compileColumns(q *query.Query, columns []any) string {
 }
 
 func (g *QueryGrammar) compileFrom(q *query.Query, table any) string {
+	if g.compileFromFn != nil {
+		return g.compileFromFn(q, table)
+	}
 	return "from " + g.WrapTable(table)
 }
 
@@ -347,7 +351,16 @@ func (g *QueryGrammar) compileWhereByType(q *query.Query, w *query.Where) string
 		if g.whereLikeFn != nil {
 			return g.whereLikeFn(q, w)
 		}
-		panic(ErrUnsupported{"This database engine does not support like operations."})
+		// 基础方言对应 Laravel Query\Grammars\Grammar::whereLike：
+		// 仅 caseSensitive 时抛错，否则按 like / not like 走基础比较。
+		if w.CaseSensitive {
+			panic(ErrUnsupported{"This database engine does not support case sensitive like operations."})
+		}
+		operator := "like"
+		if w.Not {
+			operator = "not like"
+		}
+		return g.whereBasic(q, &query.Where{Column: w.Column, Operator: operator, Value: w.Value})
 	case "NullSafeEquals":
 		if g.whereNullSafeEqualsFn != nil {
 			return g.whereNullSafeEqualsFn(q, w)
@@ -852,6 +865,12 @@ func (g *QueryGrammar) CompileUpdate(q *query.Query, values map[string]any) stri
 	if g.compileUpdateFn != nil {
 		return g.compileUpdateFn(q, values)
 	}
+	return g.baseCompileUpdate(q, values)
+}
+
+// baseCompileUpdate CompileUpdate 的无钩子基础实现（方言回退直接调用，
+// 避免 compileUpdateFn 再次路由回方言方法造成无限递归）。
+func (g *QueryGrammar) baseCompileUpdate(q *query.Query, values map[string]any) string {
 	table := g.WrapTable(q.From)
 
 	columns := g.compileUpdateColumns(q, values)

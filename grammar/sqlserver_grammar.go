@@ -37,6 +37,7 @@ func NewSqlServerGrammar() *SqlServerGrammar {
 
 	g.compileRandomFn = g.compileRandom
 	g.compileLockFn = g.compileLock
+	g.compileFromFn = g.compileFrom
 	g.compileInsertFn = g.compileInsert
 	g.compileInsertGetIdFn = g.compileInsertGetId
 	g.compileColumnsFn = g.compileColumns
@@ -44,6 +45,31 @@ func NewSqlServerGrammar() *SqlServerGrammar {
 	g.compileOffsetFn = g.compileOffset
 
 	return g
+}
+
+// CompileSelect 对应 Laravel SqlServerGrammar::compileSelect：
+// 有 offset 而无 order by 时追加 order by (SELECT 0) 兜底（SQL Server 的
+// offset 必须 order by）。
+func (g *SqlServerGrammar) CompileSelect(q *query.Query) string {
+	if q.Offset != nil && *q.Offset > 0 && len(q.Orders) == 0 {
+		q.Orders = append(q.Orders, &query.Order{Sql: NewExpression("(SELECT 0)")})
+	}
+	return g.QueryGrammar.CompileSelect(q)
+}
+
+// CompileExists 对应 Laravel SqlServerGrammar::compileExists：
+// clone 后 selectRaw('1 [exists]')->limit(1) → select top 1 1 [exists]。
+func (g *SqlServerGrammar) CompileExists(q *query.Query) string {
+	exists := *q
+	exists.Columns = []any{NewExpression("1 [exists]")}
+	if len(exists.Unions) > 0 {
+		one := int64(1)
+		exists.UnionLimit = &one
+	} else {
+		one := int64(1)
+		exists.Limit = &one
+	}
+	return g.CompileSelect(&exists)
 }
 
 func sqlserverWrapValue(value string) string {
@@ -57,16 +83,27 @@ func (g *SqlServerGrammar) compileRandom(seed any) string {
 	return "NEWID()"
 }
 
-func (g *SqlServerGrammar) compileLock(q *query.Query, value any) string {
-	if s, ok := value.(string); ok {
-		return s
+// compileFrom 对应 Laravel SqlServerGrammar::compileFrom：
+// lock 拼接在 from 之后（with(rowlock,updlock,holdlock) 形式）。
+func (g *SqlServerGrammar) compileFrom(q *query.Query, table any) string {
+	// 直接内联基础实现（compileFromFn 钩子会再次路由回本方法）
+	from := "from " + g.WrapTable(table)
+
+	if s, ok := q.Lock.(string); ok {
+		return from + " " + s
 	}
-	if bv, ok := value.(bool); ok {
-		if bv {
-			return "with (rowlock,updlock,holdlock)"
+	if q.Lock != nil {
+		if bv, ok := q.Lock.(bool); ok && bv {
+			return from + " with(rowlock,updlock,holdlock)"
 		}
-		return "with (rowlock,holdlock)"
+		return from + " with(rowlock,holdlock)"
 	}
+	return from
+}
+
+// compileLock 对应 Laravel SqlServerGrammar::compileLock：返回空串
+// （锁已由 compileFrom 拼进 from，语句末尾不再出现 lock）。
+func (g *SqlServerGrammar) compileLock(q *query.Query, value any) string {
 	return ""
 }
 
