@@ -8,6 +8,7 @@ import (
 )
 
 func TestTableSelectBasic(t *testing.T) {
+	skipNoDB(t)
 	var users []User
 	err := DB.Table("users").Where("gender", "M").Get(&users)
 
@@ -21,17 +22,19 @@ func TestTableSelectBasic(t *testing.T) {
 	}
 }
 
-func TestTableSelectOne(test *testing.T) {
+func TestTableSelectOne(t *testing.T) {
+	skipNoDB(t)
 	var user User
 	err := DB.Table("users").First(&user)
 
 	if err != nil {
-		test.Error(err)
+		t.Error(err)
 	}
 	log.Println(user)
 }
 
 func TestTableSelectAdvance(t *testing.T) {
+	skipNoDB(t)
 	var users []User
 	err := DB.Table("users").
 		Where("gender", "M").
@@ -65,6 +68,7 @@ func TestTableSelectAdvance(t *testing.T) {
 }
 
 func TestTableGroup(t *testing.T) {
+	skipNoDB(t)
 	type UserAddr struct {
 		Name  string
 		Count int64 `torm:"column:ct"`
@@ -83,6 +87,7 @@ func TestTableGroup(t *testing.T) {
 }
 
 func TestTableOrderBy(t *testing.T) {
+	skipNoDB(t)
 	var users []User
 	err := DB.Table("users").
 		OrderByDesc("balance").
@@ -98,6 +103,7 @@ func TestTableOrderBy(t *testing.T) {
 }
 
 func TestTableAggregates(t *testing.T) {
+	skipNoDB(t)
 	var count int64
 	err := DB.Table("users").Count(&count)
 	if err != nil {
@@ -107,6 +113,7 @@ func TestTableAggregates(t *testing.T) {
 }
 
 func TestModelSelect(t *testing.T) {
+	skipNoDB(t)
 	var users []User
 
 	err := DB.Model(User{}).Get(&users)
@@ -117,6 +124,7 @@ func TestModelSelect(t *testing.T) {
 }
 
 func TestModelInsert(t *testing.T) {
+	skipNoDB(t)
 
 	var data []map[string]interface{}
 
@@ -130,17 +138,17 @@ func TestModelInsert(t *testing.T) {
 		"gender": "M",
 	})
 
-	id, affected, err := DB.Model(User{}).Inserts(data)
+	id, affected, err := DB.Model(User{}).Inserts([]interface{}{data[0], data[1]})
 
 	if err != nil {
-		panic(err)
-		t.Error(err)
+		t.Fatal(err)
 	}
 
 	t.Log(id, affected, err)
 }
 
 func TestModelUpdate(t *testing.T) {
+	skipNoDB(t)
 
 	data := map[string]interface{}{
 		"gender": "F",
@@ -155,6 +163,7 @@ func TestModelUpdate(t *testing.T) {
 }
 
 func TestModelCreate(t *testing.T) {
+	skipNoDB(t)
 	u := &User{
 		Name:      "testing",
 		Gender:    "F",

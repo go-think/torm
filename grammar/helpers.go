@@ -1,0 +1,72 @@
+package grammar
+
+import (
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+// BindingSegments 绑定段的固定顺序（对应 Laravel 的 bindings 属性键序）。
+var BindingSegments = []string{
+	"select",
+	"from",
+	"join",
+	"where",
+	"groupBy",
+	"having",
+	"order",
+	"union",
+	"unionOrder",
+}
+
+func fmtString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprint(v)
+}
+
+func fmtJoin(values []any, sep string) string {
+	parts := make([]string, len(values))
+	for i, v := range values {
+		parts[i] = fmtString(v)
+	}
+	return strings.Join(parts, sep)
+}
+
+func sortedKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// flattenBinding 对应 Laravel 的 Arr::flatten（JSON 数组值展平）。
+func flattenBinding(v any) any {
+	if arr, ok := v.([]any); ok {
+		if len(arr) == 0 {
+			return nil
+		}
+		if len(arr) == 1 {
+			return flattenBinding(arr[0])
+		}
+		return arr
+	}
+	return v
+}
+
+func intToString(n int64) string {
+	return strconv.FormatInt(n, 10)
+}
+
+// replaceFirst 对应 Laravel 的 Str::replaceFirst。
+func replaceFirst(search, replace, subject string) string {
+	idx := strings.Index(subject, search)
+	if idx < 0 {
+		return subject
+	}
+	return subject[:idx] + replace + subject[idx+len(search):]
+}

@@ -14,20 +14,29 @@ func init() {
 	DB = initDb()
 }
 
+func skipNoDB(t *testing.T) {
+	t.Helper()
+	if DB == nil {
+		t.Skip("local mysql not available")
+	}
+}
+
 func initDb() *Connection {
 	dsn := "root:@tcp(127.0.0.1:3306)/"
 	driver := "mysql"
 	db, err := Open(Config{
 		Driver: driver,
-		Dsn:    dsn + "?charset=utf8&parseTime=true",
+		Dsn:    dsn + "?charset=utf8&parseTime=true&timeout=500ms",
 	})
 	if err != nil {
-		panic(err)
+		return nil
 	}
-	err = db.Statement(`CREATE DATABASE IF NOT EXISTS torm_test`)
+	if err := db.DB.Ping(); err != nil {
+		return nil
+	}
 
-	if err != nil {
-		panic(err)
+	if err := db.Statement(`CREATE DATABASE IF NOT EXISTS torm_test`); err != nil {
+		return nil
 	}
 
 	db, err = Open(Config{
@@ -72,6 +81,7 @@ func (u *User) TableName() string {
 }
 
 func TestConnection_SelectOne(t *testing.T) {
+	skipNoDB(t)
 	var user User
 	_, _, err := DB.Insert("insert into users (name, gender) values (?, ?)", "Andrew", "M")
 	if err != nil {
@@ -93,6 +103,7 @@ func TestConnection_SelectOne(t *testing.T) {
 }
 
 func TestConnection_Select(t *testing.T) {
+	skipNoDB(t)
 	var users []User
 
 	DB.Insert("insert into users (name, gender) values (?, ?)", "Andrew", "M")
@@ -115,6 +126,7 @@ func TestConnection_Select(t *testing.T) {
 }
 
 func TestConnection_Insert(t *testing.T) {
+	skipNoDB(t)
 	insertId, _, err := DB.Insert("insert into users (name, gender) values (?, ?)", "Alaska", "F")
 	if err != nil {
 		t.Error(err)
@@ -126,6 +138,7 @@ func TestConnection_Insert(t *testing.T) {
 }
 
 func TestConnection_Update(t *testing.T) {
+	skipNoDB(t)
 	id, _, err := DB.Insert("insert into users (name, gender) values (?, ?)", "Chicago", "M")
 	if err != nil {
 		t.Error(err)
@@ -138,6 +151,7 @@ func TestConnection_Update(t *testing.T) {
 }
 
 func TestConnection_Delete(t *testing.T) {
+	skipNoDB(t)
 	id, _, err := DB.Insert("insert into users (name, gender) values (?, ?)", "Columbia", "F")
 	if err != nil {
 		t.Error(err)

@@ -27,9 +27,23 @@ func (s *Schema) Attributes() map[string]interface{} {
 	if s.attributes == nil {
 		s.attributes = make(map[string]interface{})
 		for _, field := range s.Fields {
-			if !field.Ignored {
-				s.attributes[field.Name] = field.Value.Addr().Interface()
+			if field.Ignored {
+				continue
 			}
+			// 自增主键为零值时不参与写入（对应 Laravel incrementing 约定）
+			if field.Primary && field.IsBlank {
+				continue
+			}
+			// nil 指针字段不参与写入
+			if field.Value.Kind() == reflect.Ptr && field.Value.IsNil() {
+				continue
+			}
+			// cast:json —— 结构体/切片序列化为字符串
+			if cast, ok := field.WriteCast(); ok {
+				s.attributes[field.Name] = cast
+				continue
+			}
+			s.attributes[field.Name] = field.Value.Addr().Interface()
 		}
 	}
 

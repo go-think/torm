@@ -1,18 +1,19 @@
 package query
 
-// Expression query expression
-type Expression struct {
+// Expression 对应 Laravel 的 Query\Expression（DB::raw）。
+type Expression interface {
+	GetValue() interface{}
+}
+
+// RawExpression 是 Expression 的默认实现。
+type RawExpression struct {
 	value interface{}
 }
 
-// Expr Create a new raw query expression.
-func Expr(value interface{}) *Expression {
-	return &Expression{
-		value: value,
-	}
+func NewExpression(value interface{}) *RawExpression {
+	return &RawExpression{value: value}
 }
 
-// GetValue Get the value of the expression.
-func (e *Expression) GetValue() interface{} {
+func (e *RawExpression) GetValue() interface{} {
 	return e.value
 }

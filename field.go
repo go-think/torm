@@ -3,12 +3,58 @@ package torm
 import (
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
 
 	"github.com/thinkoner/torm/utils"
 )
+
+// WriteCast 写入前转换：json cast 把结构体/切片序列化为字符串。
+func (f *Field) WriteCast() (any, bool) {
+	if f.Cast != "json" {
+		return nil, false
+	}
+	switch f.Value.Kind() {
+	case reflect.Struct, reflect.Slice, reflect.Map:
+	default:
+		return nil, false
+	}
+	if f.Value.IsZero() {
+		return nil, false
+	}
+	data, err := json.Marshal(f.Value.Addr().Interface())
+	if err != nil {
+		return nil, false
+	}
+	return string(data), true
+}
+
+// ReadCast 读取后转换：json cast 把字符串反序列化进结构体/切片。
+func (f *Field) ReadCast() error {
+	if f.Cast != "json" {
+		return nil
+	}
+	switch f.Value.Kind() {
+	case reflect.Struct, reflect.Slice, reflect.Map:
+	default:
+		return nil
+	}
+	var raw []byte
+	switch v := f.Value.Interface().(type) {
+	case string:
+		raw = []byte(v)
+	case []byte:
+		raw = v
+	default:
+		return nil
+	}
+	if len(raw) == 0 {
+		return nil
+	}
+	return json.Unmarshal(raw, f.Value.Addr().Interface())
+}
 
 // Field The model field definition
 type Field struct {
@@ -19,6 +65,7 @@ type Field struct {
 	Name        string
 	Ignored     bool
 	IsBlank     bool
+	Cast        string // cast:json —— 写入时序列化、读取时反序列化
 }
 
 // GetParams Get the attr of tag
@@ -95,6 +142,8 @@ func (f *Field) initialize() {
 			f.Primary = true
 		case "COLUMN":
 			f.Name = f.Attrs[k]
+		case "CAST":
+			f.Cast = strings.ToLower(f.Attrs[k])
 		}
 	}
 

@@ -37,6 +37,21 @@
 go get github.com/thinkoner/torm
 ```
 
+## Requirements
+
+- Go 1.27+
+
+## Status (2026-09)
+
+Query Builder 对齐 Laravel 13（双方言：标准 SQL + MySQL + Postgres），支持事务/savepoint/afterCommit、
+错误分类、软删除与时间戳自动维护、firstOrCreate 族。测试不依赖外部数据库（内置内存 driver）。
+
+```
+go test ./...
+```
+
+迭代明细见 `ITERATION_LOG.md`；对标差异清单见 `../torm-vs-laravel-database.md`。
+
 ## Quick start
 
 ##### Get the database connection:
