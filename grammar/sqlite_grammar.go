@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/thinkoner/torm/query"
+	"github.com/go-think/torm/query"
 )
 
 // SQLiteGrammar 对应 Illuminate\Database\Query\Grammars\SQLiteGrammar。

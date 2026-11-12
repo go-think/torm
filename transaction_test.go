@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/thinkoner/torm/events"
+	"github.com/go-think/torm/events"
 )
 
 func TestTransactionCommit(t *testing.T) {

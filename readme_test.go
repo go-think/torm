@@ -4,7 +4,7 @@ import (
 	"database/sql/driver"
 	"testing"
 
-	"github.com/thinkoner/torm/grammar"
+	"github.com/go-think/torm/grammar"
 )
 
 // README 示例回归测试：保证文档中的代码与当前 API 一致（示例即测试）。

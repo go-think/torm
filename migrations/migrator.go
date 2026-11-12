@@ -3,9 +3,9 @@ package migrations
 import (
 	"fmt"
 
-	torm "github.com/thinkoner/torm"
-	"github.com/thinkoner/torm/events"
-	"github.com/thinkoner/torm/grammar"
+	torm "github.com/go-think/torm"
+	"github.com/go-think/torm/events"
+	"github.com/go-think/torm/grammar"
 )
 
 // Migration 对应 Laravel 的迁移文件（Go 侧为注册式而非文件反射）。

@@ -7,20 +7,20 @@
 </p>
 
 <p align="center">
-    <a href="https://github.com/thinkoner/torm/actions">
-		<img src="https://img.shields.io/github/actions/workflow/status/thinkoner/torm/build.yml?branch=master" alt="Build Status">
+    <a href="https://github.com/go-think/torm/actions">
+		<img src="https://img.shields.io/github/actions/workflow/status/go-think/torm/build.yml?branch=master" alt="Build Status">
   	</a>
-	<a href="https://goreportcard.com/report/github.com/thinkoner/torm">
-		<img src="https://goreportcard.com/badge/github.com/thinkoner/torm" alt="Go Report Card">
+	<a href="https://goreportcard.com/report/github.com/go-think/torm">
+		<img src="https://goreportcard.com/badge/github.com/go-think/torm" alt="Go Report Card">
   	</a>
-	<a href="https://pkg.go.dev/github.com/thinkoner/torm">
-		<img src="https://pkg.go.dev/badge/github.com/thinkoner/torm" alt="GoDoc">
+	<a href="https://pkg.go.dev/github.com/go-think/torm">
+		<img src="https://pkg.go.dev/badge/github.com/go-think/torm" alt="GoDoc">
   	</a>
-	<a href="https://github.com/thinkoner/torm/releases">
-		<img src="https://img.shields.io/github/release/thinkoner/torm.svg" alt="Latest Stable Version">
+	<a href="https://github.com/go-think/torm/releases">
+		<img src="https://img.shields.io/github/release/go-think/torm.svg" alt="Latest Stable Version">
 	</a>
 	<a href="LICENSE">
-		<img src="https://img.shields.io/github/license/thinkoner/torm.svg" alt="License">
+		<img src="https://img.shields.io/github/license/go-think/torm.svg" alt="License">
 	</a>
 </p>
 
@@ -42,7 +42,7 @@
 ## Installation
 
 ```
-go get github.com/thinkoner/torm
+go get github.com/go-think/torm
 ```
 
 ## Testing
@@ -384,7 +384,7 @@ _ = s.DropIfExists("users")
 ##### Migrations
 
 ```go
-import "github.com/thinkoner/torm/migrations"
+import "github.com/go-think/torm/migrations"
 
 mig := migrations.NewMigrator(conn,
 	migrations.Migration{
@@ -414,5 +414,5 @@ This project is licensed under the [Apache 2.0 license](LICENSE).
 ## Contact
 
 If you have any issues or feature requests, please contact us. PR is welcomed.
-- https://github.com/thinkoner/torm/issues
+- https://github.com/go-think/torm/issues
 - duanpier@gmail.com

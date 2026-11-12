@@ -4,10 +4,10 @@ import (
 	"database/sql/driver"
 	"testing"
 
-	"github.com/thinkoner/torm"
-	"github.com/thinkoner/torm/events"
-	"github.com/thinkoner/torm/internal/faketb"
-	"github.com/thinkoner/torm/migrations"
+	"github.com/go-think/torm"
+	"github.com/go-think/torm/events"
+	"github.com/go-think/torm/internal/faketb"
+	"github.com/go-think/torm/migrations"
 )
 
 // Rollback step/batch/pretend 选项与迁移事件测试（migrator_test.go 的补充）。

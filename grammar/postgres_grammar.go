@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/thinkoner/torm/query"
+	"github.com/go-think/torm/query"
 )
 
 // PostgresGrammar 对应 Illuminate\Database\Query\Grammars\PostgresGrammar。

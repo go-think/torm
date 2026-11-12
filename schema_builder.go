@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/thinkoner/torm/grammar"
+	"github.com/go-think/torm/grammar"
 )
 
 // 本文件对齐 Illuminate\Database\Schema\Builder（含 MySqlBuilder/PostgresBuilder 子类语义）。

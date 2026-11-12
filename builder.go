@@ -12,8 +12,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/thinkoner/torm/grammar"
-	"github.com/thinkoner/torm/query"
+	"github.com/go-think/torm/grammar"
+	"github.com/go-think/torm/query"
 )
 
 // Builder 对应 Illuminate\Database\Query\Builder。

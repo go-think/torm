@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/thinkoner/torm/grammar"
+	"github.com/go-think/torm/grammar"
 )
 
 // 原有模型字段映射测试

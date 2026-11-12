@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/thinkoner/torm/utils"
+	"github.com/go-think/torm/utils"
 )
 
 // ---- 集合层（对应 Illuminate\Support/Collection 与 Eloquent Collection）----

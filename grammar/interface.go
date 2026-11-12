@@ -1,6 +1,6 @@
 package grammar
 
-import "github.com/thinkoner/torm/query"
+import "github.com/go-think/torm/query"
 
 // Grammar 是方言 grammar 必须实现的公开编译接口。
 type Grammar interface {

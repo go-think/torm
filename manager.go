@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/thinkoner/torm/events"
+	"github.com/go-think/torm/events"
 )
 
 // Config 连接配置（对应 Laravel database.connections[*]）。

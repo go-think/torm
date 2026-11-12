@@ -15,8 +15,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/thinkoner/torm/events"
-	"github.com/thinkoner/torm/grammar"
+	"github.com/go-think/torm/events"
+	"github.com/go-think/torm/grammar"
 )
 
 // ErrMultipleColumnsSelected 对应 Laravel 的 MultipleColumnsSelectedException

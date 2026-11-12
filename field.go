@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/thinkoner/torm/utils"
+	"github.com/go-think/torm/utils"
 )
 
 // cast 常量：Laravel 支持的常见 cast 名（本次扩展，json 为既有行为）。

@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/thinkoner/torm/query"
+	"github.com/go-think/torm/query"
 )
 
 // dialectHooks 汇集方言差异点；nil 时使用 QueryGrammar 的基础实现。

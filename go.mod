@@ -1,4 +1,4 @@
-module github.com/thinkoner/torm
+module github.com/go-think/torm
 
 go 1.27.0
 

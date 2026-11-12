@@ -1,7 +1,7 @@
 package migrations
 
 import (
-	"github.com/thinkoner/torm/events"
+	"github.com/go-think/torm/events"
 )
 
 // 迁移事件：对齐 Illuminate\Database\Events 下的迁移事件族

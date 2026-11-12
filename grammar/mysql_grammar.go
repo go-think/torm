@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/thinkoner/torm/query"
+	"github.com/go-think/torm/query"
 )
 
 // MySqlGrammar 对应 Illuminate\Database\Query\Grammars\MySqlGrammar。

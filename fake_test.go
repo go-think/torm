@@ -4,7 +4,7 @@ import (
 	"database/sql/driver"
 	"testing"
 
-	"github.com/thinkoner/torm/internal/faketb"
+	"github.com/go-think/torm/internal/faketb"
 )
 
 // ---- 内存假 driver：让 Connection 层测试脱离真实 MySQL ----

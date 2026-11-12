@@ -6,8 +6,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/thinkoner/torm/grammar"
-	"github.com/thinkoner/torm/query"
+	"github.com/go-think/torm/grammar"
+	"github.com/go-think/torm/query"
 )
 
 // 本文件的期望 SQL 逐条移植自 laravel/framework

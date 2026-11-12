@@ -2,7 +2,7 @@
 // （对应 Laravel 的 Illuminate\Database\Events）；此处保留类型与常量别名以兼容既有引用。
 package torm
 
-import "github.com/thinkoner/torm/events"
+import "github.com/go-think/torm/events"
 
 // Event / ModelEvent / Dispatcher / EventBus / QueryExecuted：类型别名（兼容层）。
 type (

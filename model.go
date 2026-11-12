@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/thinkoner/torm/field"
-	"github.com/thinkoner/torm/grammar"
-	"github.com/thinkoner/torm/utils"
+	"github.com/go-think/torm/field"
+	"github.com/go-think/torm/grammar"
+	"github.com/go-think/torm/utils"
 )
 
 // Model 是内嵌属性集合（兼容旧用法）。

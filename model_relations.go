@@ -8,9 +8,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/thinkoner/torm/grammar"
-	"github.com/thinkoner/torm/query"
-	"github.com/thinkoner/torm/utils"
+	"github.com/go-think/torm/grammar"
+	"github.com/go-think/torm/query"
+	"github.com/go-think/torm/utils"
 )
 
 // Relation 关系定义（对应 Laravel 关系的键约定）。

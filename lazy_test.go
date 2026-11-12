@@ -4,7 +4,7 @@ import (
 	"database/sql/driver"
 	"testing"
 
-	"github.com/thinkoner/torm/internal/faketb"
+	"github.com/go-think/torm/internal/faketb"
 )
 
 func rowsUsers(rows ...[2]driver.Value) *fakeResult {

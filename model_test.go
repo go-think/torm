@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thinkoner/torm/grammar"
+	"github.com/go-think/torm/grammar"
 )
 
 // Post 带软删除字段

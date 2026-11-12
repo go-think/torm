@@ -5,8 +5,8 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/thinkoner/torm/grammar"
-	"github.com/thinkoner/torm/utils"
+	"github.com/go-think/torm/grammar"
+	"github.com/go-think/torm/utils"
 )
 
 // ---- 多态关系（对应 Laravel morphMany/morphOne/morphTo）----

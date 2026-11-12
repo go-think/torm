@@ -10,10 +10,10 @@ import (
 	"time"
 
 	gomysql "github.com/go-sql-driver/mysql"
-	_ "github.com/thinkoner/torm/driver/mysql"
-	_ "github.com/thinkoner/torm/driver/sqlite"
-	"github.com/thinkoner/torm/events"
-	"github.com/thinkoner/torm/internal/faketb"
+	_ "github.com/go-think/torm/driver/mysql"
+	_ "github.com/go-think/torm/driver/sqlite"
+	"github.com/go-think/torm/events"
+	"github.com/go-think/torm/internal/faketb"
 )
 
 var DB *Connection

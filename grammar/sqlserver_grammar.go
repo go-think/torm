@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/thinkoner/torm/query"
+	"github.com/go-think/torm/query"
 )
 
 // SqlServerGrammar 对应 Illuminate\Database\Query\Grammars\SqlServerGrammar 的常用子集。

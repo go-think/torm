@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"sync"
 
-	"github.com/thinkoner/torm/events"
+	"github.com/go-think/torm/events"
 )
 
 // Observer 对应 Laravel 的模型观察者：按模型类型注册可选回调。

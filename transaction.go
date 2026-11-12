@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"strconv"
 
-	"github.com/thinkoner/torm/events"
+	"github.com/go-think/torm/events"
 )
 
 // queryer 统一 *sql.DB 与 *sql.Tx 的执行接口，事务内的查询路由到当前 tx。
