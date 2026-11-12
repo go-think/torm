@@ -3,6 +3,8 @@ package torm
 import (
 	"database/sql"
 	"strconv"
+
+	"github.com/thinkoner/torm/events"
 )
 
 // queryer 统一 *sql.DB 与 *sql.Tx 的执行接口，事务内的查询路由到当前 tx。
@@ -19,7 +21,17 @@ func (c *Connection) queryer() queryer {
 	if tx != nil {
 		return tx
 	}
-	return c.DB
+	// 管理层 ::read 固定路由：写语句也走只读连接（对应 setPdoForType 'read'）
+	c.stateMu.Lock()
+	pinned := c.pinnedType
+	c.stateMu.Unlock()
+	c.connMu.Lock()
+	readDB, mainDB := c.readDB, c.DB
+	c.connMu.Unlock()
+	if pinned == "read" && readDB != nil {
+		return readDB
+	}
+	return mainDB
 }
 
 // txHook 是带注册层级的 afterCommit/afterRollBack 回调。层级用于在部分回滚时
@@ -29,25 +41,77 @@ type txHook struct {
 	fn    func()
 }
 
-// BeginTransaction 开启事务；嵌套时创建 savepoint（对齐 Laravel ManagesTransactions）。
+// dispatchTxEvent 分发事务生命周期事件（无 dispatcher 时为 no-op）。
+func (c *Connection) dispatchTxEvent(name string) {
+	c.txMu.Lock()
+	d := c.dispatcher
+	level := c.level
+	name2 := c.name
+	c.txMu.Unlock()
+	if d != nil {
+		d.Dispatch(events.TransactionEvent{Name: name, TransactionLevel: level, ConnectionName: name2})
+	}
+}
+
+// dispatchTxEventLocked 在已持 txMu 锁的情况下分发事务事件（事件监听器不得
+// 调用事务 API）。
+func (c *Connection) dispatchTxEventLocked(name string) {
+	if c.dispatcher != nil {
+		c.dispatcher.Dispatch(events.TransactionEvent{
+			Name:            name,
+			TransactionLevel: c.level,
+			ConnectionName:  c.name,
+		})
+	}
+}
+
+// BeginTransaction 开启事务；嵌套时创建 savepoint（对齐 Laravel
+// ManagesTransactions）。level 0 的 BEGIN 遇断连错误重连后重试一次
+// （handleBeginTransactionException）。
 func (c *Connection) BeginTransaction() error {
+	for _, fn := range c.beforeStartingTransaction {
+		fn()
+	}
 	c.txMu.Lock()
 	defer c.txMu.Unlock()
 
 	if c.level == 0 {
 		tx, err := c.DB.Begin()
 		if err != nil {
-			return err
+			if classifyError(err) == KindLostConnection {
+				if rerr := c.reconnect(); rerr != nil {
+					return err
+				}
+				tx, err = c.DB.Begin()
+				if err != nil {
+					return err
+				}
+			} else {
+				return err
+			}
 		}
 		c.tx = tx
-	} else {
-		// SAVEPOINT trans{level+1}
+	} else if c.queryGrammarForTxSupportsSavepoints() {
+		// SAVEPOINT trans{level+1}（supportsSavepoints 守卫，C1③）
 		if _, err := c.tx.Exec(c.grammarForTx().CompileSavepoint("trans" + strconv.Itoa(c.level+1))); err != nil {
 			return err
 		}
 	}
+	// Laravel：beganTransaction 事件在 begin 成功后、计数递增后分发
+	// （ManagesTransactions.php:124-139）
 	c.level++
+	c.dispatchTxEventLocked(events.TransactionBeginning)
 	return nil
+}
+
+// queryGrammarForTxSupportsSavepoints 对应 Query Grammar::supportsSavepoints
+// （基类恒 true，方言可覆写）。
+func (c *Connection) queryGrammarForTxSupportsSavepoints() bool {
+	type sp interface{ SupportsSavepoints() bool }
+	if g, ok := c.grammarForTx().(sp); ok {
+		return g.SupportsSavepoints()
+	}
+	return true
 }
 
 // Commit 提交当前事务层；仅最外层提交到数据库。afterCommit 回调在释放事务
@@ -57,15 +121,38 @@ func (c *Connection) Commit() error {
 	var runHooks []func()
 
 	c.txMu.Lock()
+	// Laravel：committing 事件仅最外层（transactionLevel===1）时、pdo commit 之前
+	// 分发（ManagesTransactions.php:205-208）
+	if c.level == 1 {
+		c.dispatchTxEventLocked(events.TransactionCommitting)
+	}
 	if c.level == 1 && c.tx != nil {
 		if err := c.tx.Commit(); err != nil {
 			c.txMu.Unlock()
+			// Laravel handleCommitTransactionException：先无条件 transactions--
+			if classifyError(err) == KindLostConnection {
+				// 断连：事务已随连接丢失，计数清零（不重试 commit）
+				c.tx = nil
+				c.level = 0
+				c.afterCommitHooks = nil
+			} else if classifyError(err) == KindDeadlock {
+				// 并发错误：计数--、事务已死（tx 置 nil）后由外层 Transaction
+				// 重试循环重新 BEGIN（:232-251）
+				c.tx = nil
+				c.level = 0
+			}
 			return err
 		}
 		c.tx = nil
-	}
-	if c.level > 0 {
-		// 内层提交：回调上浮到父事务层；最外层提交：全部就绪执行。
+		// 最外层提交：全部 afterCommit 回调就绪执行（解锁后运行）
+		runHooks = make([]func(), 0, len(c.afterCommitHooks))
+		for _, h := range c.afterCommitHooks {
+			runHooks = append(runHooks, h.fn)
+		}
+		c.afterCommitHooks = nil
+		c.level = 0
+	} else if c.level > 0 {
+		// 内层提交：回调上浮到父事务层
 		var kept []txHook
 		for _, h := range c.afterCommitHooks {
 			if c.level == 1 {
@@ -79,9 +166,12 @@ func (c *Connection) Commit() error {
 	}
 	c.txMu.Unlock()
 
+	// Laravel：manager.commit 先执行 afterCommit 回调，再发 committed 事件
+	// （ManagesTransactions.php:215-219）
 	for _, fn := range runHooks {
 		fn()
 	}
+	c.dispatchTxEvent(events.TransactionCommitted)
 	return nil
 }
 
@@ -116,12 +206,26 @@ func (c *Connection) rollBackToLevel(toLevel int) error {
 			err = c.tx.Rollback()
 			c.tx = nil
 		}
-	} else if c.tx != nil {
-		// ROLLBACK TO SAVEPOINT trans{toLevel+1}
+	} else if c.tx != nil && c.queryGrammarForTxSupportsSavepoints() {
+		// ROLLBACK TO SAVEPOINT trans{toLevel+1}（supportsSavepoints 守卫）
 		_, err = c.tx.Exec(c.grammarForTx().CompileSavepointRollBack("trans" + strconv.Itoa(toLevel+1)))
 	}
 	if err != nil {
+		// Laravel handleRollBackException：断连时 transactions=0、按层级降序
+		// 执行全部 afterRollBack 回调、丢弃 afterCommit 回调，然后重抛
+		if classifyError(err) == KindLostConnection {
+			c.tx = nil
+			c.level = 0
+			for _, h := range c.afterRollbackHooks {
+				runRollbackHooks = append(runRollbackHooks, h.fn)
+			}
+			c.afterRollbackHooks = nil
+			c.afterCommitHooks = nil
+		}
 		c.txMu.Unlock()
+		for _, fn := range runRollbackHooks {
+			fn()
+		}
 		return err
 	}
 
@@ -151,9 +255,12 @@ func (c *Connection) rollBackToLevel(toLevel int) error {
 	c.level = toLevel
 	c.txMu.Unlock()
 
+	// Laravel：manager.rollback 先执行 afterRollBack 回调，再发 rollingBack
+	// （ManagesTransactions.php:283-289）
 	for _, fn := range runRollbackHooks {
 		fn()
 	}
+	c.dispatchTxEvent(events.TransactionRolledBack)
 	return nil
 }
 
@@ -193,10 +300,15 @@ func (c *Connection) Transaction(fn func(*Connection) error, attempts ...int) er
 		}
 
 		if err := c.Commit(); err != nil {
-			_ = c.rollBackToLevel(startLevel)
-			if startLevel == 0 && isConcurrencyError(err) && attempt < maxAttempts {
-				continue
+			// 并发/断连错误时 Commit 内部已将事务打散（level 归零/tx 丢弃），
+			// 无需再回滚；仅嵌套降级路径需要显式回滚到入口 savepoint
+			if isConcurrencyError(err) || classifyError(err) == KindLostConnection {
+				if startLevel == 0 && isConcurrencyError(err) && attempt < maxAttempts {
+					continue
+				}
+				return err
 			}
+			_ = c.rollBackToLevel(startLevel)
 			return err
 		}
 	}
@@ -217,13 +329,12 @@ func (c *Connection) AfterCommit(fn func()) {
 	c.txMu.Unlock()
 }
 
-// AfterRollBack 注册回滚回调：所在事务（或其内层）发生回滚时执行；无活动
-// 事务时立即执行（对齐 ManagesTransactions::afterRollBack）。
+// AfterRollBack 注册回滚回调：所在事务（或其内层）发生回滚时执行。无活动
+// 事务时回调被静默丢弃（对齐 DatabaseTransactionsManager::addCallbackForRollback）。
 func (c *Connection) AfterRollBack(fn func()) {
 	c.txMu.Lock()
 	if c.level == 0 {
 		c.txMu.Unlock()
-		fn()
 		return
 	}
 	c.afterRollbackHooks = append(c.afterRollbackHooks, txHook{level: c.level, fn: fn})

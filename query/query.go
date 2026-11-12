@@ -51,6 +51,9 @@ type Query struct {
 
 	// 标记当前 Query 是 join 子句（编译 on 而非 where）
 	JoinClause bool
+
+	// Timeout 查询执行超时（秒），MySQL 编译为 MAX_EXECUTION_TIME 提示。
+	Timeout *int64
 }
 
 type Aggregate struct {
@@ -67,8 +70,10 @@ type IndexHint struct {
 type Join struct {
 	// Type: inner / left / right / cross / straight_join
 	Type string
-	// Table: string 或 Expression（joinSub 场景）
+	// Table: string 或 Expression（joinSub / joinLateral 场景）
 	Table any
+	// Lateral 标记 lateral join（Laravel JoinLateralClause）
+	Lateral bool
 	// 嵌套 join（Laravel JoinClause->joins）
 	Joins  []*Join
 	Wheres []*Where
@@ -104,6 +109,10 @@ type Order struct {
 	Direction string
 	// orderByRaw：Expression 或 string
 	Sql any
+	// Type：InOrderOf（inOrderOf 顺序排序）；空 = 普通列排序
+	Type string
+	// InOrderOf 的取值序列（Type == "InOrderOf" 时使用）
+	Values []any
 }
 
 type Union struct {

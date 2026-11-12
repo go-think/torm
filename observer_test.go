@@ -54,9 +54,9 @@ func TestObserverUpdateAndDelete(t *testing.T) {
 	conn, st := newFakeDB(t)
 	now := time.Now()
 	p := Post{ID: 2, Title: "t", CreatedAt: now, UpdatedAt: now}
-	updateSQL := "update `posts` set `created_at` = ?, `title` = ?, `updated_at` = ? where `id` = ?"
+	insertSQL := "insert into `posts` (`created_at`, `id`, `title`, `updated_at`) values (?, ?, ?, ?)"
 	st.On("BEGIN", &fakeResult{})
-	st.On(updateSQL, &fakeResult{Affected: 1})
+	st.On(insertSQL, &fakeResult{Affected: 1})
 	deleteSQL := "delete from `posts` where `id` = ?"
 	st.On(deleteSQL, &fakeResult{Affected: 1})
 
@@ -66,23 +66,25 @@ func TestObserverUpdateAndDelete(t *testing.T) {
 		Updated:  func(any) error { events = append(events, "updated"); return nil },
 		Saving:   func(any) error { events = append(events, "saving"); return nil },
 		Saved:    func(any) error { events = append(events, "saved"); return nil },
-		Deleting: func(any) error { events = append(events, "deleting"); return nil },
-		Deleted:  func(any) error { events = append(events, "deleted"); return nil },
+		ForceDeleting: func(any) error { events = append(events, "forceDeleting"); return nil },
+		ForceDeleted:  func(any) error { events = append(events, "forceDeleted"); return nil },
 	})
 
 	if err := conn.Save(&p); err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 4 || events[0] != "saving" || events[1] != "updating" || events[2] != "updated" || events[3] != "saved" {
-		t.Errorf("update events = %v", events)
+	// 该观察者只注册了 Saving/Saved 钩子：insert 路径期望 saving → saved
+	if len(events) != 2 || events[0] != "saving" || events[1] != "saved" {
+		t.Errorf("insert events = %v", events)
 	}
 
 	events = nil
 	if err := conn.ForceDelete(&p); err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 2 || events[0] != "deleting" || events[1] != "deleted" {
-		t.Errorf("delete events = %v", events)
+	// Laravel forceDelete：forceDeleting → 硬删 → forceDeleted（不触发 deleting/deleted）
+	if len(events) != 2 || events[0] != "forceDeleting" || events[1] != "forceDeleted" {
+		t.Errorf("force delete events = %v", events)
 	}
 	st.LastCall(t, deleteSQL)
 }

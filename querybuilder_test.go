@@ -1,6 +1,7 @@
 package torm
 
 import (
+	"database/sql/driver"
 	"fmt"
 	"reflect"
 	"testing"
@@ -1710,5 +1711,1076 @@ func TestGoldenInsertOrIgnoreUsingPostgres(t *testing.T) {
 	}
 	if got := cleanBindings(bindings); len(got) != 1 || got[0] != 5 {
 		t.Errorf("bindings = %#v", got)
+	}
+}
+
+// ---- R3-A: SQLite 方言 ----
+
+func sqliteBuilder(t *testing.T, prefix ...string) *Builder {
+	t.Helper()
+	g := grammar.NewSqliteQueryGrammar()
+	if len(prefix) > 0 {
+		g.SetTablePrefix(prefix[0])
+	}
+	return NewBuilder(nil, g)
+}
+
+func TestGoldenSqlite(t *testing.T) {
+	cases := []struct {
+		name  string
+		build func(b *Builder) *Builder
+		want  string
+	}{
+		{
+			name:  "compile lock is empty",
+			build: func(b *Builder) *Builder { return b.Select("*").From("users").LockForUpdate() },
+			want:  `select * from "users"`,
+		},
+		{
+			name: "where date strftime",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").WhereDate("created_at", "=", "2015-12-21")
+			},
+			want: `select * from "users" where strftime('%Y-%m-%d', "created_at") = cast(? as text)`,
+		},
+		{
+			name: "where time strftime",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").WhereTime("created_at", "=", "12:00:00")
+			},
+			want: `select * from "users" where strftime('%H:%M:%S', "created_at") = cast(? as text)`,
+		},
+		{
+			name:  "where day month year strftime",
+			build: func(b *Builder) *Builder { return b.Select("*").From("users").WhereDay("created_at", "=", 1).WhereMonth("created_at", "=", 2).WhereYear("created_at", "=", 2015) },
+			want:  `select * from "users" where strftime('%d', "created_at") = cast(? as text) and strftime('%m', "created_at") = cast(? as text) and strftime('%Y', "created_at") = cast(? as text)`,
+		},
+		{
+			name:  "where like case insensitive falls back",
+			build: func(b *Builder) *Builder { return b.Select("*").From("users").WhereLike("name", "foo", false) },
+			want:  `select * from "users" where "name" like ?`,
+		},
+		{
+			name:  "where like case sensitive uses glob",
+			build: func(b *Builder) *Builder { return b.Select("*").From("users").WhereLike("name", "foo%", true) },
+			want:  `select * from "users" where "name" glob ?`,
+		},
+		{
+			name:  "where not like case sensitive uses not glob",
+			build: func(b *Builder) *Builder { return b.Select("*").From("users").WhereNotLike("name", "foo", true) },
+			want:  `select * from "users" where "name" not glob ?`,
+		},
+		{
+			name:  "where null safe equals uses is",
+			build: func(b *Builder) *Builder { return b.Select("*").From("users").Where("a", "<=>", 1) },
+			want:  `select * from "users" where "a" is ?`,
+		},
+		{
+			name:  "union wraps with select * from",
+			build: func(b *Builder) *Builder { return b.Select("id").From("users").Union(func(nb *Builder) *Builder { return nb.Select("id").From("archives") }) },
+			want:  `select * from (select "id" from "users") union select * from (select "id" from "archives")`,
+		},
+		{
+			name:  "json contains uses json_each",
+			build: func(b *Builder) *Builder { return b.Select("*").From("users").WhereJsonContains("options->tags", "x") },
+			want:  `select * from "users" where exists (select 1 from json_each("options", '$."tags"') where "json_each"."value" is ?)`,
+		},
+		{
+			name:  "json contains key uses json_type",
+			build: func(b *Builder) *Builder { return b.Select("*").From("users").WhereJsonContainsKey("options->tags") },
+			want:  `select * from "users" where json_type("options", '$."tags"') is not null`,
+		},
+		{
+			name:  "json length uses json_array_length",
+			build: func(b *Builder) *Builder { return b.Select("*").From("users").WhereJsonLength("options->tags", ">", 1) },
+			want:  `select * from "users" where json_array_length("options", '$."tags"') > ?`,
+		},
+		{
+			name:  "force index hint",
+			build: func(b *Builder) *Builder { return b.Select("*").From("users").ForceIndex("idx_name") },
+			want:  `select * from "users" indexed by idx_name`,
+		},
+		{
+			name:  "use index hint compiles empty",
+			build: func(b *Builder) *Builder { return b.Select("*").From("users").UseIndex("idx_name") },
+			want:  `select * from "users"`,
+		},
+		{
+			name:  "in order of",
+			build: func(b *Builder) *Builder { return b.Select("*").From("users").InOrderOf("id", []interface{}{3, 1, 2}) },
+			want:  `select * from "users" order by case when "id" = ? then 0 when "id" = ? then 1 when "id" = ? then 2 else 3 end`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.want == "" {
+				t.Skip("n/a")
+			}
+			b := tc.build(sqliteBuilder(t))
+			if got := b.ToSql(); got != tc.want {
+				t.Errorf("sqlite sql =\n  %s\nwant\n  %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGoldenSqliteStatements(t *testing.T) {
+	t.Run("insert or ignore", func(t *testing.T) {
+		b := sqliteBuilder(t).From("users")
+		sql, bindings := b.GetGrammar().CompileInsertOrIgnore(b.Query, []query.Row{query.ToRow(map[string]any{"email": "foo"})})
+		if sql != `insert or ignore into "users" ("email") values (?)` {
+			t.Errorf("sql = %s", sql)
+		}
+		if !reflect.DeepEqual(bindings, []any{"foo"}) {
+			t.Errorf("bindings = %#v", bindings)
+		}
+	})
+
+	t.Run("insert or ignore using", func(t *testing.T) {
+		b := sqliteBuilder(t).From("users")
+		stmt := b.GetGrammar().CompileInsertOrIgnoreUsing(b.Query, []any{"email"}, `select "email" from "contacts"`)
+		if stmt != `insert or ignore into "users" ("email") select "email" from "contacts"` {
+			t.Errorf("sql = %s", stmt)
+		}
+	})
+
+	t.Run("upsert on conflict do update", func(t *testing.T) {
+		b := sqliteBuilder(t).From("users")
+		sql, _ := b.GetGrammar().CompileUpsert(b.Query, []query.Row{query.ToRow(map[string]any{"email": "foo", "name": "bar"})}, []string{"email"}, []string{"name"})
+		want := `insert into "users" ("email", "name") values (?, ?) on conflict ("email") do update set "name" = "excluded"."name"`
+		if sql != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", sql, want)
+		}
+	})
+
+	t.Run("truncate two statements", func(t *testing.T) {
+		b := sqliteBuilder(t, "prefix_").From("users")
+		stmts := b.GetGrammar().CompileTruncate(b.Query)
+		if len(stmts) != 2 {
+			t.Fatalf("stmts = %d", len(stmts))
+		}
+		// Laravel 先 delete from 表，再清 sqlite_sequence
+		if stmts[0].Sql != `delete from "prefix_users"` {
+			t.Errorf("sql[0] = %s", stmts[0].Sql)
+		}
+		if stmts[1].Sql != `delete from "sqlite_sequence" where name = ?` {
+			t.Errorf("sql[1] = %s", stmts[1].Sql)
+		}
+		if !reflect.DeepEqual(stmts[1].Bindings, []any{"prefix_users"}) {
+			t.Errorf("bindings[1] = %#v", stmts[1].Bindings)
+		}
+	})
+
+	t.Run("update with limit rewrites to rowid in", func(t *testing.T) {
+		b := sqliteBuilder(t).From("users").Where("email", "=", "foo").Limit(1)
+		sql := b.GetGrammar().CompileUpdate(b.Query, map[string]any{"name": "bar"})
+		want := `update "users" set "name" = ? where "rowid" in (select "users"."rowid" from "users" where "email" = ? limit 1)`
+		if sql != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", sql, want)
+		}
+		if got := b.GetGrammar().PrepareBindingsForUpdate(b.GetRawBindings(), map[string]any{"name": "bar"}); !reflect.DeepEqual(got, []any{"bar", "foo"}) {
+			t.Errorf("bindings = %#v", got)
+		}
+	})
+
+	t.Run("delete with limit rewrites to rowid in", func(t *testing.T) {
+		b := sqliteBuilder(t).From("users").Where("email", "=", "foo").Limit(1)
+		sql := b.GetGrammar().CompileDelete(b.Query)
+		want := `delete from "users" where "rowid" in (select "users"."rowid" from "users" where "email" = ? limit 1)`
+		if sql != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", sql, want)
+		}
+	})
+
+	t.Run("update with json patch", func(t *testing.T) {
+		b := sqliteBuilder(t).From("users")
+		sql := b.GetGrammar().CompileUpdate(b.Query, map[string]any{"name": "x", "options->theme": "dark"})
+		want := `update "users" set "name" = ?, "options" = json_patch(ifnull("options", json('{}')), json(?))`
+		if sql != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", sql, want)
+		}
+		bindings := b.GetGrammar().PrepareBindingsForUpdate(b.GetRawBindings(), map[string]any{"name": "x", "options->theme": "dark"})
+		wantBindings := []any{"x", `{"theme":"dark"}`}
+		_ = want
+		if !reflect.DeepEqual(bindings, wantBindings) {
+			t.Errorf("bindings = %#v, want %#v", bindings, wantBindings)
+		}
+	})
+
+	t.Run("group limit legacy branch", func(t *testing.T) {
+		g := grammar.NewSqliteQueryGrammar()
+		g.SetUseLegacyGroupLimit(true)
+		b := NewBuilder(nil, g).From("users").Select("*")
+		b.Query.GroupLimit = &query.GroupLimit{Column: "id", Value: 2}
+		b.OrderBy("created_at")
+		if got := b.ToSql(); got != `select * from "users" order by "created_at" asc` {
+			t.Errorf("legacy groupLimit sql = %s", got)
+		}
+
+		g2 := grammar.NewSqliteQueryGrammar()
+		b2 := NewBuilder(nil, g2).From("users").Select("*")
+		b2.Query.GroupLimit = &query.GroupLimit{Column: "id", Value: 2}
+		b2.OrderBy("created_at")
+		want := `select * from (select *, row_number() over (partition by "id" order by "created_at" asc) as "laravel_row" from "users") as "laravel_table" where "laravel_row" <= 2 order by "laravel_row"`
+		if got := b2.ToSql(); got != want {
+			t.Errorf("groupLimit sql =\n  %s\nwant\n  %s", got, want)
+		}
+	})
+
+	t.Run("prepare where like binding glob conversion", func(t *testing.T) {
+		g := grammar.NewSqliteQueryGrammar()
+		if got := g.PrepareWhereLikeBinding("a%b_c*d?e", true); got != "a*b?c[*]d[?]e" {
+			t.Errorf("binding = %v", got)
+		}
+		if got := g.PrepareWhereLikeBinding("a%b", false); got != "a%b" {
+			t.Errorf("binding = %v", got)
+		}
+	})
+
+	t.Run("prepare binding for json contains passthrough", func(t *testing.T) {
+		g := grammar.NewSqliteQueryGrammar()
+		v := []any{1, 2}
+		if got := g.PrepareBindingForJsonContains(v); !reflect.DeepEqual(got, v) {
+			t.Errorf("binding changed: %#v", got)
+		}
+	})
+
+	t.Run("wrap union aggregate", func(t *testing.T) {
+		bb := sqliteBuilder(t).From("users").Select("id")
+		bb.Query.Unions = append(bb.Query.Unions, &query.Union{Query: (&query.Query{From: "archives"})})
+		bb.Query.Aggregate = &query.Aggregate{Function: "count", Columns: []any{"*"}}
+		want := `select count(*) as "aggregate" from (select * from (select "id" from "users") union select * from (select * from "archives")) as "temp_table"`
+		if got := bb.ToSql(); got != want {
+			t.Errorf("union aggregate sql =\n  %s\nwant\n  %s", got, want)
+		}
+	})
+}
+
+// ---- R3-A: UpdateFrom / InOrderOf / Timeout / 排序扩展 ----
+
+func TestGoldenUpdateFrom(t *testing.T) {
+	t.Run("joins only", func(t *testing.T) {
+		b := pgBuilder(t).From("users").Join("contacts", "users.id", "=", "contacts.user_id")
+		sql := b.GetGrammar().(interface {
+			CompileUpdateFrom(*query.Query, map[string]any) string
+		}).CompileUpdateFrom(b.Query, map[string]any{"name": "foo"})
+		want := `update "users" set "name" = ? from "contacts" where "users"."id" = "contacts"."user_id"`
+		if sql != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", sql, want)
+		}
+	})
+
+	t.Run("joins with base wheres", func(t *testing.T) {
+		b := pgBuilder(t).From("users").Where("email", "=", "x").Join("contacts", "users.id", "=", "contacts.user_id")
+		sql := b.GetGrammar().(interface {
+			CompileUpdateFrom(*query.Query, map[string]any) string
+		}).CompileUpdateFrom(b.Query, map[string]any{"name": "foo"})
+		want := `update "users" set "name" = ? from "contacts" where "email" = ? and "users"."id" = "contacts"."user_id"`
+		if sql != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", sql, want)
+		}
+		bindings := b.GetGrammar().(interface {
+			PrepareBindingsForUpdateFrom(map[string][]any, map[string]any) []any
+		}).PrepareBindingsForUpdateFrom(b.GetRawBindings(), map[string]any{"name": "foo"})
+		if !reflect.DeepEqual(bindings, []any{"foo", "x"}) {
+			t.Errorf("bindings = %#v", bindings)
+		}
+	})
+}
+
+func TestGoldenInOrderOf(t *testing.T) {
+	cases := []goldenCase{
+		{
+			name:     "in order of",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").InOrderOf("id", []interface{}{3, 1, 2}) },
+			wantBase: `select * from "users" order by case when "id" = ? then 0 when "id" = ? then 1 when "id" = ? then 2 else 3 end`,
+			wantMySQL: "select * from `users` order by case when `id` = ? then 0 when `id` = ? then 1 when `id` = ? then 2 else 3 end",
+			bindings: []interface{}{3, 1, 2},
+		},
+		{
+			name:     "in order of empty values is noop",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").InOrderOf("id", nil) },
+			wantBase: `select * from "users"`,
+		},
+		{
+			name:     "in order of with union order",
+			build:    func(b *Builder) *Builder { return b.Select("id").From("users").Union(func(n *Builder) *Builder { return n.Select("id").From("archives") }).InOrderOf("id", []interface{}{2, 1}) },
+			wantBase: `(select "id" from "users") union (select "id" from "archives") order by case when "id" = ? then 0 when "id" = ? then 1 else 2 end`,
+		},
+	}
+	runGolden(t, cases)
+}
+
+func TestGoldenTimeout(t *testing.T) {
+	t.Run("mysql max execution time", func(t *testing.T) {
+		b := mysqlBuilder(t).Select("*").From("users").Where("id", "=", 1).Timeout(5)
+		want := "select /*+ MAX_EXECUTION_TIME(5000) */ * from `users` where `id` = ?"
+		if got := b.ToSql(); got != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+		}
+	})
+
+	t.Run("base dialect ignores timeout", func(t *testing.T) {
+		b := baseBuilder(t).Select("*").From("users").Timeout(5)
+		want := `select * from "users"`
+		if got := b.ToSql(); got != want {
+			t.Errorf("sql = %s", got)
+		}
+	})
+
+	t.Run("timeout must be positive", func(t *testing.T) {
+		defer func() {
+			if recover() == nil {
+				t.Error("expect panic on zero timeout")
+			}
+		}()
+		baseBuilder(t).Select("*").Timeout(0)
+	})
+}
+
+func TestGoldenOrderBySubQuery(t *testing.T) {
+	cases := []goldenCase{
+		{
+			name: "order by sub query column",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").OrderBy(func(n *Builder) *Builder {
+					return n.SelectRaw("count(*)").From("orders").WhereColumn("orders.user_id", "=", "users.id")
+				})
+			},
+			wantBase: `select * from "users" order by (select count(*) from "orders" where "orders"."user_id" = "users"."id") asc`,
+			bindings: []interface{}{},
+		},
+	}
+	runGolden(t, cases)
+}
+
+func TestGoldenForPageBeforeId(t *testing.T) {
+	cases := []goldenCase{
+		{
+			name: "for page before id",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").OrderBy("email").ForPageBeforeId(15, 10)
+			},
+			wantBase: `select * from "users" where "id" < ? order by "email" asc, "id" desc limit 15`,
+			bindings: []interface{}{10},
+		},
+		{
+			name: "for page before id nil last id",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").ForPageBeforeId(15, nil)
+			},
+			wantBase: `select * from "users" where "id" is not null order by "id" desc limit 15`,
+		},
+		{
+			name: "reorder desc",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").OrderBy("email").OrderBy("id").ReorderDesc("name")
+			},
+			wantBase: `select * from "users" order by "name" desc`,
+		},
+	}
+	runGolden(t, cases)
+}
+
+// ---- R3-A: JoinClause 体系 ----
+
+func TestGoldenJoinClosure(t *testing.T) {
+	t.Run("on and or on", func(t *testing.T) {
+		b := baseBuilder(t).Select("*").From("users").Join("contacts", func(j *Builder) *Builder {
+			return j.On("users.id", "=", "contacts.id").OrOn("users.name", "=", "contacts.name")
+		})
+		want := `select * from "users" inner join "contacts" on "users"."id" = "contacts"."id" or "users"."name" = "contacts"."name"`
+		if got := b.ToSql(); got != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+		}
+	})
+
+	t.Run("nested closure on", func(t *testing.T) {
+		b := baseBuilder(t).Select("*").From("users").Join("contacts", func(j *Builder) *Builder {
+			return j.On("users.id", "=", "contacts.id").OrOn(func(n *Builder) *Builder {
+				return n.On("users.name", "=", "contacts.name").OrOn("users.type", "=", "contacts.type")
+			})
+		})
+		want := `select * from "users" inner join "contacts" on "users"."id" = "contacts"."id" or ("users"."name" = "contacts"."name" or "users"."type" = "contacts"."type")`
+		if got := b.ToSql(); got != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+		}
+	})
+
+	t.Run("on with where binding", func(t *testing.T) {
+		b := baseBuilder(t).Select("*").From("users").Join("contacts", func(j *Builder) *Builder {
+			return j.On("users.id", "=", "contacts.id").Where("contacts.active", 1)
+		})
+		want := `select * from "users" inner join "contacts" on "users"."id" = "contacts"."id" and "contacts"."active" = ?`
+		if got := b.ToSql(); got != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+		}
+		if got := b.GetBindings(); !reflect.DeepEqual(got, []interface{}{1}) {
+			t.Errorf("bindings = %#v", got)
+		}
+	})
+}
+
+func TestGoldenJoinLateral(t *testing.T) {
+	sub := func(n *Builder) *Builder { return n.Select("id", "name").From("contacts").WhereColumn("contacts.user_id", "=", "users.id") }
+
+	t.Run("mysql", func(t *testing.T) {
+		b := mysqlBuilder(t).Select("*").From("users").JoinLateral(sub, "contacts")
+		want := "select * from `users` inner join lateral (select `id`, `name` from `contacts` where `contacts`.`user_id` = `users`.`id`) as `contacts` on true"
+		if got := b.ToSql(); got != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+		}
+	})
+
+	t.Run("mysql left lateral", func(t *testing.T) {
+		b := mysqlBuilder(t).Select("*").From("users").LeftJoinLateral(sub, "contacts")
+		want := "select * from `users` left join lateral (select `id`, `name` from `contacts` where `contacts`.`user_id` = `users`.`id`) as `contacts` on true"
+		if got := b.ToSql(); got != want {
+			t.Errorf("sql = %s", got)
+		}
+	})
+
+	t.Run("postgres", func(t *testing.T) {
+		b := pgBuilder(t).Select("*").From("users").JoinLateral(sub, "contacts")
+		want := `select * from "users" inner join lateral (select "id", "name" from "contacts" where "contacts"."user_id" = "users"."id") as "contacts" on true`
+		if got := b.ToSql(); got != want {
+			t.Errorf("sql = %s", got)
+		}
+	})
+
+	t.Run("sqlserver cross apply", func(t *testing.T) {
+		g := grammar.NewSqlServerGrammar()
+		b := NewBuilder(nil, g).Select("*").From("users").JoinLateral(sub, "contacts")
+		want := "select * from [users] cross apply (select [id], [name] from [contacts] where [contacts].[user_id] = [users].[id]) as [contacts]"
+		if got := b.ToSql(); got != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+		}
+	})
+
+	t.Run("sqlserver outer apply", func(t *testing.T) {
+		g := grammar.NewSqlServerGrammar()
+		b := NewBuilder(nil, g).Select("*").From("users").LeftJoinLateral(sub, "contacts")
+		want := "select * from [users] outer apply (select [id], [name] from [contacts] where [contacts].[user_id] = [users].[id]) as [contacts]"
+		if got := b.ToSql(); got != want {
+			t.Errorf("sql = %s", got)
+		}
+	})
+
+	t.Run("base dialect panics", func(t *testing.T) {
+		defer func() {
+			if recover() == nil {
+				t.Error("expect panic")
+			}
+		}()
+		baseBuilder(t).Select("*").From("users").JoinLateral(sub, "contacts").ToSql()
+	})
+
+	t.Run("mariadb panics", func(t *testing.T) {
+		defer func() {
+			if recover() == nil {
+				t.Error("expect panic")
+			}
+		}()
+		g := grammar.NewMariaDbGrammar()
+		NewBuilder(nil, g).Select("*").From("users").JoinLateral(sub, "contacts").ToSql()
+	})
+}
+
+func TestGoldenCrossJoinSub(t *testing.T) {
+	cases := []goldenCase{
+		{
+			name: "cross join sub",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").CrossJoinSub(func(n *Builder) *Builder { return n.Select("id").From("contacts") }, "contacts")
+			},
+			wantBase:  `select * from "users" cross join (select "id" from "contacts") as "contacts"`,
+			wantMySQL: "select * from `users` cross join (select `id` from `contacts`) as `contacts`",
+		},
+	}
+	runGolden(t, cases)
+}
+
+func TestGoldenStraightJoin(t *testing.T) {
+	t.Run("mysql supported", func(t *testing.T) {
+		b := mysqlBuilder(t).Select("*").From("users").StraightJoin("contacts", "users.id", "=", "contacts.user_id")
+		want := "select * from `users` straight_join `contacts` on `users`.`id` = `contacts`.`user_id`"
+		if got := b.ToSql(); got != want {
+			t.Errorf("sql = %s", got)
+		}
+	})
+
+	t.Run("base dialect panics", func(t *testing.T) {
+		defer func() {
+			if recover() == nil {
+				t.Error("expect panic")
+			}
+		}()
+		baseBuilder(t).Select("*").From("users").StraightJoin("contacts", "users.id", "=", "contacts.user_id").ToSql()
+	})
+}
+
+// ---- R3-A: whereAll / whereAny / whereNone / whereExpression / bitwise ----
+
+func TestGoldenWhereAllAnyNone(t *testing.T) {
+	cases := []goldenCase{
+		{
+			name:     "where all",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").WhereAll([]interface{}{"a", "b"}, "=", 1) },
+			wantBase: `select * from "users" where ("a" = ? and "b" = ?)`,
+			wantMySQL: "select * from `users` where (`a` = ? and `b` = ?)",
+			bindings: []interface{}{1, 1},
+		},
+		{
+			name:     "or where all",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").Where("id", 1).OrWhereAll([]interface{}{"a", "b"}, "=", 1) },
+			wantBase: `select * from "users" where "id" = ? or ("a" = ? and "b" = ?)`,
+		},
+		{
+			name:     "where any",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").WhereAny([]interface{}{"a", "b"}, "=", 1) },
+			wantBase: `select * from "users" where ("a" = ? or "b" = ?)`,
+		},
+		{
+			name:     "or where any",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").Where("id", 1).OrWhereAny([]interface{}{"a", "b"}, "=", 1) },
+			wantBase: `select * from "users" where "id" = ? or ("a" = ? or "b" = ?)`,
+		},
+		{
+			name:     "where none",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").WhereNone([]interface{}{"a", "b"}, "=", 1) },
+			wantBase: `select * from "users" where not ("a" = ? or "b" = ?)`,
+		},
+		{
+			name:     "or where none",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").Where("id", 1).OrWhereNone([]interface{}{"a", "b"}, "=", 1) },
+			wantBase: `select * from "users" where "id" = ? or not ("a" = ? or "b" = ?)`,
+		},
+	}
+	runGolden(t, cases)
+}
+
+func TestGoldenWhereExpression(t *testing.T) {
+	cases := []goldenCase{
+		{
+			name:     "where expression",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").WhereExpression("ISNULL(`name`)", "or") },
+			wantBase: `select * from "users" where ISNULL(` + "`name`" + `)`,
+		},
+	}
+	runGolden(t, cases)
+}
+
+func TestGoldenBitwise(t *testing.T) {
+	cases := []goldenCase{
+		{
+			name:     "base bitwise where compiles basic",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").Where("flags", "&", 1) },
+			wantBase: `select * from "users" where "flags" & ?`,
+			wantMySQL: "select * from `users` where `flags` & ?",
+		},
+		{
+			name:  "postgres bitwise casts bool",
+			build: func(b *Builder) *Builder { return pgBuilder(t).Select("*").From("users").Where("flags", "&", 1) },
+			wantBase: `select * from "users" where ("flags" & ?)::bool`,
+		},
+		{
+			name:  "postgres bitwise escaped operator",
+			build: func(b *Builder) *Builder { return pgBuilder(t).Select("*").From("users").Where("flags", ">>", 1) },
+			wantBase: `select * from "users" where ("flags" >> ?)::bool`,
+		},
+		{
+			name:  "sqlserver bitwise != 0",
+			build: func(b *Builder) *Builder {
+				g := grammar.NewSqlServerGrammar()
+				return NewBuilder(nil, g).Select("*").From("users").Where("flags", "&", 1)
+			},
+			wantBase: "select * from [users] where ([flags] & ?) != 0",
+		},
+	}
+	runGolden(t, cases)
+
+	t.Run("postgres bitwise having", func(t *testing.T) {
+		b := pgBuilder(t).Select("*").From("users").GroupBy("id").Having("flags", "&", 1)
+		want := `select * from "users" group by "id" having ("flags" & ?)::bool`
+		if got := b.ToSql(); got != want {
+			t.Errorf("sql = %s", got)
+		}
+	})
+
+	t.Run("sqlserver bitwise having", func(t *testing.T) {
+		g := grammar.NewSqlServerGrammar()
+		b := NewBuilder(nil, g).Select("*").From("users").GroupBy("id").Having("flags", "&", 1)
+		want := "select * from [users] group by [id] having ([flags] & ?) != 0"
+		if got := b.ToSql(); got != want {
+			t.Errorf("sql = %s", got)
+		}
+	})
+}
+
+// ---- R3-A: 方言残余 ----
+
+func TestGoldenSqlServerResiduals(t *testing.T) {
+	sqlserver := func(t *testing.T) *Builder {
+		return NewBuilder(nil, grammar.NewSqlServerGrammar())
+	}
+
+	t.Run("upsert merge", func(t *testing.T) {
+		b := sqlserver(t).From("users")
+		sql, bindings := b.GetGrammar().CompileUpsert(b.Query, []query.Row{
+			query.ToRow(map[string]any{"email": "foo", "name": "bar"}),
+		}, []string{"email"}, []string{"name"})
+		want := "merge [users] using (values (?, ?)) [laravel_source] ([email], [name]) on [laravel_source].[email] = [users].[email] when matched then update set [name] = [laravel_source].[name] when not matched then insert ([email], [name]) values ([email], [name]);"
+		if sql != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", sql, want)
+		}
+		if !reflect.DeepEqual(bindings, []any{"foo", "bar"}) {
+			t.Errorf("bindings = %#v", bindings)
+		}
+	})
+
+	t.Run("update top n", func(t *testing.T) {
+		b := sqlserver(t).From("users").Where("email", "=", "foo").Limit(5)
+		sql := b.GetGrammar().CompileUpdate(b.Query, map[string]any{"name": "bar"})
+		want := "update top (5) [users] set [name] = ? where [email] = ?"
+		if sql != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", sql, want)
+		}
+	})
+
+	t.Run("update with joins uses alias from", func(t *testing.T) {
+		b := sqlserver(t).From("users").Join("contacts", "users.id", "=", "contacts.user_id")
+		sql := b.GetGrammar().CompileUpdate(b.Query, map[string]any{"name": "bar"})
+		want := "update [users] set [name] = ? from [users] inner join [contacts] on [users].[id] = [contacts].[user_id]"
+		if sql != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", sql, want)
+		}
+	})
+
+	t.Run("delete top n", func(t *testing.T) {
+		b := sqlserver(t).From("users").Where("email", "=", "foo").Limit(5)
+		sql := b.GetGrammar().CompileDelete(b.Query)
+		want := "delete top (5) from [users] where [email] = ?"
+		if sql != want {
+			t.Errorf("sql = %s", sql)
+		}
+	})
+
+	t.Run("wrap union as temp table", func(t *testing.T) {
+		b := sqlserver(t).Select("id").From("users").Union(func(n *Builder) *Builder { return n.Select("id").From("archives") })
+		want := "select * from (select [id] from [users]) as [temp_table] union select * from (select [id] from [archives]) as [temp_table]"
+		if got := b.ToSql(); got != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+		}
+	})
+
+	t.Run("row number empty orders fallback", func(t *testing.T) {
+		g := grammar.NewSqlServerGrammar()
+		b := NewBuilder(nil, g).From("users").Select("*")
+		b.Query.GroupLimit = &query.GroupLimit{Column: "id", Value: 2}
+		want := `select * from (select *, row_number() over (partition by [id] order by (select 0)) as [laravel_row] from [users]) as [laravel_table] where [laravel_row] <= 2 order by [laravel_row]`
+		if got := b.ToSql(); got != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+		}
+	})
+
+	t.Run("save transaction savepoints", func(t *testing.T) {
+		g := grammar.NewSqlServerGrammar()
+		if got := g.CompileSavepoint("sp1"); got != "SAVE TRANSACTION sp1" {
+			t.Errorf("savepoint = %s", got)
+		}
+		if got := g.CompileSavepointRollBack("sp1"); got != "ROLLBACK TRANSACTION sp1" {
+			t.Errorf("rollback = %s", got)
+		}
+	})
+
+	t.Run("date format with milliseconds", func(t *testing.T) {
+		g := grammar.NewSqlServerGrammar()
+		if got := g.GetDateFormat(); got != "Y-m-d H:i:s.v" {
+			t.Errorf("date format = %s", got)
+		}
+	})
+
+	t.Run("null safe equals intersect", func(t *testing.T) {
+		b := sqlserver(t).Select("*").From("users").Where("a", "<=>", 1)
+		want := "select * from [users] where exists (select [a] intersect select ?)"
+		if got := b.ToSql(); got != want {
+			t.Errorf("sql = %s", got)
+		}
+	})
+
+	t.Run("json value cast", func(t *testing.T) {
+		g := grammar.NewSqlServerGrammar()
+		if got := g.CompileJsonValueCast("?"); got != "json_query(?)" {
+			t.Errorf("cast = %s", got)
+		}
+	})
+}
+
+func TestGoldenMySqlResiduals(t *testing.T) {
+	t.Run("upsert alias", func(t *testing.T) {
+		g := grammar.NewMySqlGrammar()
+		g.SetUseUpsertAlias(true)
+		b := NewBuilder(nil, g).From("users")
+		sql, _ := b.GetGrammar().CompileUpsert(b.Query, []query.Row{query.ToRow(map[string]any{"email": "foo", "name": "bar"})}, []string{"email"}, []string{"name"})
+		want := "insert into `users` (`email`, `name`) values (?, ?) as laravel_upsert_alias on duplicate key update `name` = `laravel_upsert_alias`.`name`"
+		if sql != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", sql, want)
+		}
+	})
+
+	t.Run("prepare bindings for update json", func(t *testing.T) {
+		g := grammar.NewMySqlGrammar()
+		bindings := map[string][]any{
+			"join":  {"j1"},
+			"where": {"w1"},
+		}
+		values := map[string]any{
+			"options->active": true,
+			"tags":            []any{"a", "b"},
+			"name":            "x",
+		}
+		got := g.PrepareBindingsForUpdate(bindings, values)
+		// bool 值被剔除；数组 json_encode；顺序：join、values（sorted keys）、where
+		want := []any{"j1", "x", `["a","b"]`, "w1"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("bindings = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("json value cast", func(t *testing.T) {
+		g := grammar.NewMySqlGrammar()
+		if got := g.CompileJsonValueCast("?"); got != "cast(? as json)" {
+			t.Errorf("cast = %s", got)
+		}
+	})
+}
+
+func TestGoldenMariaDbResiduals(t *testing.T) {
+	g := grammar.NewMariaDbGrammar()
+	b := NewBuilder(nil, g).Select("*").From("users").Where("options->theme", "=", "dark")
+	want := "select * from `users` where json_value(`options`, '$.\"theme\"') = ?"
+	if got := b.ToSql(); got != want {
+		t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+	}
+	if got := g.CompileJsonValueCast("?"); got != "json_query(?, '$')" {
+		t.Errorf("cast = %s", got)
+	}
+}
+
+func TestGoldenPostgresResiduals(t *testing.T) {
+	t.Run("truncate cascade", func(t *testing.T) {
+		b := pgBuilder(t).From("users")
+		stmts := b.GetGrammar().CompileTruncate(b.Query)
+		if len(stmts) != 1 || stmts[0].Sql != `truncate "users" restart identity cascade` {
+			t.Errorf("stmts = %#v", stmts)
+		}
+	})
+
+	t.Run("full text language whitelist", func(t *testing.T) {
+		b := pgBuilder(t).Select("*").From("users").WhereFullText("body", "hello", map[string]any{"language": "klingon"})
+		want := `select * from "users" where (to_tsvector('english', "body")) @@ plainto_tsquery('english', ?)`
+		if got := b.ToSql(); got != want {
+			t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+		}
+		b2 := pgBuilder(t).Select("*").From("users").WhereFullText("body", "hello", map[string]any{"language": "russian"})
+		want2 := `select * from "users" where (to_tsvector('russian', "body")) @@ plainto_tsquery('russian', ?)`
+		if got := b2.ToSql(); got != want2 {
+			t.Errorf("sql = %s", got)
+		}
+	})
+
+	t.Run("substitute bindings into raw sql unescapes operators", func(t *testing.T) {
+		g := grammar.NewPostgresGrammar()
+		got := g.SubstituteBindingsIntoRawSql("data ?? 'key' and id = ?", []any{1})
+		want := "data ? 'key' and id = 1"
+		if got != want {
+			t.Errorf("sql = %s, want %s", got, want)
+		}
+		got2 := g.SubstituteBindingsIntoRawSql("arr ??| ? and id = ?", []any{"a", 1})
+		want2 := "arr ?| 'a' and id = 1"
+		if got2 != want2 {
+			t.Errorf("sql = %s, want %s", got2, want2)
+		}
+	})
+
+	t.Run("prepare bindings for update json encoding", func(t *testing.T) {
+		g := grammar.NewPostgresGrammar()
+		bindings := map[string][]any{"join": {"j1"}, "where": {"w1"}}
+		values := map[string]any{"tags": []any{"a"}, "options->x": "y", "name": "n"}
+		got := g.PrepareBindingsForUpdate(bindings, values)
+		want := []any{"n", `"y"`, `["a"]`, "j1", "w1"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("bindings = %#v, want %#v", got, want)
+		}
+	})
+}
+
+// ---- 20261106 报告查询层补全（WhereValueBetween 族 / NullSafeEquals /
+// orWhereJsonDoesntOverlap / straightJoinSub / average / ddRawSql /
+// GroupLimit / insertOrIgnoreReturning / 操作符表）----
+
+// ★ whereValueBetween 族（Builder.php:1789-1843）：值介于两列之间
+func TestGoldenWhereValueBetween(t *testing.T) {
+	cases := []goldenCase{
+		{
+			name: "where value between",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").WhereValueBetween(7, []interface{}{"min_salary", "max_salary"})
+			},
+			wantBase:  `select * from "users" where ? between "min_salary" and "max_salary"`,
+			wantMySQL: "select * from `users` where ? between `min_salary` and `max_salary`",
+			bindings:  []interface{}{7},
+		},
+		{
+			name: "or where value between",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").Where("id", "=", 1).
+					OrWhereValueBetween(7, []interface{}{"min_salary", "max_salary"})
+			},
+			wantBase: `select * from "users" where "id" = ? or ? between "min_salary" and "max_salary"`,
+			bindings: []interface{}{1, 7},
+		},
+		{
+			name: "where value not between",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").WhereValueNotBetween(7, []interface{}{"a", "b"})
+			},
+			wantBase: `select * from "users" where ? not between "a" and "b"`,
+			bindings: []interface{}{7},
+		},
+		{
+			name: "or where value not between",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").Where("id", "=", 1).
+					OrWhereValueNotBetween(7, []interface{}{"a", "b"})
+			},
+			wantBase: `select * from "users" where "id" = ? or ? not between "a" and "b"`,
+			bindings: []interface{}{1, 7},
+		},
+	}
+	runGolden(t, cases)
+}
+
+// ★ whereNullSafeEquals（Builder.php:1442-1467）
+func TestGoldenWhereNullSafeEquals(t *testing.T) {
+	cases := []goldenCase{
+		{
+			name: "where null safe equals",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").WhereNullSafeEquals("score", 10)
+			},
+			wantBase:  `select * from "users" where "score" is not distinct from ?`,
+			wantMySQL: "select * from `users` where `score` <=> ?",
+			bindings:  []interface{}{10},
+		},
+		{
+			name: "or where null safe equals",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").Where("id", "=", 1).OrWhereNullSafeEquals("score", nil)
+			},
+			wantBase: `select * from "users" where "id" = ? or "score" is not distinct from ?`,
+			bindings: []interface{}{1, nil},
+		},
+	}
+	runGolden(t, cases)
+
+	// SqlServer 方言：nullSafeEquals 编译为 =（null 值时 is）
+	b := NewBuilder(nil, grammar.NewSqlServerGrammar()).Select("*").From("users").WhereNullSafeEquals("score", 10)
+	if got := b.ToSql(); got != "select * from [users] where exists (select [score] intersect select ?)" {
+		t.Errorf("sqlserver sql = %s", got)
+	}
+}
+
+// ★ orWhereJsonDoesntOverlap（Builder.php:2420）与 whereJsonOverlaps 族对齐
+func TestGoldenWhereJsonOverlaps(t *testing.T) {
+	cases := []goldenCase{
+		{
+			name: "where json overlaps",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").WhereJsonOverlaps("tags", []interface{}{"a", "b"})
+			},
+			wantMySQL: "select * from `users` where json_overlaps(`tags`, ?)",
+			bindings:  []interface{}{`["a","b"]`},
+		},
+		{
+			name: "or where json doesnt overlap",
+			build: func(b *Builder) *Builder {
+				return b.Select("*").From("users").Where("id", "=", 1).
+					OrWhereJsonDoesntOverlap("tags", []interface{}{"a"})
+			},
+			wantMySQL: "select * from `users` where `id` = ? or not json_overlaps(`tags`, ?)",
+			bindings:  []interface{}{1, `["a"]`},
+		},
+	}
+	runGolden(t, cases)
+}
+
+// ★ straightJoinSub（Builder.php:874）
+func TestGoldenStraightJoinSub(t *testing.T) {
+	sub := func(nb *Builder) *Builder {
+		return nb.Select("*").From("contacts")
+	}
+	b := mysqlBuilder(t).Select("*").From("users").
+		StraightJoinSub(sub, "contacts", "users.id", "=", "contacts.user_id")
+	want := "select * from `users` straight_join (select * from `contacts`) as `contacts` on `users`.`id` = `contacts`.`user_id`"
+	if got := b.ToSql(); got != want {
+		t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+	}
+
+	// 基础方言：straight_join 不支持，编译时 panic
+	defer func() {
+		if recover() == nil {
+			t.Error("expect panic on base dialect")
+		}
+	}()
+	baseBuilder(t).Select("*").From("users").
+		StraightJoinSub(sub, "contacts", "users.id", "=", "contacts.user_id").ToSql()
+}
+
+// ★ average = avg 别名（Builder.php:4112）
+func TestBuilderAverageAlias(t *testing.T) {
+	conn, st := newFakeDB(t)
+	st.On("select avg(`price`) as `aggregate` from `products`", &fakeResult{
+		Columns: []string{"aggregate"},
+		Rows:    [][]driver.Value{{"9.75"}},
+	})
+	var avg float64
+	if err := conn.Table("products").Average("price", &avg); err != nil {
+		t.Fatal(err)
+	}
+	if avg != 9.75 {
+		t.Errorf("average = %v", avg)
+	}
+}
+
+// ★ GroupLimit 公开入口（Builder.php:3247）
+func TestBuilderGroupLimitEntry(t *testing.T) {
+	b := baseBuilder(t).Select("posts.*").From("posts").OrderBy("created_at", "desc").GroupLimit(2, "user_id")
+	want := `select * from (select "posts".*, row_number() over (partition by "user_id" order by "created_at" desc) as "laravel_row" from "posts") as "laravel_table" where "laravel_row" <= 2 order by "laravel_row"`
+	if got := b.ToSql(); got != want {
+		t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
+	}
+	// 负值不设置（对齐 Laravel if ($value >= 0)）
+	nb := baseBuilder(t).Select("*").From("posts").GroupLimit(-1, "user_id")
+	if nb.Query.GroupLimit != nil {
+		t.Errorf("negative groupLimit should be ignored, got %+v", nb.Query.GroupLimit)
+	}
+}
+
+// ★ insertOrIgnoreReturning（Builder.php:4262）：方言钩子未接线时 panic
+// ErrUnsupported；空 values 不发 SQL
+func TestBuilderInsertOrIgnoreReturning(t *testing.T) {
+	b := mysqlBuilder(t).From("users")
+	if rows, err := b.InsertOrIgnoreReturning(nil, []string{"id"}); err != nil || len(rows) != 0 {
+		t.Errorf("empty values = %v, %v", rows, err)
+	}
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("expect ErrUnsupported panic without grammar hook")
+			}
+		}()
+		_, _ = mysqlBuilder(t).From("users").InsertOrIgnoreReturning(
+			[]interface{}{map[string]interface{}{"name": "a"}}, []string{"id"})
+	}()
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("expect panic for empty returning")
+			}
+		}()
+		_, _ = mysqlBuilder(t).From("users").InsertOrIgnoreReturning(
+			[]interface{}{map[string]interface{}{"name": "a"}}, nil)
+	}()
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("expect panic for empty uniqueBy")
+			}
+		}()
+		_, _ = mysqlBuilder(t).From("users").InsertOrIgnoreReturning(
+			[]interface{}{map[string]interface{}{"name": "a"}}, []string{"id"}, []string{})
+	}()
+}
+
+// ★ 操作符表补全（Builder.php:248-255：is / is not / &~ / ~~* / !~~* 等）
+func TestGoldenOperatorTable(t *testing.T) {
+	cases := []goldenCase{
+		{
+			name:     "is operator",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").Where("flags", "is", grammar.NewExpression("null")) },
+			wantBase: `select * from "users" where "flags" is null`,
+		},
+		{
+			name:     "is not operator",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").Where("flags", "is not", grammar.NewExpression("null")) },
+			wantBase: `select * from "users" where "flags" is not null`,
+		},
+		{
+			name:     "tilde tilde star operator",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").Where("name", "~~*", "a%") },
+			wantBase: `select * from "users" where "name" ~~* ?`,
+			bindings: []interface{}{"a%"},
+		},
+		{
+			name:     "bang tilde tilde operator",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").Where("name", "!~~", "a%") },
+			wantBase: `select * from "users" where "name" !~~ ?`,
+			bindings: []interface{}{"a%"},
+		},
+		{
+			name:     "and tilde bitwise operator",
+			build:    func(b *Builder) *Builder { return b.Select("*").From("users").Where("flags", "&~", 1) },
+			wantBase: `select * from "users" where "flags" &~ ?`,
+			bindings: []interface{}{1},
+		},
+	}
+	runGolden(t, cases)
+
+	// &~ 是位运算符（Laravel $bitwiseOperators），PG 编译追加 ::bool
+	b := pgBuilder(t).Select("*").From("users").Where("flags", "&~", 1)
+	if got := b.ToSql(); got != `select * from "users" where ("flags" &~ ?)::bool` {
+		t.Errorf("pg bitwise and-tilde = %s", got)
+	}
+}
+
+// ★ DDRawSql：打印内联绑定 SQL 后返回 builder（不做 os.Exit，与 Laravel dd 的
+// 差异见 DDRawSql 注释）
+func TestBuilderDDRawSql(t *testing.T) {
+	b := baseBuilder(t).Select("*").From("users").Where("id", "=", 1)
+	if got := b.DDRawSql(); got != b {
+		t.Error("DDRawSql should return the builder")
+	}
+}
+
+// CompileInsertOrIgnoreReturning：PG/SQLite 方言已接线（Laravel
+// PostgresGrammar.php:406-414 / SQLiteGrammar.php:300-309）；SqlServer 无此
+// 编译（Laravel 亦无），panic 即正确行为。
+func TestGoldenInsertOrIgnoreReturningWired(t *testing.T) {
+	pg := grammar.NewPostgresGrammar()
+	q := &query.Query{From: "users"}
+	sql, bindings := pg.CompileInsertOrIgnoreReturning(q,
+		[]query.Row{toRow(map[string]interface{}{"email": "foo"})},
+		[]string{"id", "email"}, []string{"email"})
+	want := `insert into "users" ("email") values (?) on conflict ("email") do nothing returning "id", "email"`
+	if sql != want {
+		t.Errorf("pg sql = %s\nwant %s", sql, want)
+	}
+	if len(bindings) != 1 || bindings[0] != "foo" {
+		t.Errorf("bindings = %#v", bindings)
+	}
+
+	sq := grammar.NewSqliteQueryGrammar()
+	sql2, _ := sq.CompileInsertOrIgnoreReturning(q,
+		[]query.Row{toRow(map[string]interface{}{"email": "foo"})},
+		[]string{"id"}, nil)
+		// SQLiteGrammar.php:300-309：compileInsertOrIgnoreReturning =
+	// compileInsertOrIgnore（insert or ignore，无 on conflict）+ returning
+	want2 := `insert or ignore into "users" ("email") values (?) returning "id"`
+	if sql2 != want2 {
+		t.Errorf("sqlite sql = %s\nwant %s", sql2, want2)
 	}
 }

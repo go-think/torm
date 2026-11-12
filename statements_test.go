@@ -490,3 +490,186 @@ func TestExecInsertOrIgnoreUsing(t *testing.T) {
 		t.Errorf("args = %#v", call.Args)
 	}
 }
+
+// ---- R3-A: SQLite 写入族执行级 ----
+
+func execSqliteBuilder(t *testing.T) (*Builder, *fakeStore) {
+	t.Helper()
+	conn, st := newFakeDB(t)
+	b := conn.Query()
+	b.grammar = grammar.NewSqliteQueryGrammar()
+	return b, st
+}
+
+func TestExecSqliteInsertOrIgnoreAndTruncate(t *testing.T) {
+	b, st := execSqliteBuilder(t)
+
+	// insert or ignore
+	sql := `insert or ignore into "users" ("email") values (?)`
+	st.On(sql, &fakeResult{Affected: 1})
+	if _, err := b.From("users").InsertOrIgnore([]interface{}{map[string]interface{}{"email": "foo"}}); err != nil {
+		t.Fatal(err)
+	}
+	call := st.LastCall(t, sql)
+	if !reflect.DeepEqual(asAny(call.Args), []any{"foo"}) {
+		t.Errorf("args = %#v", call.Args)
+	}
+
+	// truncate：两条语句，先表后 sqlite_sequence（Laravel 顺序），绑定带前缀表名
+	st.On(`delete from "users"`, &fakeResult{Affected: 0})
+	st.On(`delete from "sqlite_sequence" where name = ?`, &fakeResult{Affected: 0})
+	if err := b.Truncate(); err != nil {
+		t.Fatal(err)
+	}
+	call = st.LastCall(t, `delete from "sqlite_sequence" where name = ?`)
+	if !reflect.DeepEqual(asAny(call.Args), []any{"users"}) {
+		t.Errorf("truncate binding = %#v", call.Args)
+	}
+}
+
+func TestExecSqliteUpdateLimitRowid(t *testing.T) {
+	b, st := execSqliteBuilder(t)
+	sql := `update "users" set "name" = ? where "rowid" in (select "users"."rowid" from "users" where "email" = ? limit 1)`
+	st.On(sql, &fakeResult{Affected: 1})
+	if _, err := b.From("users").Where("email", "=", "foo").Limit(1).Update(map[string]interface{}{"name": "bar"}); err != nil {
+		t.Fatal(err)
+	}
+	call := st.LastCall(t, sql)
+	// SQLite 绑定顺序：values 在前，随后是全部非 select 段绑定
+	if !reflect.DeepEqual(asAny(call.Args), []any{"bar", "foo"}) {
+		t.Errorf("args = %#v", call.Args)
+	}
+}
+
+// ---- R3-A: UpdateFrom（PG）执行级 ----
+
+func TestExecUpdateFromPg(t *testing.T) {
+	conn, st := newFakeDB(t)
+	b := conn.Query()
+	b.grammar = grammar.NewPostgresGrammar()
+
+	sql := `update "users" set "name" = ? from "contacts" where "email" = ? and "users"."id" = "contacts"."user_id"`
+	st.On(sql, &fakeResult{Affected: 1})
+	b.From("users").Where("email", "=", "foo").Join("contacts", "users.id", "=", "contacts.user_id")
+	if _, err := b.UpdateFrom(map[string]interface{}{"name": "bar"}); err != nil {
+		t.Fatal(err)
+	}
+	call := st.LastCall(t, sql)
+	// PG UpdateFrom 绑定顺序：values、where、其余段
+	if !reflect.DeepEqual(asAny(call.Args), []any{"bar", "foo"}) {
+		t.Errorf("args = %#v", call.Args)
+	}
+}
+
+// ---- R3-A: MySQL prepareBindingsForUpdate JSON 执行级 ----
+
+func TestExecMySqlUpdateJsonBindings(t *testing.T) {
+	b, st := execMySQLBuilder(t)
+	// JSON 选择器上的 bool 被编译为 raw true（剔除绑定）；数组 json_encode
+	sql := "update `users` set `options` = json_set(`options`, '$.\"active\"', true), `tags` = ? where `id` = ?"
+	st.On(sql, &fakeResult{Affected: 1})
+	if _, err := b.From("users").Where("id", "=", 1).Update(map[string]interface{}{
+		"tags":            []interface{}{"a", "b"},
+		"options->active": true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	call := st.LastCall(t, sql)
+	if !reflect.DeepEqual(asAny(call.Args), []any{`["a","b"]`, int64(1)}) {
+		t.Errorf("args = %#v", call.Args)
+	}
+}
+
+// ---- R3-A: BeforeQuery / AfterQuery 回调 ----
+
+func TestExecBeforeQueryCallbacks(t *testing.T) {
+	b, st := execBaseBuilder(t)
+	sql := `select * from "users" where "email" = ?`
+	st.On(sql, &fakeResult{Columns: []string{"id"}, Rows: [][]driver.Value{{int64(1)}}})
+
+	var seen *Builder
+	b.BeforeQuery(func(nb *Builder) { seen = nb; nb.Where("email", "foo") })
+
+	type idRow struct {
+		Id int64 `torm:"column:id"`
+	}
+	var dest []idRow
+	if err := b.From("users").Get(&dest); err != nil {
+		t.Fatal(err)
+	}
+	if seen == nil {
+		t.Error("before query callback not invoked")
+	}
+	st.LastCall(t, sql)
+
+	// 写入路径同样应用
+	sql2 := `insert into "users" ("email") values (?)`
+	st.On(sql2, &fakeResult{Affected: 1})
+	if _, _, err := b.From("users").Insert(map[string]interface{}{"email": "x"}); err != nil {
+		t.Fatal(err)
+	}
+	st.LastCall(t, sql2)
+}
+
+func TestExecAfterQueryCallbacks(t *testing.T) {
+	b, st := execBaseBuilder(t)
+	sql := `select * from "users"`
+	st.On(sql, &fakeResult{Columns: []string{"id"}, Rows: [][]driver.Value{{int64(1)}}})
+
+	invoked := false
+	b.AfterQuery(func(result any) any { invoked = true; return nil })
+
+	type idRow struct {
+		Id int64 `torm:"column:id"`
+	}
+	var dest []idRow
+	if err := b.From("users").Get(&dest); err != nil {
+		t.Fatal(err)
+	}
+	if !invoked {
+		t.Error("after query callback not invoked")
+	}
+}
+
+// ---- R3-A: IncrementEach / DecrementEach 执行级 ----
+
+func TestExecIncrementEach(t *testing.T) {
+	b, st := execBaseBuilder(t)
+	sql := `update "users" set "points" = "points" + 3, "status" = ?, "votes" = "votes" + 2 where "id" = ?`
+	st.On(sql, &fakeResult{Affected: 1})
+	if _, err := b.From("users").Where("id", "=", 1).IncrementEach(map[string]float64{"votes": 2, "points": 3}, map[string]interface{}{"status": "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	call := st.LastCall(t, sql)
+	if !reflect.DeepEqual(asAny(call.Args), []any{"ok", int64(1)}) {
+		t.Errorf("args = %#v", call.Args)
+	}
+}
+
+func TestExecDecrementEach(t *testing.T) {
+	b, st := execBaseBuilder(t)
+	sql := `update "users" set "votes" = "votes" - 1 where "id" = ?`
+	st.On(sql, &fakeResult{Affected: 1})
+	if _, err := b.From("users").Where("id", "=", 1).DecrementEach(map[string]float64{"votes": 1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	st.LastCall(t, sql)
+}
+
+// ---- R3-A: SqlServer MERGE upsert 执行级 ----
+
+func TestExecSqlServerMergeUpsert(t *testing.T) {
+	conn, st := newFakeDB(t)
+	b := conn.Query()
+	b.grammar = grammar.NewSqlServerGrammar()
+
+	sql := "merge [users] using (values (?, ?)) [laravel_source] ([email], [name]) on [laravel_source].[email] = [users].[email] when matched then update set [name] = [laravel_source].[name] when not matched then insert ([email], [name]) values ([email], [name]);"
+	st.On(sql, &fakeResult{Affected: 1})
+	if _, err := b.From("users").Upsert([]interface{}{map[string]interface{}{"email": "foo", "name": "bar"}}, []string{"email"}, []string{"name"}); err != nil {
+		t.Fatal(err)
+	}
+	call := st.LastCall(t, sql)
+	if !reflect.DeepEqual(asAny(call.Args), []any{"foo", "bar"}) {
+		t.Errorf("args = %#v", call.Args)
+	}
+}

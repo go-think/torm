@@ -215,3 +215,44 @@ func TestReadWriteSplitRouting(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// ---- R3-A: ForPageBeforeId 游标式翻页（倒序 id 游标） ----
+
+func TestForPageBeforeIdWalksPages(t *testing.T) {
+	b, st := execBaseBuilder(t)
+	// 第一页：lastId 为 nil → where id is not null
+	sql1 := `select * from "users" where "id" is not null order by "id" desc limit 2`
+	st.On(sql1, &fakeResult{Columns: []string{"id"}, Rows: [][]driver.Value{{int64(4)}, {int64(3)}}})
+	// 第二页：id < 3
+	sql2 := `select * from "users" where "id" < ? order by "id" desc limit 2`
+	st.On(sql2, &fakeResult{Columns: []string{"id"}, Rows: [][]driver.Value{{int64(2)}, {int64(1)}}})
+	// 第三页：空，终止
+	st.On(sql2, &fakeResult{Columns: []string{"id"}, Rows: nil})
+
+	type idRow struct {
+		Id int64 `torm:"column:id"`
+	}
+
+	var lastId any
+	pages := 0
+	seen := 0
+	for {
+		var dest []idRow
+		nb := b.Clone().From("users").ForPageBeforeId(2, lastId)
+		if err := nb.Get(&dest); err != nil {
+			t.Fatal(err)
+		}
+		if len(dest) == 0 {
+			break
+		}
+		pages++
+		seen += len(dest)
+		lastId = dest[len(dest)-1].Id
+		if pages > 5 {
+			t.Fatal("loop did not terminate")
+		}
+	}
+	if pages != 2 || seen != 4 {
+		t.Errorf("pages=%d seen=%d", pages, seen)
+	}
+}

@@ -1,6 +1,7 @@
 package grammar
 
 import (
+	"encoding/json"
 	"regexp"
 	"strconv"
 	"strings"
@@ -12,7 +13,23 @@ import (
 // 方言差异通过构造器注入的钩子实现；必须使用 NewMySqlGrammar 构造。
 type MySqlGrammar struct {
 	QueryGrammar
+
+	// useUpsertAlias：upsert 编译走 as laravel_upsert_alias 形式
+	// （对应连接配置 use_upsert_alias）。
+	useUpsertAlias bool
+
+	// D7 版本分支注入参数（对应 Laravel connection->getServerVersion()/isMaria()，
+	// 经 SetServerVersion/SetIsMaria 注入，避免 grammar 反向依赖 connection）。
+	serverVersion string
+	isMaria       bool
 }
+
+// SetServerVersion 注入服务器版本（如 "8.0.36" / "10.5.2-MariaDB"）；
+// 空串表示未知，各方言版本分支保守取现代语法。
+func (g *MySqlGrammar) SetServerVersion(v string) { g.serverVersion = v }
+
+// SetIsMaria 标记 MariaDB 方言（对应 connection->isMaria()，按 driver 传入）。
+func (g *MySqlGrammar) SetIsMaria(v bool) { g.isMaria = v }
 
 func NewMySqlGrammar() *MySqlGrammar {
 	g := &MySqlGrammar{}
@@ -38,6 +55,10 @@ func NewMySqlGrammar() *MySqlGrammar {
 	g.compileLimitFn = g.compileLimit
 	g.compileLockFn = g.compileLock
 	g.compileRandomFn = g.compileRandom
+	g.compileTimeoutFn = g.compileTimeout
+	g.compileJoinLateralFn = g.compileJoinLateral
+	g.supportsStraightJoinsFn = func() bool { return true }
+	g.compileJsonValueCastFn = g.compileJsonValueCast
 
 	g.compileInsertFn = g.compileInsert
 	g.compileInsertOrIgnoreFn = g.compileInsertOrIgnore
@@ -48,6 +69,25 @@ func NewMySqlGrammar() *MySqlGrammar {
 	g.compileDeleteWithJoinsFn = g.compileDeleteWithJoins
 
 	return g
+}
+
+// SetUseUpsertAlias 切换 upsert 的别名形式（对应 use_upsert_alias 配置）。
+func (g *MySqlGrammar) SetUseUpsertAlias(v bool) {
+	g.useUpsertAlias = v
+}
+
+// compileTimeout 对应 MySqlGrammar::compileSelect 的超时改写：
+// 把开头的 select 替换为 select /*+ MAX_EXECUTION_TIME(ms) */。
+func (g *MySqlGrammar) compileTimeout(sql string, seconds int64) string {
+	milliseconds := seconds * 1000
+	return selectPrefix.ReplaceAllString(sql, "select /*+ MAX_EXECUTION_TIME("+intToString(milliseconds)+") */")
+}
+
+var selectPrefix = regexp.MustCompile(`^select\b`)
+
+// compileJoinLateral 对应 MySqlGrammar::compileJoinLateral。
+func (g *MySqlGrammar) compileJoinLateral(expr, joinType string) string {
+	return strings.TrimSpace(joinType + " join lateral " + expr + " on true")
 }
 
 func mysqlWrapValue(value string) string {
@@ -238,14 +278,45 @@ func (g *MySqlGrammar) compileInsertOrIgnoreUsing(q *query.Query, columns []any,
 
 func (g *MySqlGrammar) compileUpsert(q *query.Query, rows []query.Row, uniqueBy, update []string) (string, []any) {
 	sql, bindings := g.QueryGrammar.baseCompileInsert(q, rows)
+
+	if g.useUpsertAlias {
+		sql += " as laravel_upsert_alias"
+	}
+
 	sql += " on duplicate key update "
 
 	cols := make([]string, 0, len(update))
 	for _, column := range update {
+		if g.useUpsertAlias {
+			cols = append(cols, g.Wrap(column)+" = "+g.Wrap("laravel_upsert_alias")+"."+g.Wrap(column))
+			continue
+		}
 		cols = append(cols, g.Wrap(column)+" = values("+g.Wrap(column)+")")
 	}
 
 	return sql + strings.Join(cols, ", "), bindings
+}
+
+// PrepareBindingsForUpdate 对应 MySqlGrammar::prepareBindingsForUpdate：
+// JSON 选择器上的 bool 值剔除（编译为 raw true/false），数组值 json_encode。
+func (g *MySqlGrammar) PrepareBindingsForUpdate(bindings map[string][]any, values map[string]any) []any {
+	vals := make(map[string]any, len(values))
+	for _, key := range sortedKeys(values) {
+		v := values[key]
+		if g.isJsonSelector(key) {
+			if _, ok := v.(bool); ok {
+				continue
+			}
+		}
+		if arr, ok := v.([]any); ok {
+			data, err := json.Marshal(arr)
+			if err == nil {
+				v = string(data)
+			}
+		}
+		vals[key] = v
+	}
+	return g.QueryGrammar.PrepareBindingsForUpdate(bindings, vals)
 }
 
 func (g *MySqlGrammar) compileJsonUpdateColumn(key string, value any) string {

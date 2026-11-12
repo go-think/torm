@@ -1,6 +1,7 @@
 package grammar
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -37,6 +38,7 @@ func NewPostgresGrammar() *PostgresGrammar {
 	g.whereTimeFn = g.whereTime
 	g.dateBasedWhereFn = g.dateBasedWhere
 	g.whereFullTextFn = g.whereFullText
+	g.whereBitwiseFn = g.whereBitwise
 
 	g.compileInsertOrIgnoreFn = g.compileInsertOrIgnore
 	g.compileInsertOrIgnoreUsingFn = g.compileInsertOrIgnoreUsing
@@ -45,8 +47,40 @@ func NewPostgresGrammar() *PostgresGrammar {
 	g.compileUpdateFn = g.compileUpdate
 	g.compileUpdateColumnsFn = g.compileUpdateColumns
 	g.compileTruncateFn = g.compileTruncate
+	g.compileHavingBitwiseFn = g.compileHavingBitwise
+	g.compileJoinLateralFn = g.compileJoinLateral
 
 	return g
+}
+
+// whereBitwise 对应 PostgresGrammar::whereBitwise：(col op ?)::bool。
+func (g *PostgresGrammar) whereBitwise(q *query.Query, w *query.Where) string {
+	value := g.Parameter(w.Value)
+	operator := escapeOperator(w.Operator)
+	return "(" + g.Wrap(w.Column) + " " + operator + " " + value + ")::bool"
+}
+
+// compileHavingBitwise 对应 PostgresGrammar::compileHavingBitwise。
+func (g *PostgresGrammar) compileHavingBitwise(h *query.Where) string {
+	return "(" + g.Wrap(h.Column) + " " + h.Operator + " " + g.Parameter(h.Value) + ")::bool"
+}
+
+// compileJoinLateral 对应 PostgresGrammar::compileJoinLateral。
+func (g *PostgresGrammar) compileJoinLateral(expr, joinType string) string {
+	return strings.TrimSpace(joinType + " join lateral " + expr + " on true")
+}
+
+// BitwiseOperators 对应 PostgresGrammar::$bitwiseOperators（builder 侧识别用）。
+func (g *PostgresGrammar) BitwiseOperators() []string {
+	return []string{"~", "&", "|", "#", "<<", ">>", "<<=", ">>="}
+}
+
+// pgValidFullTextLanguages 对应 validFullTextLanguages 白名单。
+var pgValidFullTextLanguages = []string{
+	"simple", "arabic", "danish", "dutch", "english", "finnish", "french",
+	"german", "hungarian", "indonesian", "irish", "italian", "lithuanian",
+	"nepali", "norwegian", "portuguese", "romanian", "russian", "spanish",
+	"swedish", "tamil", "turkish",
 }
 
 // ---- where 覆盖 ----
@@ -98,6 +132,18 @@ func (g *PostgresGrammar) whereFullText(q *query.Query, w *query.Where) string {
 	language := "english"
 	if l, ok := w.Options["language"].(string); ok {
 		language = l
+	}
+
+	// 语言白名单：非法语言回退 english（对应 validFullTextLanguages）
+	valid := false
+	for _, l := range pgValidFullTextLanguages {
+		if language == l {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		language = "english"
 	}
 
 	parts := make([]string, 0, len(w.Columns))
@@ -294,14 +340,46 @@ func (g *PostgresGrammar) compileLock(q *query.Query, value any) string {
 }
 
 func (g *PostgresGrammar) compileTruncate(q *query.Query) []TruncateStatement {
-	return []TruncateStatement{{Sql: "truncate " + g.WrapTable(q.From) + " restart identity"}}
+	return []TruncateStatement{{Sql: "truncate " + g.WrapTable(q.From) + " restart identity cascade"}}
 }
 
 // ---- 写入族 ----
 
+// Operators 对应 PostgresGrammar::$operators（PostgresGrammar.php:18-24）。
+func (g *PostgresGrammar) Operators() []string {
+	return []string{
+		"=", "<", ">", "<=", ">=", "<>", "!=",
+		"like", "not like", "between", "ilike", "not ilike",
+		"~", "&", "|", "#", "<<", ">>", "<<=", ">>=",
+		"&&", "@>", "<@", "?", "?|", "?&", "||", "-", "@?", "@@", "#-",
+		"is distinct from", "is not distinct from",
+	}
+}
+
 func (g *PostgresGrammar) compileInsertOrIgnore(q *query.Query, rows []query.Row) (string, []any) {
 	sql, bindings := g.QueryGrammar.baseCompileInsert(q, rows)
 	return sql + " on conflict do nothing", bindings
+}
+
+// CompileInsertOrIgnoreReturning 对应 PostgresGrammar.php:406-414：
+// insert or ignore + returning（uniqueBy 非空时限定 conflict 列）。
+func (g *PostgresGrammar) CompileInsertOrIgnoreReturning(q *query.Query, rows []query.Row, returning, uniqueBy []string) (string, []any) {
+	sql, bindings := g.QueryGrammar.baseCompileInsert(q, rows)
+	if len(uniqueBy) > 0 {
+		cols := make([]string, 0, len(uniqueBy))
+		for _, c := range uniqueBy {
+			cols = append(cols, g.Wrap(c))
+		}
+		sql += " on conflict (" + strings.Join(cols, ", ") + ") do nothing"
+	} else {
+		sql += " on conflict do nothing"
+	}
+	returns := make([]string, 0, len(returning))
+	for _, c := range returning {
+		returns = append(returns, g.Wrap(c))
+	}
+	sql += " returning " + strings.Join(returns, ", ")
+	return sql, bindings
 }
 
 func (g *PostgresGrammar) compileInsertOrIgnoreUsing(q *query.Query, columns []any, sql string) string {
@@ -363,6 +441,128 @@ func (g *PostgresGrammar) compileUpdate(q *query.Query, values map[string]any) s
 	return g.QueryGrammar.baseCompileUpdate(q, values)
 }
 
+// CompileUpdateFrom 对应 PostgresGrammar::compileUpdateFrom：
+// update table set ... from (join 表列表) where [wheres + join wheres]。
+func (g *PostgresGrammar) CompileUpdateFrom(q *query.Query, values map[string]any) string {
+	table := g.WrapTable(q.From)
+	columns := g.compileUpdateColumns(q, values)
+
+	from := ""
+	if len(q.Joins) > 0 {
+		froms := make([]string, 0, len(q.Joins))
+		for _, join := range q.Joins {
+			froms = append(froms, g.WrapTable(join.Table))
+		}
+		if len(froms) > 0 {
+			from = " from " + strings.Join(froms, ", ")
+		}
+	}
+
+	where := g.compileUpdateWheres(q)
+
+	return strings.TrimSpace("update " + table + " set " + columns + from + " " + where)
+}
+
+// compileUpdateWheres 对应 compileUpdateWheres：joins 存在时把 join 的 on
+// 条件并入 where（基础 where 为空时去掉首布尔词）。
+func (g *PostgresGrammar) compileUpdateWheres(q *query.Query) string {
+	baseWheres := g.QueryGrammar.compileWheres(q)
+
+	if len(q.Joins) == 0 {
+		return baseWheres
+	}
+
+	joinWheres := g.compileUpdateJoinWheres(q)
+
+	if strings.TrimSpace(baseWheres) == "" {
+		return "where " + g.removeLeadingBoolean(joinWheres)
+	}
+	return baseWheres + " " + joinWheres
+}
+
+// compileUpdateJoinWheres 对应 compileUpdateJoinWheres。
+func (g *PostgresGrammar) compileUpdateJoinWheres(q *query.Query) string {
+	sqls := make([]string, 0, len(q.Joins))
+	for _, join := range q.Joins {
+		for _, w := range join.Wheres {
+			sqls = append(sqls, w.Boolean+" "+g.compileWhereByType(q, w))
+		}
+	}
+	return strings.Join(sqls, " ")
+}
+
+// PrepareBindingsForUpdateFrom 对应 PostgresGrammar::prepareBindingsForUpdateFrom：
+// 数组/JSON 选择器值 json_encode；顺序为 values、where 绑定、其余段。
+func (g *PostgresGrammar) PrepareBindingsForUpdateFrom(bindings map[string][]any, values map[string]any) []any {
+	vals := make([]any, 0, len(values))
+	for _, key := range sortedKeys(values) {
+		v := values[key]
+		isExpr := g.IsExpression(v)
+		if _, ok := v.([]any); ok || (g.isJsonSelector(key) && !isExpr) {
+			if data, err := json.Marshal(v); err == nil {
+				v = string(data)
+			}
+		}
+		if !isExpr {
+			vals = append(vals, flattenBinding(v))
+		}
+	}
+
+	out := make([]any, 0, len(vals)+8)
+	out = append(out, vals...)
+	out = append(out, bindings["where"]...)
+	for _, segment := range BindingSegments {
+		if segment == "select" || segment == "where" {
+			continue
+		}
+		for _, v := range bindings[segment] {
+			out = append(out, flattenBinding(v))
+		}
+	}
+	return out
+}
+
+// PrepareBindingsForUpdate 对应 PostgresGrammar::prepareBindingsForUpdate：
+// 数组/JSON 选择器值 json_encode；顺序为 values、除 select 外全部绑定。
+func (g *PostgresGrammar) PrepareBindingsForUpdate(bindings map[string][]any, values map[string]any) []any {
+	vals := make([]any, 0, len(values))
+	for _, key := range sortedKeys(values) {
+		v := values[key]
+		isExpr := g.IsExpression(v)
+		if _, ok := v.([]any); ok || (g.isJsonSelector(key) && !isExpr) {
+			if data, err := json.Marshal(v); err == nil {
+				v = string(data)
+			}
+		}
+		if !isExpr {
+			vals = append(vals, flattenBinding(v))
+		}
+	}
+
+	out := make([]any, 0, len(vals)+8)
+	out = append(out, vals...)
+	for _, segment := range BindingSegments {
+		if segment == "select" {
+			continue
+		}
+		for _, v := range bindings[segment] {
+			out = append(out, flattenBinding(v))
+		}
+	}
+	return out
+}
+
+// SubstituteBindingsIntoRawSql 对应 PostgresGrammar::substituteBindingsIntoRawSql：
+// 基础替换后把转义的 PG 运算符还原（?? → ?、??| → ?|、??& → ?&）。
+func (g *PostgresGrammar) SubstituteBindingsIntoRawSql(sql string, bindings []any) string {
+	queryStr := g.QueryGrammar.SubstituteBindingsIntoRawSql(sql, bindings)
+	return strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(
+		queryStr,
+		"??|", "?|"),
+		"??&", "?&"),
+		"??", "?")
+}
+
 func (g *PostgresGrammar) compileUpdateColumns(q *query.Query, values map[string]any) string {
 	// PG：set 列不带表限定（取最后一段）
 	keys := sortedKeys(values)
@@ -393,13 +593,12 @@ func (g *PostgresGrammar) compileUpdateWithJoinsOrLimit(q *query.Query, values m
 		alias = alias[i+1:]
 	}
 
-	// ctid 子查询（对应 Laravel compileUpdateWithJoinsOrLimit）
+	// ctid 子查询（对应 Laravel compileUpdateWithJoinsOrLimit:649-660）：
+	// 复用原 query 仅替换列为 ctid，orders/limit/offset 保留在子查询内
+	// （与同文件 delete ctid 路径语义一致）
 	sub := *q
 	sub.Aggregate = nil
 	sub.Columns = []any{alias + ".ctid"}
-	sub.Orders = nil
-	sub.Limit = nil
-	sub.Offset = nil
 	subLock := sub
 	subLock.Lock = nil
 	selectSql := g.CompileSelect(&subLock)

@@ -1,11 +1,14 @@
 package torm
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"iter"
 	"os"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -22,21 +25,99 @@ type Builder struct {
 
 	// modelInfo：Model() 查询所关联的模型元数据（软删除 scope 等）
 	modelInfo     *modelInfo
+	modelInternalQuery bool
 	scopesApplied bool
+	softDelete    softDeleteMode
 
 	// useWritePdo：select 强制走写连接（对应 Laravel useWritePdo）
 	useWritePdo bool
 
 	// relations：待预加载的关系（With）
 	relations []pendingRelation
+
+	// joinClause：JoinClause 变体（Laravel JoinClause extends Builder）——
+	// 携带自身 join 类型与表，编译为 on 子句。
+	joinType  string
+	joinTable interface{}
+
+	// beforeQueryCallbacks / afterQueryCallbacks：对应 Laravel 同名回调。
+	beforeQueryCallbacks []func(*Builder)
+	afterQueryCallbacks  []func(any) any
 }
 
+// softDeleteMode 软删全局 scope 的状态（对应 SoftDeletingScope 的宏语义）。
+type softDeleteMode uint8
+
+const (
+	sdApply          softDeleteMode = iota // 默认：deleted_at IS NULL
+	sdWithTrashed                          // 去掉软删约束
+	sdOnlyTrashed                          // 仅已删除：deleted_at IS NOT NULL
+	sdWithoutTrashed                       // 仅未删除：deleted_at IS NULL
+)
+
 // applyModelScopes 在执行前追加模型全局 scope（对齐 Laravel 全局 scope 后置语义）。
+// 软删约束的列名带表限定（"users"."deleted_at"），与 Laravel
+// getQualifiedDeletedAtColumn 一致；scope 状态随 Builder 克隆一并继承。
 func (b *Builder) applyModelScopes() {
-	if b.modelInfo != nil && b.modelInfo.softDeletes && !b.scopesApplied {
-		b.WhereNull(b.modelInfo.deletedAtField)
-		b.scopesApplied = true
+	if b.modelInfo == nil || !b.modelInfo.softDeletes || b.scopesApplied {
+		return
 	}
+	// 模型内部路径（Save/软删/Restore 的 UPDATE）等价 Laravel newModelQuery：
+	// 不注册全局 scope（Model.php:1859-1865），软删行也参与更新
+	if b.modelInternalQuery {
+		return
+	}
+	column := b.modelInfo.table + "." + b.modelInfo.deletedAtField
+	switch b.softDelete {
+	case sdWithTrashed:
+		// 无约束
+	case sdOnlyTrashed:
+		b.WhereNotNull(column)
+	default:
+		b.WhereNull(column)
+	}
+	b.scopesApplied = true
+}
+
+// WithTrashed 去掉软删约束（对应 SoftDeletingScope 的 withTrashed 宏）。
+func (b *Builder) WithTrashed() *Builder {
+	return b.setSoftDeleteMode(sdWithTrashed)
+}
+
+// OnlyTrashed 只查已软删的行：deleted_at IS NOT NULL（对应 onlyTrashed 宏）。
+func (b *Builder) OnlyTrashed() *Builder {
+	return b.setSoftDeleteMode(sdOnlyTrashed)
+}
+
+// WithoutTrashed 只查未软删的行：deleted_at IS NULL（对应 withoutTrashed 宏，默认态）。
+func (b *Builder) WithoutTrashed() *Builder {
+	return b.setSoftDeleteMode(sdWithoutTrashed)
+}
+
+// setSoftDeleteMode 切换软删 scope 状态并剔除已物化的软删约束，
+// 下次执行按新模式重新应用（对齐 Laravel applyScopes 每次执行都生效）。
+func (b *Builder) setSoftDeleteMode(m softDeleteMode) *Builder {
+	if b.modelInfo == nil || !b.modelInfo.softDeletes {
+		return b
+	}
+	b.softDelete = m
+	b.removeSoftDeleteScopeWheres()
+	b.scopesApplied = false
+	return b
+}
+
+// removeSoftDeleteScopeWheres 剔除先前由软删 scope 物化的 Null/NotNull 约束。
+func (b *Builder) removeSoftDeleteScopeWheres() {
+	column := b.modelInfo.table + "." + b.modelInfo.deletedAtField
+	wheres := b.Query.Wheres
+	out := make([]*query.Where, 0, len(wheres))
+	for _, w := range wheres {
+		if (w.Type == "Null" || w.Type == "NotNull") && w.Column == column {
+			continue
+		}
+		out = append(out, w)
+	}
+	b.Query.Wheres = out
 }
 
 func NewBuilder(connection *Connection, g grammar.Grammar) *Builder {
@@ -194,7 +275,8 @@ func (b *Builder) FromSub(q interface{}, as string) *Builder {
 
 // Join 添加 join 子句：Join(table, first, operator, second, type, where)，
 // 对应 Laravel join($table,$first,$operator=null,$second=null,$type='inner',$where=false)。
-func (b *Builder) Join(table string, first string, args ...interface{}) *Builder {
+// first 亦可为 func(*Builder)（复杂 on 子句，JoinClause 闭包形式）。
+func (b *Builder) Join(table interface{}, first interface{}, args ...interface{}) *Builder {
 	var (
 		operator string
 		second   interface{}
@@ -213,63 +295,117 @@ func (b *Builder) Join(table string, first string, args ...interface{}) *Builder
 	if len(args) >= 4 {
 		where, _ = args[3].(bool)
 	}
+	// 闭包形式：复杂 on 子句（对应 Laravel 的 $first instanceof Closure）
+	switch first.(type) {
+	case func(*Builder), func(*Builder) *Builder:
+		return b.addJoinWithClosure(typeStr, table, first)
+	}
 	if operator == "" {
 		operator = "="
 	}
-	return b.addJoin(typeStr, table, first, operator, second, where)
+	return b.addJoin(typeStr, table, fmtString(first), operator, second, where)
 }
 
-func (b *Builder) LeftJoin(table string, first string, args ...interface{}) *Builder {
+func (b *Builder) LeftJoin(table interface{}, first interface{}, args ...interface{}) *Builder {
 	return b.Join(table, first, append(args, "left")...)
 }
 
-func (b *Builder) RightJoin(table string, first string, args ...interface{}) *Builder {
+func (b *Builder) RightJoin(table interface{}, first interface{}, args ...interface{}) *Builder {
 	return b.Join(table, first, append(args, "right")...)
 }
 
-func (b *Builder) CrossJoin(table string, first string, args ...interface{}) *Builder {
+func (b *Builder) CrossJoin(table interface{}, first interface{}, args ...interface{}) *Builder {
 	return b.Join(table, first, append(args, "cross")...)
 }
 
+// StraightJoin 对应 Laravel straightJoin（仅 MySQL 支持，其它方言编译时抛错）。
+func (b *Builder) StraightJoin(table interface{}, first string, operator string, second interface{}) *Builder {
+	return b.Join(table, first, operator, second, "straight_join", false)
+}
+
+// StraightJoinWhere 对应 Laravel straightJoinWhere。
+func (b *Builder) StraightJoinWhere(table interface{}, first string, operator string, second interface{}) *Builder {
+	return b.Join(table, first, operator, second, "straight_join", true)
+}
+
 // JoinWhere 对应 join(..., $where=true)：把第二操作数作为绑定值。
-func (b *Builder) JoinWhere(table string, first string, operator string, second interface{}) *Builder {
+func (b *Builder) JoinWhere(table interface{}, first string, operator string, second interface{}) *Builder {
 	return b.Join(table, first, operator, second, "inner", true)
 }
 
-func (b *Builder) LeftJoinWhere(table string, first string, operator string, second interface{}) *Builder {
+func (b *Builder) LeftJoinWhere(table interface{}, first string, operator string, second interface{}) *Builder {
 	return b.Join(table, first, operator, second, "left", true)
 }
 
-func (b *Builder) RightJoinWhere(table string, first string, operator string, second interface{}) *Builder {
+func (b *Builder) RightJoinWhere(table interface{}, first string, operator string, second interface{}) *Builder {
 	return b.Join(table, first, operator, second, "right", true)
 }
 
-func (b *Builder) addJoin(typeStr string, table interface{}, first, operator string, second interface{}, where bool) *Builder {
-	wheres := make([]*query.Where, 0, 1)
-	if where {
-		wheres = append(wheres, &query.Where{
-			Type:     "Basic",
-			Column:   first,
-			Operator: "=",
-			Value:    second,
-			Boolean:  "and",
-		})
-		b.AddBinding(second, "join")
-	} else {
-		wheres = append(wheres, &query.Where{
-			Type:     "Column",
-			First:    first,
-			Operator: operator,
-			Second:   second,
-			Boolean:  "and",
-		})
+// newJoinClause 构造 JoinClause 变体（JoinClause 标记的 Builder，携带类型与表）。
+func (b *Builder) newJoinClause(typeStr string, table interface{}) *Builder {
+	jc := &Builder{
+		Connection: b.Connection,
+		grammar:    b.grammar,
+		Query:      &query.Query{JoinClause: true, From: table},
+		Bindings:   getDefaultBindings(),
+		joinType:   typeStr,
+		joinTable:  table,
 	}
+	return jc
+}
+
+// addJoinWithClosure 对应 Laravel join($table, closure)：先构造 JoinClause，
+// 由回调在其上构造 on 条件，随后把 clause 追加到父查询。
+func (b *Builder) addJoinWithClosure(typeStr string, table interface{}, fn interface{}) *Builder {
+	jc := b.newJoinClause(typeStr, table)
+	applySubQuery(jc, fn)
+	return b.appendJoinClause(jc)
+}
+
+// appendJoinClause 把 JoinClause 变体的 wheres 与绑定并入父查询。
+func (b *Builder) appendJoinClause(jc *Builder) *Builder {
 	b.Query.Joins = append(b.Query.Joins, &query.Join{
-		Type:   typeStr,
-		Table:  table,
-		Wheres: wheres,
+		Type:   jc.joinType,
+		Table:  jc.joinTable,
+		Wheres: jc.Query.Wheres,
 	})
+	b.AddBinding(jc.GetBindings(), "join")
 	return b
+}
+
+func (b *Builder) addJoin(typeStr string, table interface{}, first, operator string, second interface{}, where bool) *Builder {
+	jc := b.newJoinClause(typeStr, table)
+	if where {
+		jc.Where(first, second)
+	} else {
+		jc.On(first, operator, second)
+	}
+	return b.appendJoinClause(jc)
+}
+
+// On 在 JoinClause 上添加 on 条件：列比较或嵌套闭包（对应 JoinClause::on）。
+func (b *Builder) On(first interface{}, args ...interface{}) *Builder {
+	operator, second, boolean := parseColumnArgs(args...)
+	if boolean == "" {
+		boolean = "and"
+	}
+	switch first.(type) {
+	case func(*Builder), func(*Builder) *Builder:
+		if operator == "=" && second == nil {
+			return b.WhereNested(func(nq *Builder) { applySubQuery(nq, first) }, boolean)
+		}
+	}
+	return b.WhereColumn(first, operator, second, boolean)
+}
+
+// OrOn 在 JoinClause 上添加 or on 条件（对应 JoinClause::orOn）。
+func (b *Builder) OrOn(first interface{}, args ...interface{}) *Builder {
+	operator, second, _ := parseColumnArgs(args...)
+	switch first.(type) {
+	case func(*Builder), func(*Builder) *Builder:
+		return b.WhereNested(func(nq *Builder) { applySubQuery(nq, first) }, "or")
+	}
+	return b.On(first, operator, second, "or")
 }
 
 // JoinSub 以子查询作为 join 表：inner join (select ...) as "as" on ...
@@ -285,24 +421,65 @@ func (b *Builder) RightJoinSub(q interface{}, as string, first, operator, second
 	return b.addJoinOfSub("right", q, as, first, operator, second)
 }
 
+// StraightJoinSub 以子查询作为 straight join 表（对应 Laravel
+// Builder.php:874 straightJoinSub；仅 MySQL 支持，其它方言编译时抛错）。
+func (b *Builder) StraightJoinSub(q interface{}, as string, first, operator, second interface{}) *Builder {
+	return b.addJoinOfSub("straight_join", q, as, first, operator, second)
+}
+
 func (b *Builder) addJoinOfSub(typeStr string, q interface{}, as string, first, operator, second interface{}) *Builder {
-	sql, _ := b.createSub(q)
-	return b.addJoin(typeStr, grammar.NewExpression("("+sql+") as "+b.grammar.WrapTable(as)), fmtString(first), fmtString(operator), second, false)
+	sql, bindings := b.createSub(q)
+	b.AddBinding(bindings, "join")
+	expr := grammar.NewExpression("(" + sql + ") as " + b.grammar.WrapTable(as))
+	jc := b.newJoinClause(typeStr, expr)
+	jc.On(fmtString(first), fmtString(operator), second)
+	return b.appendJoinClause(jc)
+}
+
+// CrossJoinSub 交叉 join 子查询（无 on 条件，对应 crossJoinSub）。
+func (b *Builder) CrossJoinSub(q interface{}, as string) *Builder {
+	sql, bindings := b.createSub(q)
+	b.AddBinding(bindings, "join")
+	jc := b.newJoinClause("cross", grammar.NewExpression("("+sql+") as "+b.grammar.WrapTable(as)))
+	return b.appendJoinClause(jc)
+}
+
+// JoinLateral 添加 lateral join（MySQL/PG 支持，对应 joinLateral）。
+func (b *Builder) JoinLateral(q interface{}, as string, typeStr ...string) *Builder {
+	t := "inner"
+	if len(typeStr) > 0 && typeStr[0] != "" {
+		t = typeStr[0]
+	}
+	sql, bindings := b.createSub(q)
+	b.AddBinding(bindings, "join")
+	b.Query.Joins = append(b.Query.Joins, &query.Join{
+		Type:    t,
+		Table:   grammar.NewExpression("(" + sql + ") as " + b.grammar.WrapTable(as)),
+		Lateral: true,
+	})
+	return b
+}
+
+// LeftJoinLateral 添加 left lateral join。
+func (b *Builder) LeftJoinLateral(q interface{}, as string) *Builder {
+	return b.JoinLateral(q, as, "left")
 }
 
 // ---- Where ----
 
-// queryOperators 对应 Laravel Query\Builder 的 $operators。
+// queryOperators 对应 Laravel Query\Builder 的 $operators（Builder.php:248-255）。
 var queryOperators = []string{
 	"=", "<", ">", "<=", ">=", "<>", "!=", "<=>",
-	"like", "like binary", "not like", "ilike", "not ilike",
-	"&", "|", "^", "<<", ">>",
+	"like", "like binary", "not like", "not like binary", "ilike", "not ilike",
+	"&", "|", "^", "<<", ">>", "&~", "is", "is not",
 	"rlike", "not rlike", "regexp", "not regexp",
 	"~", "~*", "!~", "!~*", "similar to", "not similar to",
-	"sounds like",
+	"~~", "!~~", "~~*", "!~~*",
 }
 
-func invalidOperator(operator string) bool {
+// invalidBaseOperator 基础操作符表判定（对应 Laravel invalidOperator 的
+// builder 侧 $operators 部分）。
+func invalidBaseOperator(operator string) bool {
 	if operator == "" {
 		return true
 	}
@@ -312,6 +489,46 @@ func invalidOperator(operator string) bool {
 		}
 	}
 	return true
+}
+
+// invalidOperator 对应 Laravel invalidOperator：基础表 ∪ grammar 方言表。
+// 方言经 Grammar 的 Operators() []string 钩子提供（对齐 Laravel
+// grammar->getOperators()；PG/SqlServer 方言表待接线，见待接线清单）。
+func (b *Builder) invalidOperator(operator string) bool {
+	if invalidBaseOperator(operator) {
+		if ops, ok := b.grammar.(interface{ Operators() []string }); ok {
+			lower := strings.ToLower(operator)
+			for _, op := range ops.Operators() {
+				if lower == op {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// builderBitwiseOperators 对应 Laravel Query\Builder::$bitwiseOperators。
+var builderBitwiseOperators = []string{"&", "|", "^", "<<", ">>", "&~"}
+
+// isBitwiseOperator 对应 Laravel isBitwiseOperator：基础位运算符集合
+// ∪ 方言集合（方言通过 BitwiseOperators() 方法提供）。
+func (b *Builder) isBitwiseOperator(operator string) bool {
+	lower := strings.ToLower(operator)
+	for _, op := range builderBitwiseOperators {
+		if lower == op {
+			return true
+		}
+	}
+	if bo, ok := b.grammar.(interface{ BitwiseOperators() []string }); ok {
+		for _, op := range bo.BitwiseOperators() {
+			if lower == op {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Where 基础 where：Where(column, value) / Where(column, operator, value, boolean...)。
@@ -356,7 +573,7 @@ func (b *Builder) whereImpl(column interface{}, args []interface{}, boolean stri
 	}
 
 	// 操作符回退：非法操作符视为值，操作符取 "="
-	if invalidOperator(operator) {
+	if b.invalidOperator(operator) {
 		operator, value = "=", operator
 	}
 
@@ -393,6 +610,18 @@ func (b *Builder) whereImpl(column interface{}, args []interface{}, boolean stri
 
 	typ := "Basic"
 
+	// 条件表达式：无参 where(Expression) 视为完整条件（对应 ConditionExpression）
+	if len(args) == 0 {
+		if _, ok := column.(grammar.Expression); ok {
+			b.Query.Wheres = append(b.Query.Wheres, &query.Where{
+				Type:    "Expression",
+				Column:  column,
+				Boolean: boolean,
+			})
+			return b
+		}
+	}
+
 	// JSON 列上的布尔值：作为 raw true/false
 	if colStr, ok := column.(string); ok && strings.Contains(colStr, "->") {
 		if bv, ok := value.(bool); ok {
@@ -403,6 +632,11 @@ func (b *Builder) whereImpl(column interface{}, args []interface{}, boolean stri
 			}
 			typ = "JsonBoolean"
 		}
+	}
+
+	// 位运算符：Bitwise 类型（PG ::bool / SqlServer != 0 等方言编译）
+	if b.isBitwiseOperator(operator) {
+		typ = "Bitwise"
 	}
 
 	if operator == "<=>" {
@@ -485,6 +719,26 @@ func (b *Builder) WhereColumn(first interface{}, args ...interface{}) *Builder {
 func (b *Builder) OrWhereColumn(first interface{}, args ...interface{}) *Builder {
 	operator, second, _ := parseColumnArgs(args...)
 	return b.WhereColumn(first, operator, second, "or")
+}
+
+// WhereExpression 添加条件表达式（对应 Laravel 的 ConditionExpression）：
+// 条件原样进入 where，不追加操作符与绑定。
+func (b *Builder) WhereExpression(condition interface{}, boolean ...string) *Builder {
+	col := condition
+	if s, ok := condition.(string); ok {
+		col = grammar.NewExpression(s)
+	}
+	b.Query.Wheres = append(b.Query.Wheres, &query.Where{
+		Type:    "Expression",
+		Column:  col,
+		Boolean: boolArg(boolean, "and"),
+	})
+	return b
+}
+
+// OrWhereExpression 以 or 连接条件表达式。
+func (b *Builder) OrWhereExpression(condition interface{}) *Builder {
+	return b.WhereExpression(condition, "or")
 }
 
 // WhereRaw / OrWhereRaw
@@ -693,6 +947,14 @@ func (b *Builder) OrWhereNotLike(column interface{}, value interface{}, caseSens
 }
 
 func (b *Builder) addWhereLike(column interface{}, value interface{}, caseSensitive bool, boolean string, not bool) *Builder {
+	// 方言改写 like 绑定（SQLite 大小写敏感 → glob 模式转换）
+	if !b.grammar.IsExpression(value) {
+		if prep, ok := b.grammar.(interface {
+			PrepareWhereLikeBinding(any, bool) any
+		}); ok {
+			value = prep.PrepareWhereLikeBinding(value, caseSensitive)
+		}
+	}
 	b.Query.Wheres = append(b.Query.Wheres, &query.Where{
 		Type:          "Like",
 		Column:        column,
@@ -702,6 +964,33 @@ func (b *Builder) addWhereLike(column interface{}, value interface{}, caseSensit
 		Not:           not,
 	})
 	b.AddBinding(value, "where")
+	return b
+}
+
+// ---- WhereNullSafeEquals（对应 Laravel Builder.php:1442-1467）----
+
+// WhereNullSafeEquals 空安全等值比较（对应 whereNullSafeEquals）：
+// 编译为 is not distinct from（MySQL/SqlServer/SQLite 有方言实现，
+// 基础方言走 is not distinct from）。
+func (b *Builder) WhereNullSafeEquals(column interface{}, value interface{}) *Builder {
+	return b.addNullSafeEquals(column, value, "and")
+}
+
+// OrWhereNullSafeEquals 以 or 连接的空安全等值（对应 orWhereNullSafeEquals）。
+func (b *Builder) OrWhereNullSafeEquals(column interface{}, value interface{}) *Builder {
+	return b.addNullSafeEquals(column, value, "or")
+}
+
+func (b *Builder) addNullSafeEquals(column, value interface{}, boolean string) *Builder {
+	b.Query.Wheres = append(b.Query.Wheres, &query.Where{
+		Type:    "NullSafeEquals",
+		Column:  column,
+		Value:   value,
+		Boolean: boolean,
+	})
+	if !b.grammar.IsExpression(value) {
+		b.AddBinding(flattenValue(value), "where")
+	}
 	return b
 }
 
@@ -853,6 +1142,43 @@ func (b *Builder) whereBetweenColumnsImpl(column interface{}, values []interface
 		Boolean: boolean,
 		Not:     not,
 	})
+	return b
+}
+
+// ---- WhereValueBetween 族（对应 Laravel Builder.php:1789-1843）----
+
+// WhereValueBetween 值介于两列之间：where ? between min and max
+// （对应 Laravel whereValueBetween($value, $columns)：第一参数为值，
+// 第二参数为 [下界列, 上界列] 两元素切片）。
+func (b *Builder) WhereValueBetween(value interface{}, columns []interface{}) *Builder {
+	return b.whereValueBetweenImpl(value, columns, "and", false)
+}
+
+// OrWhereValueBetween 以 or 连接（对应 orWhereValueBetween）。
+func (b *Builder) OrWhereValueBetween(value interface{}, columns []interface{}) *Builder {
+	return b.whereValueBetweenImpl(value, columns, "or", false)
+}
+
+// WhereValueNotBetween 值不介于两列之间（对应 whereValueNotBetween）。
+func (b *Builder) WhereValueNotBetween(value interface{}, columns []interface{}) *Builder {
+	return b.whereValueBetweenImpl(value, columns, "and", true)
+}
+
+// OrWhereValueNotBetween 以 or 连接（对应 orWhereValueNotBetween）。
+func (b *Builder) OrWhereValueNotBetween(value interface{}, columns []interface{}) *Builder {
+	return b.whereValueBetweenImpl(value, columns, "or", true)
+}
+
+func (b *Builder) whereValueBetweenImpl(value interface{}, columns []interface{}, boolean string, not bool) *Builder {
+	b.Query.Wheres = append(b.Query.Wheres, &query.Where{
+		Type:    "ValueBetween",
+		Value:   value,
+		Columns: columns,
+		Boolean: boolean,
+		Not:     not,
+	})
+	// Laravel addBinding($value, 'where')：值本身为绑定（Expression 自动跳过）
+	b.AddBinding(value, "where")
 	return b
 }
 
@@ -1010,11 +1336,15 @@ func (b *Builder) GroupByRaw(sql string, bindings ...interface{}) *Builder {
 // Having 基础 having。
 func (b *Builder) Having(column interface{}, args ...interface{}) *Builder {
 	operator, value := parseWhereArgs(args...)
-	if invalidOperator(operator) {
+	if b.invalidOperator(operator) {
 		operator, value = "=", operator
 	}
+	typ := "Basic"
+	if b.isBitwiseOperator(operator) {
+		typ = "Bitwise"
+	}
 	b.Query.Havings = append(b.Query.Havings, &query.Where{
-		Type:     "Basic",
+		Type:     typ,
 		Column:   column,
 		Operator: operator,
 		Value:    value,
@@ -1028,11 +1358,15 @@ func (b *Builder) Having(column interface{}, args ...interface{}) *Builder {
 
 func (b *Builder) OrHaving(column interface{}, args ...interface{}) *Builder {
 	operator, value := parseWhereArgs(args...)
-	if invalidOperator(operator) {
+	if b.invalidOperator(operator) {
 		operator, value = "=", operator
 	}
+	typ := "Basic"
+	if b.isBitwiseOperator(operator) {
+		typ = "Bitwise"
+	}
 	b.Query.Havings = append(b.Query.Havings, &query.Where{
-		Type:     "Basic",
+		Type:     typ,
 		Column:   column,
 		Operator: operator,
 		Value:    value,
@@ -1042,6 +1376,62 @@ func (b *Builder) OrHaving(column interface{}, args ...interface{}) *Builder {
 		b.AddBinding(flattenValue(value), "having")
 	}
 	return b
+}
+
+// MergeWheres 合并外部 where 数组与绑定（对应 Laravel mergeWheres）。
+func (b *Builder) MergeWheres(wheres []*query.Where, bindings []interface{}) *Builder {
+	b.Query.Wheres = append(b.Query.Wheres, wheres...)
+	b.Bindings["where"] = append(b.Bindings["where"], bindings...)
+	return b
+}
+
+// WhereAll 多列 and 组内条件（对应 Laravel whereAll）：
+// where (a = ? and b = ?)。
+func (b *Builder) WhereAll(columns []interface{}, operator string, value interface{}, boolean ...string) *Builder {
+	return b.whereAllAnyImpl(columns, operator, value, boolArg(boolean, "and"), "and")
+}
+
+// OrWhereAll 对应 orWhereAll。
+func (b *Builder) OrWhereAll(columns []interface{}, operator string, value interface{}) *Builder {
+	return b.whereAllAnyImpl(columns, operator, value, "or", "and")
+}
+
+// WhereAny 多列 or 组内条件（对应 Laravel whereAny）：where (a = ? or b = ?)。
+func (b *Builder) WhereAny(columns []interface{}, operator string, value interface{}, boolean ...string) *Builder {
+	return b.whereAllAnyImpl(columns, operator, value, boolArg(boolean, "and"), "or")
+}
+
+// OrWhereAny 对应 orWhereAny。
+func (b *Builder) OrWhereAny(columns []interface{}, operator string, value interface{}) *Builder {
+	return b.whereAllAnyImpl(columns, operator, value, "or", "or")
+}
+
+// WhereNone 多列均不满足（对应 Laravel whereNone：whereAny + " not"）。
+func (b *Builder) WhereNone(columns []interface{}, operator string, value interface{}, boolean ...string) *Builder {
+	return b.whereAllAnyImpl(columns, operator, value, boolArg(boolean, "and")+" not", "or")
+}
+
+// OrWhereNone 对应 orWhereNone。
+func (b *Builder) OrWhereNone(columns []interface{}, operator string, value interface{}) *Builder {
+	return b.whereAllAnyImpl(columns, operator, value, "or not", "or")
+}
+
+func (b *Builder) whereAllAnyImpl(columns []interface{}, operator string, value interface{}, boolean, inner string) *Builder {
+	if b.invalidOperator(operator) {
+		operator, value = "=", operator
+	}
+	return b.WhereNested(func(nq *Builder) {
+		for _, column := range columns {
+			nq.whereImpl(column, []interface{}{operator, value}, inner)
+		}
+	}, boolean)
+}
+
+func boolArg(args []string, def string) string {
+	if len(args) > 0 && args[0] != "" {
+		return args[0]
+	}
+	return def
 }
 
 // HavingRaw / OrHavingRaw（对应 Laravel havingRaw($sql, $bindings=[], $boolean='and)：
@@ -1198,6 +1588,7 @@ func flattenBindings(values []interface{}) []interface{} {
 // ---- Order ----
 
 // OrderBy 排序；direction 只接受 asc/desc（大小写不敏感），非法值 panic（对应 Laravel InvalidArgumentException）。
+// column 可为 *Builder / 闭包（编译为子查询列：order by (select ...)）。
 func (b *Builder) OrderBy(column interface{}, direction ...string) *Builder {
 	dir := "asc"
 	if len(direction) > 0 {
@@ -1206,12 +1597,40 @@ func (b *Builder) OrderBy(column interface{}, direction ...string) *Builder {
 			panic(ErrInvalid{"Order direction must be \"asc\" or \"desc\""})
 		}
 	}
+	// 子查询列：order by (select ...)
+	if b.isQueryable(column) {
+		sql, bindings := b.createSub(column)
+		column = grammar.NewExpression("(" + sql + ")")
+		segment := "order"
+		if len(b.Query.Unions) > 0 {
+			segment = "unionOrder"
+		}
+		b.AddBinding(bindings, segment)
+	}
 	order := &query.Order{Column: column, Direction: dir}
 	if len(b.Query.Unions) > 0 {
 		b.Query.UnionOrders = append(b.Query.UnionOrders, order)
 	} else {
 		b.Query.Orders = append(b.Query.Orders, order)
 	}
+	return b
+}
+
+// InOrderOf 按取值序列排序（对应 Laravel inOrderOf）：
+// order by case "col" = ? then 0 ... else N end。
+func (b *Builder) InOrderOf(column interface{}, values []interface{}) *Builder {
+	if len(values) == 0 {
+		return b
+	}
+	segment := "order"
+	order := &query.Order{Type: "InOrderOf", Column: column, Values: values}
+	if len(b.Query.Unions) > 0 {
+		segment = "unionOrder"
+		b.Query.UnionOrders = append(b.Query.UnionOrders, order)
+	} else {
+		b.Query.Orders = append(b.Query.Orders, order)
+	}
+	b.AddBinding(cleanBindings(values), segment)
 	return b
 }
 
@@ -1277,6 +1696,20 @@ func (b *Builder) Reorder(column ...interface{}) *Builder {
 	return b.OrderBy(column[0], dir)
 }
 
+// ReorderDesc 降序重设排序（对应 Laravel reorderDesc）。
+func (b *Builder) ReorderDesc(column interface{}) *Builder {
+	return b.Reorder(column, "desc")
+}
+
+// Timeout 设置查询执行超时（秒），MySQL 编译为 MAX_EXECUTION_TIME 提示。
+func (b *Builder) Timeout(seconds int64) *Builder {
+	if seconds <= 0 {
+		panic(ErrInvalid{"Timeout must be greater than zero."})
+	}
+	b.Query.Timeout = &seconds
+	return b
+}
+
 // ---- Limit / Offset ----
 
 func (b *Builder) Limit(value uint64) *Builder {
@@ -1302,6 +1735,16 @@ func (b *Builder) Offset(value uint64) *Builder {
 }
 
 func (b *Builder) Skip(value uint64) *Builder { return b.Offset(value) }
+
+// GroupLimit 分组限额（对应 Laravel Builder.php:3247 groupLimit）：
+// value >= 0 时设置（编译为 row_number() over (partition by column) <= value，
+// 预加载分组限额的基础入口）。
+func (b *Builder) GroupLimit(value int, column string) *Builder {
+	if value >= 0 {
+		b.Query.GroupLimit = &query.GroupLimit{Value: int64(value), Column: column}
+	}
+	return b
+}
 
 // ForPage 分页：page 从 1 开始。
 func (b *Builder) ForPage(page, perPage uint64) *Builder {
@@ -1402,6 +1845,11 @@ func (b *Builder) Avg(columns string, dest ...interface{}) error {
 	return b.Aggregate("avg", []interface{}{columns}, dest...)
 }
 
+// Average Avg 的别名（对应 Laravel Builder.php:4112 average）。
+func (b *Builder) Average(columns string, dest ...interface{}) error {
+	return b.Avg(columns, dest...)
+}
+
 // ---- 获取结果 ----
 
 // Get 执行查询并扫描进 dest；columns 可为 string / []string / []interface{}。
@@ -1422,6 +1870,7 @@ func (b *Builder) Get(dest interface{}, columns ...interface{}) error {
 	err := b.runSelect(dest)
 	b.Query.Columns = original
 	if err == nil {
+		b.applyAfterQueryCallbacks(dest)
 		b.Connection.fireRetrieved(dest)
 		b.loadRelations(dest)
 	}
@@ -1455,6 +1904,359 @@ func (b *Builder) DoesntExist() (bool, error) {
 		return false, err
 	}
 	return !v, nil
+}
+
+// ExistsOr 存在返回 true，否则执行回调（对应 Laravel existsOr）。
+func (b *Builder) ExistsOr(callback func() error) (bool, error) {
+	v, err := b.Exists()
+	if err != nil {
+		return false, err
+	}
+	if v {
+		return true, nil
+	}
+	return false, callback()
+}
+
+// DoesntExistOr 不存在返回 true，否则执行回调（对应 Laravel doesntExistOr）。
+func (b *Builder) DoesntExistOr(callback func() error) (bool, error) {
+	v, err := b.DoesntExist()
+	if err != nil {
+		return false, err
+	}
+	if v {
+		return true, nil
+	}
+	return false, callback()
+}
+
+// ---- 主键 where 族（对应 Laravel Builder.php:278-347 whereKey/orWhereKey/whereKeyNot/orWhereKeyNot）----
+
+// keyName 返回主键列名：模型建器取模型主键列，普通表建器缺省 "id"
+// （builder 级无模型元数据时的主键映射口径）。
+func (b *Builder) keyName() string {
+	if b.modelInfo != nil && b.modelInfo.primaryKey != "" {
+		return b.modelInfo.primaryKey
+	}
+	return "id"
+}
+
+// WhereKey 按主键添加 where（对应 Laravel whereKey）：id 可为主键值、
+// 模型实例（取其主键值）或切片（编译为 whereIn）。
+func (b *Builder) WhereKey(id interface{}) *Builder {
+	return b.whereKeyImpl(id, false, "and")
+}
+
+// WhereKeyNot 按主键添加排除 where（对应 Laravel whereKeyNot）：
+// 切片编译为 whereNotIn，单值编译为 !=。
+func (b *Builder) WhereKeyNot(id interface{}) *Builder {
+	return b.whereKeyImpl(id, true, "and")
+}
+
+// OrWhereKey 以 or 连接主键条件（对应 Laravel orWhereKey：括号分组 + or）。
+func (b *Builder) OrWhereKey(id interface{}) *Builder {
+	return b.whereKeyImpl(id, false, "or")
+}
+
+// OrWhereKeyNot 以 or 连接主键排除条件（对应 Laravel orWhereKeyNot）。
+func (b *Builder) OrWhereKeyNot(id interface{}) *Builder {
+	return b.whereKeyImpl(id, true, "or")
+}
+
+func (b *Builder) whereKeyImpl(id interface{}, not bool, boolean string) *Builder {
+	key := b.keyName()
+	// 模型实例 → 主键值（对应 Laravel $id instanceof Model）
+	if _, v, ok := modelPrimaryKey(id); ok {
+		id = v
+	}
+	if boolean == "or" {
+		// 对齐 Laravel orWhereKey：嵌套括号分组后以 or 连接
+		return b.WhereNested(func(nq *Builder) {
+			nq.modelInfo = b.modelInfo
+			nq.whereKeyImpl(id, not, "and")
+		}, "or")
+	}
+	if ids, ok := interfaceSlice(id); ok {
+		if not {
+			return b.WhereNotIn(key, ids)
+		}
+		return b.WhereIn(key, ids)
+	}
+	if not {
+		return b.Where(key, "!=", id)
+	}
+	return b.Where(key, "=", id)
+}
+
+// interfaceSlice 切片值归一为 []interface{}（[]byte 视为单值）。
+func interfaceSlice(v interface{}) ([]interface{}, bool) {
+	if v == nil {
+		return nil, false
+	}
+	rv := reflect.ValueOf(v)
+	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
+		return nil, false
+	}
+	if rv.Type().Elem().Kind() == reflect.Uint8 {
+		return nil, false
+	}
+	out := make([]interface{}, 0, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		out = append(out, rv.Index(i).Interface())
+	}
+	return out, true
+}
+
+// ---- 关系存在性/计数阈值（对应 QueriesRelationships.php:39-90 has）----
+
+// hasImpl Has 的实现体：无参 → 存在性 exists；带 count 阈值 → 计数子查询比较。
+// 优化口径与 Laravel 一致（canUseExistsForExistenceCheck）：count==1 且操作符为
+// >= 或 < 时退化为 exists / not exists（has(rel, '<', 1) 即 doesntHave 语义）。
+// 其余组合编译为 where (select count(*) from target where keys...) op count，
+// count 取绝对值、以字面值内联（对应 Laravel is_numeric → Expression）。
+func (b *Builder) hasImpl(rel Relation, args ...any) *Builder {
+	operator := ">="
+	count := int64(1)
+	switch len(args) {
+	case 1:
+		if s, ok := args[0].(string); ok {
+			operator = s
+		} else if n, ok := toIncrementAmount(args[0]); ok {
+			count = n
+		}
+	case 2:
+		if s, ok := args[0].(string); ok && s != "" {
+			operator = s
+		}
+		if n, ok := toIncrementAmount(args[1]); ok {
+			count = n
+		}
+	}
+	// 存在性检查优化（canUseExistsForExistenceCheck）
+	if count == 1 && (operator == ">=" || operator == "<") {
+		if operator == "<" {
+			return b.addHasWhere(rel, nil, "and-not")
+		}
+		return b.addHasWhere(rel, nil, "and")
+	}
+	// 计数子查询形态（addWhereCountQuery）
+	sub := b.hasSubQuery(rel)
+	if sub == nil {
+		// MorphTo：目标类型由行数据决定，无法静态构造子查询（防 panic 静默跳过）
+		return b
+	}
+	switch m := rel.(type) {
+	case MorphMany:
+		addMorphTypeFilter(sub, m.MorphName, m.TypeColumn, m.MorphKey, fmtString(b.Query.From))
+	case MorphOne:
+		addMorphTypeFilter(sub, m.MorphName, m.TypeColumn, m.MorphKey, fmtString(b.Query.From))
+	}
+	sub.SetAggregate("count", []interface{}{"*"})
+	return b.Where(sub, operator, grammar.NewExpression(strconv.FormatInt(count, 10)))
+}
+
+// ---- Find 族（对应 Laravel Builder.php:589-715）----
+
+// Find 按主键取单行（对应 Laravel find：whereKey(id)->first）。
+func (b *Builder) Find(id interface{}, dest interface{}, columns ...interface{}) error {
+	return b.WhereKey(id).First(dest, columns...)
+}
+
+// FindMany 按主键批量取行（对应 Laravel findMany：whereKey(ids)->get）；
+// ids 为任意切片。空集直接返回空 dest，不发 SQL。
+func (b *Builder) FindMany(ids interface{}, dest interface{}, columns ...interface{}) error {
+	list, _ := interfaceSlice(ids)
+	if len(list) == 0 {
+		rv := reflect.Indirect(reflect.ValueOf(dest))
+		if rv.Kind() == reflect.Slice {
+			rv.Set(reflect.MakeSlice(rv.Type(), 0, 0))
+		}
+		return nil
+	}
+	return b.WhereKey(list).Get(dest, columns...)
+}
+
+// FindOrFail 按主键取单行，未命中返回 *ErrNotFound
+// （对应 Laravel findOrFail 的 ModelNotFoundException）。
+func (b *Builder) FindOrFail(id interface{}, dest interface{}, columns ...interface{}) error {
+	if err := b.Find(id, dest, columns...); err != nil {
+		return err
+	}
+	if isEmptyDest(dest) {
+		return ErrNotFound{Msg: "No query results for record [" + fmtString(id) + "]."}
+	}
+	return nil
+}
+
+// FindOrNew 按主键查找；未命中时把 dest 重置为空白实例并仅设主键
+// （对应 Laravel findOrNew：newModelInstance + 主键，不落库）。
+func (b *Builder) FindOrNew(id interface{}, dest interface{}, columns ...interface{}) error {
+	if err := b.Find(id, dest, columns...); err != nil {
+		return err
+	}
+	if isEmptyDest(dest) {
+		if _, v, ok := modelPrimaryKey(id); ok {
+			id = v
+		}
+		rv := reflect.ValueOf(dest)
+		if rv.Kind() == reflect.Ptr && rv.Elem().Kind() == reflect.Struct {
+			rv.Elem().Set(reflect.Zero(rv.Elem().Type()))
+			_ = setModelAttribute(dest, b.keyName(), id)
+		}
+	}
+	return nil
+}
+
+// FindOr 按主键取单行，未命中执行 fallback（对应 Laravel findOr）。
+func (b *Builder) FindOr(id interface{}, dest interface{}, fallback func() error, columns ...interface{}) error {
+	if err := b.Find(id, dest, columns...); err != nil {
+		return err
+	}
+	if isEmptyDest(dest) {
+		return fallback()
+	}
+	return nil
+}
+
+// ---- firstOrCreate 族（builder 级转发，对应 Laravel Builder.php:717-800）----
+
+// FirstOrCreate 按 attributes 查找；未命中则合并 attributes+values 创建
+// （转发 Connection.FirstOrCreate，保持两者语义一致）。
+func (b *Builder) FirstOrCreate(model interface{}, attributes map[string]interface{}, values ...map[string]interface{}) error {
+	return b.Connection.FirstOrCreate(model, attributes, values...)
+}
+
+// FirstOrNew 按 attributes 查找；未命中仅构造不落库（转发 Connection.FirstOrNew）。
+func (b *Builder) FirstOrNew(model interface{}, attributes map[string]interface{}, values ...map[string]interface{}) error {
+	return b.Connection.FirstOrNew(model, attributes, values...)
+}
+
+// CreateOrFirst 先尝试创建，唯一约束冲突时回退按 attributes 查询
+// （转发 Connection.CreateOrFirst 的并发安全语义）。
+func (b *Builder) CreateOrFirst(model interface{}, attributes map[string]interface{}, values ...map[string]interface{}) error {
+	return b.Connection.CreateOrFirst(model, attributes, values...)
+}
+
+// UpdateOrCreate 按 attributes 查找；命中则更新 values，未命中则创建
+// （转发 Connection.UpdateOrCreate）。
+func (b *Builder) UpdateOrCreate(model interface{}, attributes, values map[string]interface{}) error {
+	return b.Connection.UpdateOrCreate(model, attributes, values)
+}
+
+// IncrementOrCreate 创建匹配 attributes 的记录（column 取 default），已存在
+// 则对 column 自增 step（对应 Laravel 13 Builder.php:786 incrementOrCreate）：
+//
+//	firstOrCreate(attributes, {column: default}) → !wasRecentlyCreated 时 increment。
+//
+// rest 依次为 default（缺省 1）、step（缺省 1）、extra map[string]interface{}（附加列）。
+func (b *Builder) IncrementOrCreate(model interface{}, attributes map[string]interface{}, column string, rest ...interface{}) error {
+	def := int64(1)
+	step := int64(1)
+	var extra map[string]interface{}
+	if len(rest) > 0 {
+		if v, ok := toIncrementAmount(rest[0]); ok {
+			def = v
+		}
+	}
+	if len(rest) > 1 {
+		if v, ok := toIncrementAmount(rest[1]); ok {
+			step = v
+		}
+	}
+	if len(rest) > 2 {
+		if m, ok := rest[2].(map[string]interface{}); ok {
+			extra = m
+		}
+	}
+	if err := b.FirstOrCreate(model, attributes, map[string]interface{}{column: def}); err != nil {
+		return err
+	}
+	if WasRecentlyCreated(model) {
+		return nil
+	}
+	args := []interface{}{step}
+	if extra != nil {
+		args = append(args, extra)
+	}
+	return b.Connection.Increment(model, column, args...)
+}
+
+// toIncrementAmount 解析 increment 金额（整型/浮点 → int64）。
+func toIncrementAmount(v interface{}) (int64, bool) {
+	switch n := v.(type) {
+	case int:
+		return int64(n), true
+	case int8:
+		return int64(n), true
+	case int16:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	case int64:
+		return n, true
+	case uint:
+		return int64(n), true
+	case uint8:
+		return int64(n), true
+	case uint16:
+		return int64(n), true
+	case uint32:
+		return int64(n), true
+	case uint64:
+		return int64(n), true
+	case float32:
+		return int64(n), true
+	case float64:
+		return int64(n), true
+	}
+	return 0, false
+}
+
+// ---- Touch（对应 Laravel Eloquent Builder.php:1343 touch）----
+
+// Touch 批量刷新时间戳：把匹配行的时间戳列更新为 now。
+// 指定列时仅更新该列（对应 touch($column)）；缺省列刷新 updated_at，
+// 且仅对带时间戳列的模型建器生效（无时间戳返回 0、不发 SQL）。
+// 直接编译 UPDATE（对应 toBase()->update）：不自动追加 updated_at。
+func (b *Builder) Touch(columns ...string) (int64, error) {
+	if b.modelInfo != nil && b.modelInfo.softDeletes && !b.modelInternalQuery {
+		b.applyModelScopes()
+	}
+	now := nowFunc()
+	if len(columns) == 0 {
+		if b.modelInfo == nil || !b.modelInfo.hasTimestamps {
+			return 0, nil
+		}
+		columns = []string{"updated_at"}
+	}
+	value := make(map[string]interface{}, len(columns))
+	for _, col := range columns {
+		value[col] = now
+	}
+	b.applyBeforeQueryCallbacks()
+	sql := b.grammar.CompileUpdate(b.Query, value)
+	bindings := cleanBindings(b.grammar.PrepareBindingsForUpdate(b.Bindings, value))
+	return b.Connection.Update(sql, bindings...)
+}
+
+// SoleValue 取唯一一行的单列值：零行 ErrNotFound、多行 ErrMultiple
+// （对应 Laravel soleValue）。
+func (b *Builder) SoleValue(column string) (any, error) {
+	nb := b.Clone()
+	nb.Query.Columns = []interface{}{column}
+	nb.Take(2)
+	rows, err := nb.Connection.SelectMaps(nb.ToSql(), nb.GetBindings())
+	if err != nil {
+		return nil, err
+	}
+	switch len(rows) {
+	case 0:
+		return nil, ErrNotFound{Msg: "No query results for record."}
+	case 1:
+		return rows[0][column], nil
+	default:
+		return nil, ErrMultiple{Msg: fmt.Sprintf("Multiple records found (%d).", len(rows))}
+	}
 }
 
 // ---- 写入 ----
@@ -1494,12 +2296,18 @@ func (b *Builder) Insert(value interface{}) (int64, int64, error) {
 
 // Inserts 批量插入：元素为 map 或 query.Row。
 func (b *Builder) Inserts(values []interface{}) (int64, int64, error) {
+	if len(values) == 0 {
+		// Laravel insert([]) → true：不编译不执行（Query/Builder.php:4194-4197）
+		return 0, 0, nil
+	}
+	b.applyBeforeQueryCallbacks()
 	sql, bindings := b.grammar.CompileInsert(b.Query, normalizeRows(values))
 	return b.Connection.Insert(sql, bindings...)
 }
 
 // InsertGetId 插入并返回自增 id。
 func (b *Builder) InsertGetId(value interface{}, sequence ...string) (int64, error) {
+	b.applyBeforeQueryCallbacks()
 	seq := ""
 	if len(sequence) > 0 {
 		seq = sequence[0]
@@ -1510,6 +2318,10 @@ func (b *Builder) InsertGetId(value interface{}, sequence ...string) (int64, err
 
 // InsertOrIgnore 插入并忽略冲突行。
 func (b *Builder) InsertOrIgnore(values []interface{}) (int64, error) {
+	if len(values) == 0 {
+		return 0, nil
+	}
+	b.applyBeforeQueryCallbacks()
 	sql, bindings := b.grammar.CompileInsertOrIgnore(b.Query, normalizeRows(values))
 	n, _, err := b.Connection.Insert(sql, bindings...)
 	return n, err
@@ -1540,6 +2352,41 @@ func (b *Builder) InsertOrIgnoreUsing(columns []string, q interface{}) (int64, e
 	return n, err
 }
 
+// InsertOrIgnoreReturning 插入并忽略冲突行，按 returning 列返回结果行
+// （对应 Laravel Builder.php:4262 insertOrIgnoreReturning）：
+// values 为空返回空结果不发 SQL；returning/uniqueBy 为空切片报错；
+// 经写连接执行（对应 selectFromWriteConnection）。
+// 编译依赖 grammar 的 CompileInsertOrIgnoreReturning 钩子——PG/SQLite/
+// SqlServer 方言尚未实现（待接线清单），当前调用会 panic ErrUnsupported。
+func (b *Builder) InsertOrIgnoreReturning(values []interface{}, returning []string, uniqueBy ...[]string) ([]map[string]any, error) {
+	if len(values) == 0 {
+		return []map[string]any{}, nil
+	}
+	if len(returning) == 0 {
+		panic(ErrInvalid{"The returning columns must not be empty."})
+	}
+	var unique []string
+	if len(uniqueBy) > 0 {
+		if len(uniqueBy[0]) == 0 {
+			panic(ErrInvalid{"The unique columns must not be empty."})
+		}
+		unique = uniqueBy[0]
+	}
+	g, ok := b.grammar.(interface {
+		CompileInsertOrIgnoreReturning(q *query.Query, rows []query.Row, returning, uniqueBy []string) (string, []any)
+	})
+	if !ok {
+		panic(grammar.ErrUnsupported{Msg: "This database engine does not support insert or ignore returning."})
+	}
+	b.applyBeforeQueryCallbacks()
+	sql, bindings := g.CompileInsertOrIgnoreReturning(b.Query, normalizeRows(values), returning, unique)
+	var rows []map[string]any
+	if err := b.Connection.SelectFromWrite(sql, cleanBindings(bindings), &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
 // Upsert upsert（对应 Laravel Builder.php:4434-4473）：uniqueBy 为唯一键列，update 为冲突时更新的列。
 // update 为空切片 → 普通 insert；update 为 nil → 全列更新（取首行的列）；
 // uniqueBy 为空抛错；values 为空返回 0。
@@ -1547,6 +2394,35 @@ func (b *Builder) InsertOrIgnoreUsing(columns []string, q interface{}) (int64, e
 func (b *Builder) Upsert(values []interface{}, uniqueBy, update []string) (int64, error) {
 	if len(uniqueBy) == 0 {
 		return 0, ErrInvalid{"The unique columns must not be empty."}
+	}
+	// 模型建器 upsert 触碰时间戳（Laravel addTimestampsToUpsertValues:
+	// created_at + updated_at 双补，全行共用一个 fresh timestamp；
+	// Row 行与 WithoutTimestamps 作用域跳过）
+	if b.modelInfo != nil && b.modelInfo.hasTimestamps && !TimestampsIgnored() {
+		now := nowFunc()
+		for _, row := range values {
+			if mm, ok := row.(map[string]interface{}); ok {
+				if _, exists := mm["updated_at"]; !exists {
+					mm["updated_at"] = now
+				}
+				if _, exists := mm["created_at"]; !exists {
+					mm["created_at"] = now
+				}
+			}
+		}
+		// addUpdatedAtToUpsertColumns：冲突更新列无条件追加 updated_at
+		if update != nil {
+			found := false
+			for _, u := range update {
+				if u == "updated_at" {
+					found = true
+					break
+				}
+			}
+			if !found {
+				update = append(append([]string(nil), update...), "updated_at")
+			}
+		}
 	}
 	if len(values) == 0 {
 		return 0, nil
@@ -1565,11 +2441,60 @@ func (b *Builder) Upsert(values []interface{}, uniqueBy, update []string) (int64
 	return n, err
 }
 
-// Update 更新记录。
+// addUpdatedAtColumn 模型建器自动补 updated_at（对应 Laravel Eloquent
+// Builder::addUpdatedAtColumn：update/upsert/increment 系列自动触碰时间戳）。
+func (b *Builder) addUpdatedAtColumn(value map[string]interface{}) map[string]interface{} {
+	if b.modelInfo == nil || !b.modelInfo.hasTimestamps {
+		return value
+	}
+	if _, exists := value["updated_at"]; !exists {
+		value["updated_at"] = nowFunc()
+	}
+	return value
+}
+
+// addUpdatedAtColumnToRows 对批量行插入补 updated_at（Laravel Builder::addTimestamps
+// 语义：时间戳列已显式给出时不覆盖）。
+func (b *Builder) addUpdatedAtColumnToRows(values []interface{}) []interface{} {
+	if b.modelInfo == nil || !b.modelInfo.hasTimestamps {
+		return values
+	}
+	for _, row := range values {
+		if m, ok := row.(map[string]interface{}); ok {
+			if _, exists := m["updated_at"]; !exists {
+				m["updated_at"] = nowFunc()
+			}
+		}
+	}
+	return values
+}
+
+// Update 更新记录。模型建器自动补 updated_at（Laravel Eloquent update 语义）。
 func (b *Builder) Update(value map[string]interface{}) (int64, error) {
+	if b.modelInfo != nil && b.modelInfo.softDeletes {
+		b.applyModelScopes()
+	}
+	value = b.addUpdatedAtColumn(value)
+	b.applyBeforeQueryCallbacks()
 	sql := b.grammar.CompileUpdate(b.Query, value)
 	cleanBindings := cleanBindings(b.grammar.PrepareBindingsForUpdate(b.Bindings, value))
 	return b.Connection.Update(sql, cleanBindings...)
+}
+
+// UpdateFrom 对应 Postgres 的 update ... from（compileUpdateFrom）：
+// 基础方言不支持（抛 ErrUnsupported）。
+func (b *Builder) UpdateFrom(value map[string]interface{}) (int64, error) {
+	b.applyBeforeQueryCallbacks()
+	g, ok := b.grammar.(interface {
+		CompileUpdateFrom(*query.Query, map[string]any) string
+		PrepareBindingsForUpdateFrom(map[string][]any, map[string]any) []any
+	})
+	if !ok {
+		panic(grammar.ErrUnsupported{Msg: "This database engine does not support update from."})
+	}
+	sql := g.CompileUpdateFrom(b.Query, value)
+	bindings := cleanBindings(g.PrepareBindingsForUpdateFrom(b.Bindings, value))
+	return b.Connection.Update(sql, bindings...)
 }
 
 // UpdateOrInsert 存在则更新，否则插入（对应 Laravel updateOrInsert）。
@@ -1649,6 +2574,47 @@ func (b *Builder) Decrement(column string, amount ...interface{}) (int64, error)
 	return b.Increment(column, -amountInt)
 }
 
+// IncrementEach 按列批量递增（对应 Laravel incrementEach）：
+// 值编译为 raw "col + amount"，extra 为附加 set 值。
+func (b *Builder) IncrementEach(columns map[string]float64, extra map[string]interface{}) (int64, error) {
+	return b.incrementEachImpl(columns, extra, "+")
+}
+
+// DecrementEach 按列批量递减（对应 Laravel decrementEach）。
+func (b *Builder) DecrementEach(columns map[string]float64, extra map[string]interface{}) (int64, error) {
+	return b.incrementEachImpl(columns, extra, "-")
+}
+
+func (b *Builder) incrementEachImpl(columns map[string]float64, extra map[string]interface{}, op string) (int64, error) {
+	values := make(map[string]interface{}, len(columns)+len(extra))
+	for _, column := range sortedColumnNames2(columns) {
+		amount := columns[column]
+		values[column] = grammar.NewExpression(b.grammar.Wrap(column) + " " + op + " " + formatAmount(amount))
+	}
+	for _, k := range sortedColumnNames(extra) {
+		values[k] = extra[k]
+	}
+	nb := b.Clone()
+	return nb.Update(values)
+}
+
+func formatAmount(amount float64) string {
+	if amount == float64(int64(amount)) {
+		return strconv.FormatInt(int64(amount), 10)
+	}
+	return strconv.FormatFloat(amount, 'f', -1, 64)
+}
+
+// sortedColumnNames2 对 map[string]float64 的 key 排序。
+func sortedColumnNames2(m map[string]float64) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // Truncate 清空表。
 func (b *Builder) Truncate() error {
 	for _, stmt := range b.grammar.CompileTruncate(b.Query) {
@@ -1660,18 +2626,105 @@ func (b *Builder) Truncate() error {
 }
 
 // Delete 删除；可传主键值（对应 delete($id)）。
+// 关联软删模型时编译为 update set deleted_at = now（对应 Laravel
+// SoftDeletingScope 的 onDelete 宏），并分发 deleting/trashed/deleted 事件；
+// 无关联模型且无任何 where 条件时返回错误，拒绝整表 DELETE。
 func (b *Builder) Delete(args ...interface{}) (int64, error) {
 	if len(args) > 0 && args[0] != nil {
+		// Laravel: setKeysForSaveQuery 用 getQualifiedKeyName——主键名来自模型
+		// 映射而非硬编码 id
+		keyCol := "id"
+		if b.modelInfo != nil && b.modelInfo.primaryKey != "" {
+			keyCol = b.modelInfo.primaryKey
+		}
 		from := fmtString(b.Query.From)
-		b.Where(from+".id", "=", args[0])
+		b.Where(from+"."+keyCol, "=", args[0])
 	}
+	if b.modelInfo != nil && b.modelInfo.softDeletes {
+		return b.softDeleteRows()
+	}
+	if len(b.Query.Wheres) == 0 {
+		return 0, errors.New("torm: delete statement requires a where clause to avoid removing all rows")
+	}
+	b.applyBeforeQueryCallbacks()
 	sql := b.grammar.CompileDelete(b.Query)
 	return b.Connection.Delete(sql, b.grammar.PrepareBindingsForDelete(b.Bindings)...)
 }
 
+// ForceDelete 硬删除：跳过软删宏，编译为裸 DELETE（对应 Laravel
+// Eloquent Builder::forceDelete → toBase()->delete）。
+func (b *Builder) ForceDelete() (int64, error) {
+	b.applyBeforeQueryCallbacks()
+	sql := b.grammar.CompileDelete(b.Query)
+	return b.Connection.Delete(sql, b.grammar.PrepareBindingsForDelete(b.Bindings)...)
+}
+
+// softDeleteRows 软删模型的 Builder.Delete（对应 SoftDeletingScope::onDelete
+// → performDeleteOnModel：runSoftDelete 写 deleted_at + updated_at）。
+// SET 列不带表限定——PG 不允许 update set 后使用限定名；仅 Laravel 在存在
+// joins 时才限定（setKeysForSaveQuery），此处同样仅在 joins 存在时限定。
+func (b *Builder) softDeleteRows() (int64, error) {
+	info := b.modelInfo
+	// Laravel onDelete → Eloquent Builder::update → toBase() 会应用 scopes：
+	// WHERE 带 deleted_at is null（已软删行不重写，SoftDeletingScope.php:43-56）
+	b.applyModelScopes()
+	now := nowFunc()
+	qualify := len(b.Query.Joins) > 0
+	setCol := info.deletedAtField
+	if qualify {
+		setCol = info.table + "." + info.deletedAtField
+	}
+	columns := map[string]interface{}{setCol: now}
+	if info.hasTimestamps {
+		upd := "updated_at"
+		if qualify {
+			upd = info.table + ".updated_at"
+		}
+		columns[upd] = now
+	}
+	// Laravel builder 级 onDelete 不分发任何模型事件（无模型实例）
+	n, err := b.Update(columns)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // ---- SQL 与绑定 ----
 
+// BeforeQuery 注册查询执行前回调（对应 Laravel beforeQuery；toSql 与写入族执行前应用）。
+func (b *Builder) BeforeQuery(callback func(*Builder)) *Builder {
+	b.beforeQueryCallbacks = append(b.beforeQueryCallbacks, callback)
+	return b
+}
+
+// AfterQuery 注册查询执行后回调（对应 Laravel afterQuery；Get 成功后应用）。
+func (b *Builder) AfterQuery(callback func(any) any) *Builder {
+	b.afterQueryCallbacks = append(b.afterQueryCallbacks, callback)
+	return b
+}
+
+// applyBeforeQueryCallbacks 应用并清空执行前回调。
+func (b *Builder) applyBeforeQueryCallbacks() {
+	for _, cb := range b.beforeQueryCallbacks {
+		cb(b)
+	}
+	b.beforeQueryCallbacks = nil
+}
+
+// applyAfterQueryCallbacks 应用执行后回调（回调返回 nil 时保留原结果）。
+func (b *Builder) applyAfterQueryCallbacks(result any) any {
+	for _, cb := range b.afterQueryCallbacks {
+		if out := cb(result); out != nil {
+			result = out
+		}
+	}
+	b.afterQueryCallbacks = nil
+	return result
+}
+
 func (b *Builder) ToSql() string {
+	b.applyBeforeQueryCallbacks()
 	return b.grammar.CompileSelect(b.Query)
 }
 
@@ -1749,9 +2802,10 @@ func cleanBindings(bindings []interface{}) []interface{} {
 // ---- 克隆 ----
 
 // Clone 深拷贝查询状态（切片复制，嵌套 Query/Join 引用共享，与 PHP clone 语义一致）。
+// 软删 scope 的物化状态（scopesApplied/softDelete）随 wheres 一并继承，
+// 避免克隆链（ChunkById/lazy 翻页）重复追加约束。
 func (b *Builder) Clone() *Builder {
 	nb := *b
-	nb.scopesApplied = false
 	nb.Query = cloneQuery(b.Query)
 	nb.Bindings = cloneBindings(b.Bindings)
 	return &nb
@@ -1889,6 +2943,8 @@ func parseColumnArgs(args ...interface{}) (operator string, second interface{}, 
 		second = args[1]
 		if len(args) > 2 {
 			boolean = fmtString(args[2])
+		} else {
+			boolean = "and"
 		}
 		return operator, second, boolean
 	}
@@ -1975,12 +3031,11 @@ func (b *Builder) addDateBasedWhere(typ string, column interface{}, operator str
 
 func (b *Builder) dateWhereImpl(typ string, column interface{}, args []interface{}, boolean string) *Builder {
 	operator, value := parseWhereArgs(args...)
-	if invalidOperator(operator) {
+	if b.invalidOperator(operator) {
 		operator, value = "=", operator
 	}
-	if value == nil {
-		return b.whereNullImpl(column, boolean, operator != "=")
-	}
+	// Laravel addDateBasedWhere 不把 nil 转为 whereNull：生成 date(col) = ?
+	// 并绑定 null（Builder.php:1857-1903）
 	return b.addDateBasedWhere(typ, column, operator, value, boolean)
 }
 
@@ -2050,9 +3105,20 @@ func (b *Builder) jsonWhereImpl(typ string, column interface{}, value interface{
 	}
 	b.Query.Wheres = append(b.Query.Wheres, w)
 	if !b.grammar.IsExpression(value) {
-		b.AddBinding(prepareJsonBinding(value), "where")
+		b.AddBinding(b.prepareBindingForJsonContains(value), "where")
 	}
 	return b
+}
+
+// prepareBindingForJsonContains 对应 Laravel 的 grammar->prepareBindingForJsonContains：
+// 方言可覆盖（SQLite 原样、SqlServer bool → json），默认数组/对象 json_encode。
+func (b *Builder) prepareBindingForJsonContains(value interface{}) interface{} {
+	// Laravel 把所有值都交 grammar->prepareBindingForJsonContains（Grammar.php:764
+	// 基础实现一律 json_encode；SQLite 原样、SqlServer bool→json）
+	if prep, ok := b.grammar.(interface{ PrepareBindingForJsonContains(any) any }); ok {
+		return prep.PrepareBindingForJsonContains(value)
+	}
+	return prepareJsonBinding(value)
 }
 
 func (b *Builder) WhereJsonContains(column interface{}, value interface{}) *Builder {
@@ -2083,6 +3149,12 @@ func (b *Builder) WhereJsonDoesntOverlap(column interface{}, value interface{}) 
 	return b.jsonWhereImpl("JsonOverlaps", column, value, "and", true)
 }
 
+// OrWhereJsonDoesntOverlap 以 or 连接的 JSON 不相交（对应 Laravel
+// Builder.php:2420 orWhereJsonDoesntOverlap）。
+func (b *Builder) OrWhereJsonDoesntOverlap(column interface{}, value interface{}) *Builder {
+	return b.jsonWhereImpl("JsonOverlaps", column, value, "or", true)
+}
+
 func (b *Builder) WhereJsonContainsKey(column interface{}) *Builder {
 	return b.jsonKeyImpl(column, "and", false)
 }
@@ -2111,7 +3183,7 @@ func (b *Builder) jsonKeyImpl(column interface{}, boolean string, not bool) *Bui
 
 func (b *Builder) jsonLengthImpl(column interface{}, args []interface{}, boolean string, not bool) *Builder {
 	operator, value := parseWhereArgs(args...)
-	if invalidOperator(operator) {
+	if b.invalidOperator(operator) {
 		operator, value = "=", operator
 	}
 	b.Query.Wheres = append(b.Query.Wheres, &query.Where{
@@ -2359,6 +3431,14 @@ func (b *Builder) DD() {
 	os.Exit(1)
 }
 
+// DDRawSql 打印内联绑定后的 SQL（对应 Laravel Builder.php:4980 ddRawSql）。
+// 与 Laravel 的差异：Laravel 的 dd() 是 die-dump（打印后终止脚本）；
+// Go 侧不做 os.Exit（终止宿主进程的职责在调用方），仅打印后返回 builder。
+func (b *Builder) DDRawSql() *Builder {
+	fmt.Fprintln(os.Stderr, b.ToRawSql())
+	return b
+}
+
 // Explain 返回执行计划（explain + SQL）。
 func (b *Builder) Explain() ([]map[string]any, error) {
 	return b.Connection.SelectMaps("explain "+b.ToSql(), b.GetBindings())
@@ -2390,25 +3470,50 @@ func (b *Builder) UseWritePdo() *Builder {
 	return b
 }
 
+// ForPageBeforeId 基于列游标向前翻页：where column < lastId + orderBy column desc + limit
+// （对应 Laravel forPageBeforeId；lastId 为 nil 时约束列非空）。
+func (b *Builder) ForPageBeforeId(perPage uint64, lastId interface{}, column ...string) *Builder {
+	col := "id"
+	if len(column) > 0 && column[0] != "" {
+		col = column[0]
+	}
+	b.Query.Orders = b.removeExistingOrdersFor(col)
+	if lastId == nil {
+		b.WhereNotNull(col)
+	} else {
+		b.Where(col, "<", lastId)
+	}
+	return b.OrderBy(col, "desc").Limit(perPage)
+}
+
 // ForPageAfterId 基于列游标的分页：where column > lastId + orderBy column asc + limit
-// （对应 Laravel forPageAfterId；不使用 offset）。
+// （对应 Laravel forPageAfterId；不使用 offset；lastId 为 nil 时约束列非空）。
 func (b *Builder) ForPageAfterId(perPage uint64, lastId interface{}, column ...string) *Builder {
 	col := "id"
 	if len(column) > 0 && column[0] != "" {
 		col = column[0]
 	}
 	// 移除已有针对该列的排序（对齐 Laravel 的 orders 过滤）
+	b.Query.Orders = b.removeExistingOrdersFor(col)
+	if lastId == nil {
+		b.WhereNotNull(col)
+	} else {
+		b.Where(col, ">", lastId)
+	}
+	b.OrderBy(col, "asc")
+	b.Limit(perPage)
+	return b
+}
+
+// removeExistingOrdersFor 移除针对指定列的排序（对应 removeExistingOrdersFor）。
+func (b *Builder) removeExistingOrdersFor(col string) []*query.Order {
 	orders := make([]*query.Order, 0, len(b.Query.Orders))
 	for _, o := range b.Query.Orders {
 		if fmtString(o.Column) != col {
 			orders = append(orders, o)
 		}
 	}
-	b.Query.Orders = orders
-	b.Where(col, ">", lastId)
-	b.OrderBy(col, "asc")
-	b.Limit(perPage)
-	return b
+	return orders
 }
 
 // ChunkById 基于列游标的分块处理，避免大 offset（对应 Laravel chunkById）。
@@ -2559,4 +3664,396 @@ func iterEachRow(page any, callback func(item any) (bool, error)) (bool, error) 
 		}
 	}
 	return true, nil
+}
+
+// ---- 分页族（对应 Laravel paginate / simplePaginate / cursorPaginate）----
+
+// LengthAwarePaginator 对应 Laravel LengthAwarePaginator 的等价结构。
+type LengthAwarePaginator struct {
+	Items       any
+	Total       int64
+	PerPage     int64
+	CurrentPage int64
+	LastPage    int64
+}
+
+// SimplePaginator 对应 Laravel Paginator（简单分页，多取一条判断 hasMore）。
+type SimplePaginator struct {
+	Items       any
+	PerPage     int64
+	CurrentPage int64
+	HasMore     bool
+}
+
+// CursorPaginator 对应 Laravel CursorPaginator。
+type CursorPaginator struct {
+	Items          any
+	PerPage        int64
+	HasMore        bool
+	Cursor         *Cursor
+	NextCursor     *Cursor
+	PreviousCursor *Cursor
+}
+
+// Cursor 对应 Illuminate\Pagination\Cursor：参数集合 + 方向标记，
+// 编码为 base64(json)（url 安全：+ → -、/ → _、= 剔除）。
+type Cursor struct {
+	parameters         map[string]any
+	pointsToNextItems  bool
+}
+
+// NewCursor 构造游标。
+func NewCursor(parameters map[string]any, pointsToNextItems bool) *Cursor {
+	return &Cursor{parameters: parameters, pointsToNextItems: pointsToNextItems}
+}
+
+// Parameter 取游标参数（缺失时 panic，对应 Laravel UnexpectedValueException）。
+func (c *Cursor) Parameter(name string) any {
+	v, ok := c.parameters[name]
+	if !ok {
+		panic(ErrInvalid{"Unable to find parameter [" + name + "] in pagination item."})
+	}
+	return v
+}
+
+// PointsToNextItems 游标是否指向后一页。
+func (c *Cursor) PointsToNextItems() bool { return c.pointsToNextItems }
+
+// Encode 编码为 url 安全 base64（对应 Cursor::encode）。
+func (c *Cursor) Encode() string {
+	payload := make(map[string]any, len(c.parameters)+1)
+	for k, v := range c.parameters {
+		payload[k] = v
+	}
+	payload["_pointsToNextItems"] = c.pointsToNextItems
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	return base64UrlEncode(data)
+}
+
+// CursorFromEncoded 从编码串解码游标（对应 Cursor::fromEncoded；非法返回 nil）。
+func CursorFromEncoded(encoded string) *Cursor {
+	data, ok := base64UrlDecode(encoded)
+	if !ok {
+		return nil
+	}
+	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec.UseNumber()
+	var payload map[string]any
+	if err := dec.Decode(&payload); err != nil {
+		return nil
+	}
+	for k, v := range payload {
+		if n, ok := v.(json.Number); ok {
+			if i, err := n.Int64(); err == nil {
+				payload[k] = i
+			}
+		}
+	}
+	raw, exists := payload["_pointsToNextItems"]
+	if !exists {
+		return nil
+	}
+	points, _ := raw.(bool)
+	delete(payload, "_pointsToNextItems")
+	return &Cursor{parameters: payload, pointsToNextItems: points}
+}
+
+func base64UrlEncode(data []byte) string {
+	r := strings.NewReplacer("+", "-", "/", "_", "=", "")
+	return r.Replace(base64.StdEncoding.EncodeToString(data))
+}
+
+func base64UrlDecode(encoded string) ([]byte, bool) {
+	r := strings.NewReplacer("-", "+", "_", "/")
+	padded := r.Replace(encoded)
+	if m := len(padded) % 4; m != 0 {
+		padded += strings.Repeat("=", 4-m)
+	}
+	data, err := base64.StdEncoding.DecodeString(padded)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+// GetCountForPagination 取分页总数（对应 Laravel getCountForPagination）：
+// 有 group/having 时包裹子查询计数，否则去除 columns/orders/limit/offset 后聚合。
+func (b *Builder) GetCountForPagination(columns ...string) (int64, error) {
+	cols := make([]interface{}, 0, len(columns))
+	if len(columns) == 0 {
+		cols = append(cols, "*")
+	} else {
+		for _, c := range columns {
+			cols = append(cols, c)
+		}
+	}
+
+	var total int64
+	var nb *Builder
+
+	if len(b.Query.Groups) > 0 || len(b.Query.Havings) > 0 {
+		clone := b.CloneWithout("orders", "limit", "offset").CloneWithoutBindings("order")
+		if clone.Query.Columns == nil && len(b.Query.Joins) > 0 {
+			clone.Select(fmtString(b.Query.From) + ".*")
+		}
+		nb = NewBuilder(b.Connection, b.grammar).
+			FromRaw(grammar.NewExpression("(" + clone.ToSql() + ") as " + b.grammar.Wrap("aggregate_table")))
+		nb.MergeBindings(clone)
+		nb.SetAggregate("count", withoutSelectAliases(cols))
+	} else {
+		var without []string
+		var bindingExcept []string
+		if len(b.Query.Unions) > 0 {
+			without = []string{"unionOrders", "unionLimit", "unionOffset"}
+			bindingExcept = []string{"unionOrder"}
+		} else {
+			without = []string{"columns", "orders", "limit", "offset"}
+			bindingExcept = []string{"select", "order"}
+		}
+		nb = b.CloneWithout(without...).CloneWithoutBindings(bindingExcept...)
+		nb.SetAggregate("count", withoutSelectAliases(cols))
+	}
+
+	if err := nb.Scan(&total); err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
+// withoutSelectAliases 去掉列别名（count 查询里别名会破坏聚合）。
+func withoutSelectAliases(columns []interface{}) []interface{} {
+	out := make([]interface{}, len(columns))
+	for i, c := range columns {
+		if s, ok := c.(string); ok {
+			if pos := strings.Index(strings.ToLower(s), " as "); pos >= 0 {
+				out[i] = s[:pos]
+				continue
+			}
+		}
+		out[i] = c
+	}
+	return out
+}
+
+// Paginate 长度感知分页（对应 Laravel paginate）：
+// 总数为 0 时不执行取数查询。
+func (b *Builder) Paginate(dest any, page, perPage int64) (*LengthAwarePaginator, error) {
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 {
+		perPage = 15
+	}
+	total, err := b.GetCountForPagination()
+	if err != nil {
+		return nil, err
+	}
+	lastPage := int64(1)
+	if total > 0 {
+		lastPage = (total + perPage - 1) / perPage
+		if lastPage < 1 {
+			lastPage = 1
+		}
+	}
+	p := &LengthAwarePaginator{Total: total, PerPage: perPage, CurrentPage: page, LastPage: lastPage}
+	if total == 0 {
+		return p, nil
+	}
+	nb := b.Clone().ForPage(uint64(page), uint64(perPage))
+	if err := nb.Get(dest); err != nil {
+		return nil, err
+	}
+	p.Items = dest
+	return p, nil
+}
+
+// SimplePaginate 简单分页（对应 Laravel simplePaginate）：
+// 多取一条判断 hasMore，无 total。
+func (b *Builder) SimplePaginate(dest any, page, perPage int64) (*SimplePaginator, error) {
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 {
+		perPage = 15
+	}
+	nb := b.Clone().Offset(uint64((page - 1) * perPage)).Limit(uint64(perPage + 1))
+	if err := nb.Get(dest); err != nil {
+		return nil, err
+	}
+	p := &SimplePaginator{Items: dest, PerPage: perPage, CurrentPage: page}
+	if n := reflectSliceLen(dest); n > int(perPage) {
+		p.HasMore = true
+		truncateSlice(dest, int(perPage))
+	}
+	return p, nil
+}
+
+// truncateSlice 把切片截断到 n 个元素。
+func truncateSlice(dest any, n int) {
+	rv := reflect.Indirect(reflect.ValueOf(dest))
+	if rv.Kind() == reflect.Slice && rv.Len() > n {
+		rv.Set(rv.Slice(0, n))
+	}
+}
+
+// CursorPaginate 游标分页（对应 Laravel cursorPaginate）：
+// 依据 order 列生成游标条件（支持多列嵌套 or），cursor 为 "" 或 nil 表示首页。
+func (b *Builder) CursorPaginate(dest any, perPage int64, cursor ...*Cursor) (*CursorPaginator, error) {
+	if perPage < 1 {
+		perPage = 15
+	}
+	var cur *Cursor
+	if len(cursor) > 0 {
+		cur = cursor[0]
+	}
+
+	orders := b.ensureOrderForCursorPagination(cur != nil && !cur.pointsToNextItems)
+	if len(orders) == 0 {
+		return nil, ErrInvalid{"No order by defined for the cursor pagination."}
+	}
+
+	if cur != nil {
+		b.addCursorConditions(b, nil, 0, orders, cur)
+	}
+
+	nb := b.Clone().Limit(uint64(perPage + 1))
+	if err := nb.Get(dest); err != nil {
+		return nil, err
+	}
+
+	p := &CursorPaginator{PerPage: perPage, Cursor: cur}
+	count := reflectSliceLen(dest)
+	if count > int(perPage) {
+		p.HasMore = true
+	}
+
+	// 组装 next / previous 游标（取截断后首末行的 order 列值）
+	params := make([]string, 0, len(orders))
+	for _, o := range orders {
+		params = append(params, fmtString(o.Column))
+	}
+	if count > 0 {
+		if p.HasMore {
+			last := sliceItem(dest, count-1)
+			nextParams := map[string]any{}
+			for _, col := range params {
+				nextParams[col] = cursorColumnValue(last, col)
+			}
+			p.NextCursor = NewCursor(nextParams, true)
+		}
+		if cur != nil {
+			first := sliceItem(dest, 0)
+			prevParams := map[string]any{}
+			for _, col := range params {
+				prevParams[col] = cursorColumnValue(first, col)
+			}
+			p.PreviousCursor = NewCursor(prevParams, false)
+		}
+	}
+	if p.HasMore {
+		truncateSlice(dest, int(perPage))
+	}
+	return p, nil
+}
+
+// ensureOrderForCursorPagination 对应 ensureOrderForCursorPagination：
+// 无排序时抛错；shouldReverse 时反转全部方向；返回带方向的 orders。
+func (b *Builder) ensureOrderForCursorPagination(shouldReverse bool) []*query.Order {
+	if len(b.Query.Orders) == 0 && len(b.Query.UnionOrders) == 0 {
+		panic(ErrInvalid{"No order by column defined for the cursor pagination."})
+	}
+	if shouldReverse {
+		for _, o := range b.Query.Orders {
+			if o.Direction == "asc" {
+				o.Direction = "desc"
+			} else {
+				o.Direction = "asc"
+			}
+		}
+		for _, o := range b.Query.UnionOrders {
+			if o.Direction == "asc" {
+				o.Direction = "desc"
+			} else {
+				o.Direction = "asc"
+			}
+		}
+	}
+	orders := b.Query.Orders
+	if len(b.Query.UnionOrders) > 0 {
+		orders = b.Query.UnionOrders
+	}
+	out := make([]*query.Order, 0, len(orders))
+	for _, o := range orders {
+		if o.Direction != "" {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
+// addCursorConditions 对应 Laravel 的递归游标条件：
+// 前序列相等 + 当前列比较（asc 为 >，desc 为 <），后续列以 or 嵌套。
+func (b *Builder) addCursorConditions(bb *Builder, previousColumn interface{}, i int, orders []*query.Order, cur *Cursor) {
+	if previousColumn != nil {
+		bb.Where(previousColumn, "=", cur.Parameter(fmtString(previousColumn)))
+	}
+	bb.WhereNested(func(second *Builder) {
+		order := orders[i]
+		column := fmtString(order.Column)
+		operator := ">"
+		if order.Direction == "desc" {
+			operator = "<"
+		}
+		second.Where(column, operator, cur.Parameter(column))
+		if i < len(orders)-1 {
+			second.OrWhereNested(func(third *Builder) {
+				b.addCursorConditions(third, column, i+1, orders, cur)
+			})
+		}
+	}, "and")
+}
+
+// sliceItem 取切片第 i 个元素（处理 []T 与 []*T）。
+func sliceItem(dest any, i int) any {
+	rv := reflect.Indirect(reflect.ValueOf(dest))
+	if rv.Kind() != reflect.Slice || i >= rv.Len() {
+		return nil
+	}
+	item := rv.Index(i)
+	if item.Kind() == reflect.Ptr {
+		return item.Interface()
+	}
+	if !item.CanAddr() {
+		cp := reflect.New(item.Type())
+		cp.Elem().Set(item)
+		return cp.Interface()
+	}
+	return item.Addr().Interface()
+}
+
+// cursorColumnValue 从扫描行提取 order 列值（map 或 struct）。
+func cursorColumnValue(item any, col string) any {
+	if item == nil {
+		return nil
+	}
+	if m, ok := item.(map[string]any); ok {
+		return m[col]
+	}
+	rv := reflect.Indirect(reflect.ValueOf(item))
+	if rv.Kind() != reflect.Struct {
+		return nil
+	}
+	sc, err := NewSchema(item)
+	if err != nil {
+		return nil
+	}
+	for _, f := range sc.Fields {
+		if f.Name == col {
+			return reflect.Indirect(f.Value).Interface()
+		}
+	}
+	return nil
 }

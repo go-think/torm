@@ -22,15 +22,15 @@ func TestMigratorRunsPendingMigrations(t *testing.T) {
 	createMigTable := "create table `migrations` (`id` int unsigned not null auto_increment primary key, `migration` varchar(255) not null, `batch` int not null)"
 	st.On(createMigTable, &faketb.Result{})
 	// ranNames：空
-	st.On("select `migration` from `migrations`", &faketb.Result{Columns: []string{"migration"}, Rows: [][]driver.Value{}})
+	st.On("select \"migration\" from \"migrations\"", &faketb.Result{Columns: []string{"migration"}, Rows: [][]driver.Value{}})
 	// nextBatch：0 → batch 1
-	st.On("select coalesce(max(`batch`), 0) as b from `migrations`", &faketb.Result{Columns: []string{"b"}, Rows: [][]driver.Value{{int64(0)}}})
+	st.On("select coalesce(max(\"batch\"), 0) as b from \"migrations\"", &faketb.Result{Columns: []string{"b"}, Rows: [][]driver.Value{{int64(0)}}})
 
 	createUsers := "create table `users` (`id` bigint unsigned not null auto_increment primary key, `name` varchar(255) not null)"
 	createPosts := "create table `posts` (`id` bigint unsigned not null auto_increment primary key)"
 	st.On(createUsers, &faketb.Result{})
 	st.On(createPosts, &faketb.Result{})
-	st.On("insert into `migrations` (`migration`, `batch`) values (?, ?)", &faketb.Result{Affected: 1})
+	st.On("insert into \"migrations\" (\"migration\", \"batch\") values (?, ?)", &faketb.Result{Affected: 1})
 
 	upCalled := 0
 	mig := migrations.NewMigrator(conn,
@@ -59,7 +59,7 @@ func TestMigratorRunsPendingMigrations(t *testing.T) {
 	if upCalled != 2 {
 		t.Errorf("upCalled = %d", upCalled)
 	}
-	st.LastCall(t, "insert into `migrations` (`migration`, `batch`) values (?, ?)")
+	st.LastCall(t, "insert into \"migrations\" (\"migration\", \"batch\") values (?, ?)")
 }
 
 func TestMigratorSkipsRan(t *testing.T) {
@@ -72,12 +72,12 @@ func TestMigratorSkipsRan(t *testing.T) {
 	// HasTable（repositoryExists）：表已存在
 	st.On("select * from information_schema.tables where table_schema = ? and table_name = ? and table_type = 'BASE TABLE'", &faketb.Result{Rows: [][]driver.Value{{1}}})
 	st.On("create table `migrations` (`id` int unsigned not null auto_increment primary key, `migration` varchar(255) not null, `batch` int not null)", &faketb.Result{})
-	st.On("select `migration` from `migrations`", &faketb.Result{
+	st.On("select \"migration\" from \"migrations\"", &faketb.Result{
 		Columns: []string{"migration"},
 		Rows:   [][]driver.Value{{"2026_01_01_create_users"}},
 	})
-	st.On("select coalesce(max(`batch`), 0) as b from `migrations`", &faketb.Result{Columns: []string{"b"}, Rows: [][]driver.Value{{int64(1)}}})
-	st.On("insert into `migrations` (`migration`, `batch`) values (?, ?)", &faketb.Result{Affected: 1})
+	st.On("select coalesce(max(\"batch\"), 0) as b from \"migrations\"", &faketb.Result{Columns: []string{"b"}, Rows: [][]driver.Value{{int64(1)}}})
+	st.On("insert into \"migrations\" (\"migration\", \"batch\") values (?, ?)", &faketb.Result{Affected: 1})
 
 	upCalled := 0
 	mig := migrations.NewMigrator(conn,
@@ -111,8 +111,8 @@ func TestMigratorRollbackLastBatch(t *testing.T) {
 	}
 
 	// lastBatch = 1
-	st.On("select coalesce(max(`batch`), 0) as b from `migrations`", &faketb.Result{Columns: []string{"b"}, Rows: [][]driver.Value{{int64(1)}}})
-	st.On("select `migration` from `migrations` where `batch` = ? order by `id`", &faketb.Result{
+	st.On("select coalesce(max(\"batch\"), 0) as b from \"migrations\"", &faketb.Result{Columns: []string{"b"}, Rows: [][]driver.Value{{int64(1)}}})
+	st.On("select \"migration\" from \"migrations\" where \"batch\" = ? order by \"id\"", &faketb.Result{
 		Columns: []string{"migration"},
 		Rows:   [][]driver.Value{{"2026_01_01_create_users"}, {"2026_01_02_create_posts"}},
 	})
@@ -120,7 +120,7 @@ func TestMigratorRollbackLastBatch(t *testing.T) {
 	dropPosts := "drop table `posts`"
 	st.On(dropUsers, &faketb.Result{})
 	st.On(dropPosts, &faketb.Result{})
-	st.On("delete from `migrations` where `migration` = ?", &faketb.Result{Affected: 1})
+	st.On("delete from \"migrations\" where \"migration\" = ?", &faketb.Result{Affected: 1})
 
 	downOrder := []string{}
 	mig := migrations.NewMigrator(conn,
@@ -161,7 +161,7 @@ func TestMigratorRollbackEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st.On("select coalesce(max(`batch`), 0) as b from `migrations`", &faketb.Result{Columns: []string{"b"}, Rows: [][]driver.Value{{int64(0)}}})
+	st.On("select coalesce(max(\"batch\"), 0) as b from \"migrations\"", &faketb.Result{Columns: []string{"b"}, Rows: [][]driver.Value{{int64(0)}}})
 
 	mig := migrations.NewMigrator(conn)
 	rolled, err := mig.Rollback()

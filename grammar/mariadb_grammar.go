@@ -1,14 +1,33 @@
 package grammar
 
 // MariaDbGrammar 对应 Illuminate\Database\Query\Grammars\MariaDbGrammar。
-// MariaDB 10.x 与 MySQL 编译行为一致（本子集内无差异点），
-// 独立类型以便方言注册表与后续差异扩展（如 REGEXP 运算符、sequence 特性）。
+// 与 MySQL 的差异点：JSON 选择器走 json_value、JSON 值 cast 走 json_query、
+// lateral join 不支持；其余（straight join、timeout 提示等）继承 MySQL。
 type MariaDbGrammar struct {
 	MySqlGrammar
 }
 
 func NewMariaDbGrammar() *MariaDbGrammar {
-	// MariaDB 编译行为与 MySQL 子集一致：复用 MySQL 的钩子配置。
+	g := &MariaDbGrammar{}
 	inner := NewMySqlGrammar()
-	return &MariaDbGrammar{MySqlGrammar: *inner}
+	g.MySqlGrammar = *inner
+
+	// MariaDB 覆盖项
+	g.BaseGrammar.wrapJsonSelectorFn = g.wrapJsonSelector
+	g.compileJsonValueCastFn = g.compileJsonValueCast
+	// lateral join 不支持（对应 MariaDbGrammar::compileJoinLateral 抛错）
+	g.compileJoinLateralFn = nil
+
+	return g
+}
+
+// wrapJsonSelector 对应 MariaDbGrammar::wrapJsonSelector：json_value。
+func (g *MariaDbGrammar) wrapJsonSelector(value string) string {
+	field, path := g.wrapJsonFieldAndPath(value)
+	return "json_value(" + field + path + ")"
+}
+
+// compileJsonValueCast 对应 MariaDbGrammar::compileJsonValueCast：json_query。
+func (g *MariaDbGrammar) compileJsonValueCast(value string) string {
+	return "json_query(" + value + ", '$')"
 }

@@ -3,7 +3,10 @@ package torm
 import (
 	"database/sql/driver"
 	"errors"
+	"sync"
 	"testing"
+
+	"github.com/thinkoner/torm/events"
 )
 
 func TestTransactionCommit(t *testing.T) {
@@ -287,5 +290,51 @@ func TestTransactionHooksRunOutsideLock(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+type txEventRecorder struct {
+	mu     sync.Mutex
+	events []events.Event
+}
+
+func (r *txEventRecorder) Dispatch(e events.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, e)
+}
+
+func TestTransactionLifecycleEvents(t *testing.T) {
+	conn, st := newFakeDB(t)
+	st.On("BEGIN", &fakeResult{})
+	st.On("COMMIT", &fakeResult{})
+	st.On("ROLLBACK", &fakeResult{})
+
+	rec := &txEventRecorder{}
+	conn.SetEventDispatcher(rec)
+
+	if err := conn.Transaction(func(c *Connection) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Transaction(func(c *Connection) error { return errors.New("boom") }); err == nil {
+		t.Fatal("want error")
+	}
+
+	var names []string
+	for _, e := range rec.events {
+		names = append(names, e.EventName())
+	}
+	// 提交路径：beginning → committing → committed；回滚路径：beginning → rolledBack
+	want := []string{
+		events.TransactionBeginning, events.TransactionCommitting, events.TransactionCommitted,
+		events.TransactionBeginning, events.TransactionRolledBack,
+	}
+	if len(names) != len(want) {
+		t.Fatalf("events = %v, want %v", names, want)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Errorf("event[%d] = %s, want %s", i, names[i], want[i])
+		}
 	}
 }

@@ -46,3 +46,36 @@ func TestWrappedQueryError(t *testing.T) {
 		t.Errorf("sql = %q", qe.Sql)
 	}
 }
+
+func TestErrorRawSqlInterpolation(t *testing.T) {
+	err := &Error{
+		Kind:     KindGeneric,
+		Err:      errors.New("boom"),
+		Sql:      "select * from users where name = ? and age > ? and active = ?",
+		Bindings: []any{"O'Brien", 18, true},
+	}
+	want := "select * from users where name = 'O''Brien' and age > 18 and active = 1"
+	if got := err.RawSql(); got != want {
+		t.Errorf("RawSql = %q, want %q", got, want)
+	}
+	if err.ConnectionName() != "" {
+		t.Errorf("ConnectionName = %q", err.ConnectionName())
+	}
+
+	nullErr := &Error{Err: errors.New("x"), Sql: "insert into t values (?, ?)", Bindings: []any{nil, "a"}}
+	if got := nullErr.RawSql(); got != "insert into t values (null, 'a')" {
+		t.Errorf("RawSql = %q", got)
+	}
+}
+
+func TestClassifySQLiteAndPGLockErrors(t *testing.T) {
+	if got := classifyError(errors.New("database is locked")); got != KindDeadlock {
+		t.Errorf("sqlite lock classify = %v", got)
+	}
+	if got := classifyError(errors.New("SQLSTATE 40P01: deadlock detected")); got != KindDeadlock {
+		t.Errorf("pg deadlock classify = %v", got)
+	}
+	if got := classifyError(errors.New("driver: bad connection")); got != KindLostConnection {
+		t.Errorf("lost connection classify = %v", got)
+	}
+}

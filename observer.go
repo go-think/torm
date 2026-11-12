@@ -20,6 +20,9 @@ type Observer struct {
 	Updated  func(model any) error
 	Deleting func(model any) error
 	Deleted  func(model any) error
+	Trashed  func(model any) error
+
+	ForceDeleting func(model any) error
 
 	Restoring    func(model any) error
 	Restored     func(model any) error
@@ -67,7 +70,9 @@ func fire(hook func(model any) error, model any) error {
 	return hook(model)
 }
 
-// fireRetrieved 对扫描结果逐模型触发 Retrieved，并分发 retrieved 事件。
+// fireRetrieved 对扫描结果逐模型触发 Retrieved，并分发 retrieved 事件；
+// 水合完成后为每个模型应用读侧 cast、固化 original 快照并置 exists 标记
+// （对应 Laravel 水合时的 original 初始化与 exists = true）。
 func (c *Connection) fireRetrieved(dest interface{}) {
 	rv := reflect.Indirect(reflect.ValueOf(dest))
 	var modelType reflect.Type
@@ -85,6 +90,7 @@ func (c *Connection) fireRetrieved(dest interface{}) {
 	default:
 		return
 	}
+	hydrateModels(dest)
 	if ob := observerForType(modelType); ob != nil && ob.Retrieved != nil {
 		if rv.Kind() == reflect.Slice {
 			for i := 0; i < rv.Len(); i++ {
@@ -102,8 +108,56 @@ func (c *Connection) fireRetrieved(dest interface{}) {
 	c.dispatchEvent(EventRetrieved, dest)
 }
 
+// hydrateModels 对扫描结果里的每个模型：读侧 cast 规范化 → original 快照 →
+// exists 标记。读 cast 失败保持扫描原值（连接层扫描已保证基础类型正确）。
+func hydrateModels(dest interface{}) {
+	rv := reflect.Indirect(reflect.ValueOf(dest))
+	switch rv.Kind() {
+	case reflect.Slice:
+		for i := 0; i < rv.Len(); i++ {
+			elem := rv.Index(i)
+			if elem.Kind() == reflect.Ptr {
+				hydrateModel(elem.Interface())
+				continue
+			}
+			if elem.Kind() != reflect.Struct || !elem.CanAddr() {
+				continue
+			}
+			hydrateModel(elem.Addr().Interface())
+		}
+	case reflect.Struct:
+		if rv.CanAddr() {
+			hydrateModel(rv.Addr().Interface())
+		}
+	}
+}
+
+func hydrateModel(model any) {
+	applyReadCasts(model)
+	syncOriginal(model)
+	setExists(model, true, false)
+}
+
+// applyReadCasts 对模型全部 cast 字段应用 ReadCast 规范化。
+func applyReadCasts(model any) {
+	schema, err := NewSchema(model)
+	if err != nil {
+		return
+	}
+	for _, f := range schema.Fields {
+		if f.Ignored || f.CastName == "" {
+			continue
+		}
+		_ = f.ReadCast()
+	}
+}
+
 // fireModelEvent 触发观察者钩子并分发同名事件；钩子出错中断后续。
+// withoutEvents 作用域内（Quietly 族）钩子与分发全部抑制。
 func (c *Connection) fireModelEvent(ob *Observer, name string, model any) error {
+	if eventsQuiet() {
+		return nil
+	}
 	if ob != nil {
 		var hook func(any) error
 		switch name {
@@ -123,6 +177,10 @@ func (c *Connection) fireModelEvent(ob *Observer, name string, model any) error 
 			hook = ob.Deleting
 		case events.Deleted:
 			hook = ob.Deleted
+		case events.Trashed:
+			hook = ob.Trashed
+		case events.ForceDeleting:
+			hook = ob.ForceDeleting
 		case events.Restoring:
 			hook = ob.Restoring
 		case events.Restored:

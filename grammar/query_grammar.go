@@ -24,6 +24,7 @@ type dialectHooks struct {
 	whereLikeFn           func(q *query.Query, w *query.Where) string
 	whereNullSafeEqualsFn func(q *query.Query, w *query.Where) string
 	whereFullTextFn       func(q *query.Query, w *query.Where) string
+	whereBitwiseFn        func(q *query.Query, w *query.Where) string
 
 	// JSON 操作差异
 	compileJsonContainsFn    func(column, value string) string
@@ -33,14 +34,23 @@ type dialectHooks struct {
 	compileJsonUpdateColFn   func(key string, value any) string
 
 	// 杂项
-	dateBasedWhereFn  func(kind string, q *query.Query, w *query.Where) string
-	compileLimitFn    func(q *query.Query, limit int64) string
-	compileOffsetFn   func(q *query.Query, offset int64) string
-	compileLockFn     func(q *query.Query, value any) string
-	compileRandomFn   func(seed any) string
-	compileColumnsFn  func(q *query.Query, columns []any) string
-	compileFromFn     func(q *query.Query, table any) string
-	compileDistinctOn func(columns []any) string
+	dateBasedWhereFn    func(kind string, q *query.Query, w *query.Where) string
+	compileLimitFn      func(q *query.Query, limit int64) string
+	compileOffsetFn     func(q *query.Query, offset int64) string
+	compileLockFn       func(q *query.Query, value any) string
+	compileRandomFn     func(seed any) string
+	compileColumnsFn    func(q *query.Query, columns []any) string
+	compileFromFn       func(q *query.Query, table any) string
+	compileDistinctOn   func(columns []any) string
+	wrapUnionFn         func(sql string) string
+	compileRowNumberFn  func(partition, orders string) string
+	compileJoinLateralFn func(expr, joinType string) string
+	// supportsStraightJoinsFn：nil = 不支持（straight_join 抛错）
+	supportsStraightJoinsFn func() bool
+	// compileTimeoutFn：select 语句超时提示改写（MySQL MAX_EXECUTION_TIME）
+	compileTimeoutFn func(sql string, seconds int64) string
+	// compileJsonValueCastFn：JSON 值 cast 表达式
+	compileJsonValueCastFn func(value string) string
 
 	// 写入族差异
 	compileInsertFn              func(q *query.Query, rows []query.Row) (string, []any)
@@ -56,6 +66,8 @@ type dialectHooks struct {
 	compileDeleteWithoutJoinsFn  func(q *query.Query, table, where string) string
 	compileDeleteWithJoinsFn     func(q *query.Query, table, where string) string
 	compileTruncateFn            func(q *query.Query) []TruncateStatement
+	// having 位运算差异（PG ::bool / SqlServer != 0）
+	compileHavingBitwiseFn func(h *query.Where) string
 }
 
 // QueryGrammar 对应 Illuminate\Database\Query\Grammars\Grammar（共享编译逻辑）。
@@ -122,6 +134,11 @@ func (g *QueryGrammar) CompileSelect(q *query.Query) string {
 	}
 
 	q.Columns = original
+
+	// 方言超时提示（MySQL MAX_EXECUTION_TIME）
+	if q.Timeout != nil && g.compileTimeoutFn != nil {
+		sql = g.compileTimeoutFn(sql, *q.Timeout)
+	}
 
 	return sql
 }
@@ -252,6 +269,9 @@ func (g *QueryGrammar) compileGroupLimit(q *query.Query) string {
 
 // compileRowNumber 对应 Laravel compileRowNumber。
 func (g *QueryGrammar) compileRowNumber(partition, orders string) string {
+	if g.compileRowNumberFn != nil {
+		return g.compileRowNumberFn(partition, orders)
+	}
 	over := strings.TrimSpace("partition by " + g.Wrap(partition) + " " + orders)
 	return ", row_number() over (" + over + ") as " + g.Wrap("laravel_row")
 }
@@ -299,8 +319,19 @@ func (g *QueryGrammar) compileJoins(q *query.Query, joins []*query.Join) string 
 			nested := g.compileJoins(q, join.Joins)
 			table = "(" + table + " " + nested + ")"
 		}
+		// lateral join（Laravel JoinLateralClause）
+		if join.Lateral {
+			if g.compileJoinLateralFn == nil {
+				panic(ErrUnsupported{"This database engine does not support lateral joins."})
+			}
+			segments = append(segments, g.compileJoinLateralFn(table, join.Type))
+			continue
+		}
 		joinWord := " join"
 		if join.Type == "straight_join" {
+			if g.supportsStraightJoinsFn == nil || !g.supportsStraightJoinsFn() {
+				panic(ErrUnsupported{"This database engine does not support straight joins."})
+			}
 			joinWord = ""
 		}
 		segments = append(segments, strings.TrimSpace(join.Type+joinWord+" "+table+" "+g.compileWheres(joinClauseQuery(join))))
@@ -344,7 +375,12 @@ func (g *QueryGrammar) compileWhereByType(q *query.Query, w *query.Where) string
 		}
 		return g.whereBasic(q, w)
 	case "Bitwise":
+		if g.whereBitwiseFn != nil {
+			return g.whereBitwiseFn(q, w)
+		}
 		return g.whereBasic(q, w)
+	case "Expression":
+		return fmtString(g.GetValue(w.Column))
 	case "Binary":
 		panic(ErrUnsupported{"This database engine does not support binary comparison operations."})
 	case "Like":
@@ -353,14 +389,7 @@ func (g *QueryGrammar) compileWhereByType(q *query.Query, w *query.Where) string
 		}
 		// 基础方言对应 Laravel Query\Grammars\Grammar::whereLike：
 		// 仅 caseSensitive 时抛错，否则按 like / not like 走基础比较。
-		if w.CaseSensitive {
-			panic(ErrUnsupported{"This database engine does not support case sensitive like operations."})
-		}
-		operator := "like"
-		if w.Not {
-			operator = "not like"
-		}
-		return g.whereBasic(q, &query.Where{Column: w.Column, Operator: operator, Value: w.Value})
+		return g.baseWhereLike(q, w)
 	case "NullSafeEquals":
 		if g.whereNullSafeEqualsFn != nil {
 			return g.whereNullSafeEqualsFn(q, w)
@@ -456,6 +485,18 @@ func (g *QueryGrammar) whereBasic(q *query.Query, w *query.Where) string {
 	value := g.Parameter(w.Value)
 	operator := escapeOperator(w.Operator)
 	return g.Wrap(w.Column) + " " + operator + " " + value
+}
+
+// baseWhereLike 对应 Laravel 基础方言的 whereLike（caseSensitive 时抛错）。
+func (g *QueryGrammar) baseWhereLike(q *query.Query, w *query.Where) string {
+	if w.CaseSensitive {
+		panic(ErrUnsupported{"This database engine does not support case sensitive like operations."})
+	}
+	operator := "like"
+	if w.Not {
+		operator = "not like"
+	}
+	return g.whereBasic(q, &query.Where{Column: w.Column, Operator: operator, Value: w.Value})
 }
 
 func (g *QueryGrammar) whereColumn(q *query.Query, w *query.Where) string {
@@ -640,6 +681,11 @@ func (g *QueryGrammar) compileHaving(h *query.Where) string {
 		return g.Wrap(h.Column) + " is not null"
 	case "bit":
 		return "(" + g.Wrap(h.Column) + " " + h.Operator + " " + g.Parameter(h.Value) + ") != 0"
+	case "Bitwise":
+		if g.compileHavingBitwiseFn != nil {
+			return g.compileHavingBitwiseFn(h)
+		}
+		return g.compileBasicHaving(h)
 	case "Expression":
 		return fmtString(g.GetValue(h.Column))
 	case "Nested":
@@ -682,9 +728,24 @@ func (g *QueryGrammar) compileOrders(q *query.Query, orders []*query.Order) stri
 			sqls = append(sqls, fmtString(g.GetValue(o.Sql)))
 			continue
 		}
+		if o.Type == "InOrderOf" {
+			sqls = append(sqls, g.compileInOrderOf(o))
+			continue
+		}
 		sqls = append(sqls, g.Wrap(o.Column)+" "+o.Direction)
 	}
 	return "order by " + strings.Join(sqls, ", ")
+}
+
+// compileInOrderOf 对应 Laravel Grammar::compileInOrderOf：
+// case "col" = ? then 0 when ... else N end（按取值序列排序）。
+func (g *QueryGrammar) compileInOrderOf(order *query.Order) string {
+	column := g.Wrap(order.Column)
+	cases := make([]string, 0, len(order.Values))
+	for i, value := range order.Values {
+		cases = append(cases, "when "+column+" = "+g.Parameter(value)+" then "+intToString(int64(i)))
+	}
+	return "case " + strings.Join(cases, " ") + " else " + intToString(int64(len(order.Values))) + " end"
 }
 
 func (g *QueryGrammar) compileLimit(q *query.Query, limit int64) string {
@@ -729,6 +790,9 @@ func (g *QueryGrammar) compileUnion(u *query.Union) string {
 }
 
 func (g *QueryGrammar) wrapUnion(sql string) string {
+	if g.wrapUnionFn != nil {
+		return g.wrapUnionFn(sql)
+	}
 	return "(" + sql + ")"
 }
 
@@ -773,6 +837,14 @@ func (g *QueryGrammar) compileRandom(seed any) string {
 // CompileRandom 导出方言随机表达式（InRandomOrder 使用）。
 func (g *QueryGrammar) CompileRandom(seed any) string {
 	return g.compileRandom(seed)
+}
+
+// CompileJsonValueCast 导出 JSON 值 cast 表达式（不支持时抛错）。
+func (g *QueryGrammar) CompileJsonValueCast(value string) string {
+	if g.compileJsonValueCastFn == nil {
+		panic(ErrUnsupported{"This database engine does not support JSON value casts."})
+	}
+	return g.compileJsonValueCastFn(value)
 }
 
 // CompileInsert 编译 insert（rows 为多行记录，行内列序保留）。

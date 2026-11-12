@@ -25,9 +25,11 @@ const (
 	EventSaved        = events.Saved
 	EventDeleting     = events.Deleting
 	EventDeleted      = events.Deleted
+	EventTrashed      = events.Trashed
 	EventRestoring    = events.Restoring
 	EventRestored     = events.Restored
-	EventForceDeleted = events.ForceDeleted
+	EventForceDeleting = events.ForceDeleting
+	EventForceDeleted  = events.ForceDeleted
 )
 
 var NewEventBus = events.NewEventBus

@@ -1,6 +1,7 @@
 package grammar
 
 import (
+	"regexp"
 	"strings"
 
 	"github.com/thinkoner/torm/query"
@@ -43,6 +44,22 @@ func NewSqlServerGrammar() *SqlServerGrammar {
 	g.compileColumnsFn = g.compileColumns
 	g.compileLimitFn = g.compileLimit
 	g.compileOffsetFn = g.compileOffset
+	g.wrapUnionFn = g.wrapUnion
+	g.compileRowNumberFn = g.compileRowNumber
+	g.whereNullSafeEqualsFn = g.whereNullSafeEquals
+	g.whereBitwiseFn = g.whereBitwise
+	g.compileHavingBitwiseFn = g.compileHavingBitwise
+	g.whereDateFn = g.whereDate
+	g.whereTimeFn = g.whereTime
+	g.compileJsonContainsFn = g.compileJsonContains
+	g.compileJsonContainsKeyFn = g.compileJsonContainsKey
+	g.compileJsonLengthFn = g.compileJsonLength
+	g.compileJoinLateralFn = g.compileJoinLateral
+	g.compileUpsertFn = g.compileUpsert
+	g.compileUpdateWithoutJoinsFn = g.compileUpdateWithoutJoins
+	g.compileUpdateWithJoinsFn = g.compileUpdateWithJoins
+	g.compileDeleteWithoutJoinsFn = g.compileDeleteWithoutJoins
+	g.compileJsonValueCastFn = g.compileJsonValueCast
 
 	return g
 }
@@ -129,9 +146,63 @@ func (g *SqlServerGrammar) compileInsertGetId(q *query.Query, rows []query.Row, 
 	return parts[0] + " output inserted." + g.wrapValue(sequence) + " values " + parts[1], bindings
 }
 
-func (g *SqlServerGrammar) dateBasedWhere(kind string, q *query.Query, w *query.Where) string {
-	value := g.Parameter(w.Value)
-	return kind + "(" + g.Wrap(w.Column) + ") " + w.Operator + " " + value
+// whereDate/whereTime 对应 Laravel SqlServerGrammar.php:167-186：
+// T-SQL 无 date()/time() 函数，使用 cast(col as date/time)。
+func (g *SqlServerGrammar) whereDate(q *query.Query, w *query.Where) string {
+	return "cast(" + g.Wrap(w.Column) + " as date) " + w.Operator + " " + g.Parameter(w.Value)
+}
+
+func (g *SqlServerGrammar) whereTime(q *query.Query, w *query.Where) string {
+	return "cast(" + g.Wrap(w.Column) + " as time) " + w.Operator + " " + g.Parameter(w.Value)
+}
+
+// ---- JSON 编译（openjson，对应 SqlServerGrammar.php:195-260） ----
+
+// Operators 对应 SqlServerGrammar::$operators（SqlServerGrammar.php:18-23）。
+func (g *SqlServerGrammar) Operators() []string {
+	return []string{
+		"=", "<", ">", "<=", ">=", "!<", "!>", "<>", "!=",
+		"like", "not like", "ilike",
+		"&", "&=", "|", "|=", "^", "^=",
+	}
+}
+
+func (g *SqlServerGrammar) compileJsonContains(column, value string) string {
+	field, path := g.wrapJsonFieldAndPath(column)
+	return value + " in (select [value] from openjson(" + field + path + "))"
+}
+
+func (g *SqlServerGrammar) compileJsonContainsKey(column string) string {
+	segments := strings.Split(column, "->")
+	lastSegment := segments[len(segments)-1]
+	segments = segments[:len(segments)-1]
+
+	key := "'" + strings.ReplaceAll(lastSegment, "'", "''") + "'"
+	if m := sqlserverArrayKeyPattern.FindStringSubmatch(lastSegment); m != nil {
+		segments = append(segments, strings.TrimSuffix(lastSegment, m[0]))
+		key = m[1]
+	}
+
+	field, path := g.wrapJsonFieldAndPath(strings.Join(segments, "->"))
+	return key + " in (select [key] from openjson(" + field + path + "))"
+}
+
+func (g *SqlServerGrammar) compileJsonLength(column, operator, value string) string {
+	field, path := g.wrapJsonFieldAndPath(column)
+	return "(select count(*) from openjson(" + field + path + ")) " + operator + " " + value
+}
+
+var sqlserverArrayKeyPattern = regexp.MustCompile(`\[([0-9]+)\]$`)
+
+// PrepareBindingForJsonContains 对应 SqlServerGrammar.php:208：bool → json 字面量。
+func (g *SqlServerGrammar) PrepareBindingForJsonContains(binding any) any {
+	if b, ok := binding.(bool); ok {
+		if b {
+			return "true"
+		}
+		return "false"
+	}
+	return binding
 }
 
 // compileColumns 有 limit 且无 offset 时输出 select top(n)（对齐 Laravel SqlServerGrammar）。
@@ -163,4 +234,176 @@ func (g *SqlServerGrammar) compileOffset(q *query.Query, offset int64) string {
 		return "offset " + intToString(offset) + " rows"
 	}
 	return ""
+}
+
+// ---- R3-A5 方言残余 ----
+
+// GetDateFormat 对应 SqlServerGrammar::getDateFormat（毫秒精度）。
+func (g *SqlServerGrammar) GetDateFormat() string {
+	return "Y-m-d H:i:s.v"
+}
+
+// wrapUnion 对应 SqlServerGrammar::wrapUnion。
+func (g *SqlServerGrammar) wrapUnion(sql string) string {
+	return "select * from (" + sql + ") as " + g.WrapTable("temp_table")
+}
+
+// compileRowNumber 对应 SqlServerGrammar::compileRowNumber：
+// 空 orders 兜底 order by (select 0)。
+func (g *SqlServerGrammar) compileRowNumber(partition, orders string) string {
+	if strings.TrimSpace(orders) == "" {
+		orders = "order by (select 0)"
+	}
+	over := strings.TrimSpace("partition by " + g.Wrap(partition) + " " + orders)
+	return ", row_number() over (" + over + ") as " + g.Wrap("laravel_row")
+}
+
+// whereNullSafeEquals 对应 SqlServerGrammar::whereNullSafeEquals：
+// exists (select col intersect select ?)。
+func (g *SqlServerGrammar) whereNullSafeEquals(q *query.Query, w *query.Where) string {
+	return "exists (select " + g.Wrap(w.Column) + " intersect select " + g.Parameter(w.Value) + ")"
+}
+
+// whereBitwise 对应 SqlServerGrammar::whereBitwise：(col op ?) != 0。
+func (g *SqlServerGrammar) whereBitwise(q *query.Query, w *query.Where) string {
+	operator := escapeOperator(w.Operator)
+	return "(" + g.Wrap(w.Column) + " " + operator + " " + g.Parameter(w.Value) + ") != 0"
+}
+
+// compileHavingBitwise 对应 SqlServerGrammar::compileHavingBitwise。
+func (g *SqlServerGrammar) compileHavingBitwise(h *query.Where) string {
+	return "(" + g.Wrap(h.Column) + " " + h.Operator + " " + g.Parameter(h.Value) + ") != 0"
+}
+
+// BitwiseOperators 对应 SqlServerGrammar::$operators 中的位运算符。
+func (g *SqlServerGrammar) BitwiseOperators() []string {
+	return []string{"&", "&=", "|", "|=", "^", "^="}
+}
+
+// compileJsonValueCast 对应 SqlServerGrammar::compileJsonValueCast。
+func (g *SqlServerGrammar) compileJsonValueCast(value string) string {
+	return "json_query(" + value + ")"
+}
+
+// compileUpdateWithoutJoins 对应 SqlServerGrammar::compileUpdateWithoutJoins：
+// 仅 limit（无 offset）时改写为 update top(n)。
+func (g *SqlServerGrammar) compileUpdateWithoutJoins(q *query.Query, table, columns, where string) string {
+	sql := "update " + table + " set " + columns + " " + where
+	if q.Limit != nil && *q.Limit > 0 && (q.Offset == nil || *q.Offset <= 0) {
+		sql = replaceFirst("update", "update top ("+intToString(*q.Limit)+")", sql)
+	}
+	return strings.TrimSpace(sql)
+}
+
+// compileUpdateWithJoins 对应 SqlServerGrammar::compileUpdateWithJoins：
+// update alias set ... from table joins where。
+func (g *SqlServerGrammar) compileUpdateWithJoins(q *query.Query, table, columns, where string) string {
+	alias := table
+	if i := strings.LastIndex(strings.ToLower(table), " as "); i >= 0 {
+		alias = table[i+4:]
+	}
+	joins := g.compileJoins(q, q.Joins)
+	return strings.TrimSpace("update " + alias + " set " + columns + " from " + table + " " + joins + " " + where)
+}
+
+// compileDeleteWithoutJoins 对应 SqlServerGrammar::compileDeleteWithoutJoins：
+// 仅 limit（无 offset）时改写为 delete top(n)。
+func (g *SqlServerGrammar) compileDeleteWithoutJoins(q *query.Query, table, where string) string {
+	sql := "delete from " + table + " " + where
+	if q.Limit != nil && *q.Limit > 0 && (q.Offset == nil || *q.Offset <= 0) {
+		sql = replaceFirst("delete", "delete top ("+intToString(*q.Limit)+")", sql)
+	}
+	return strings.TrimSpace(sql)
+}
+
+// compileUpsert 对应 SqlServerGrammar::compileUpsert：MERGE 语句。
+func (g *SqlServerGrammar) compileUpsert(q *query.Query, rows []query.Row, uniqueBy, update []string) (string, []any) {
+	if len(rows) == 0 {
+		rows = []query.Row{{}}
+	}
+	columns := rows[0].Columns()
+	wrapped := make([]string, 0, len(columns))
+	for _, col := range columns {
+		wrapped = append(wrapped, g.Wrap(col))
+	}
+	columnList := strings.Join(wrapped, ", ")
+
+	sql := "merge " + g.WrapTable(q.From) + " "
+
+	var bindings []any
+	parameters := make([]string, 0, len(rows))
+	for _, row := range rows {
+		rowParts := make([]string, 0, len(columns))
+		for _, col := range columns {
+			v, _ := row.Value(col)
+			if g.IsExpression(v) {
+				rowParts = append(rowParts, g.Parameter(v))
+				continue
+			}
+			bindings = append(bindings, v)
+			rowParts = append(rowParts, g.Parameter(v))
+		}
+		parameters = append(parameters, "("+strings.Join(rowParts, ", ")+")")
+	}
+
+	sql += "using (values " + strings.Join(parameters, ", ") + ") " + g.WrapTable("laravel_source") + " (" + columnList + ") "
+
+	on := make([]string, 0, len(uniqueBy))
+	for _, column := range uniqueBy {
+		on = append(on, g.Wrap("laravel_source."+column)+" = "+g.Wrap(fmtString(q.From)+"."+column))
+	}
+	sql += "on " + strings.Join(on, " and ") + " "
+
+	if len(update) > 0 {
+		updates := make([]string, 0, len(update))
+		for _, column := range update {
+			updates = append(updates, g.Wrap(column)+" = "+g.Wrap("laravel_source."+column))
+		}
+		sql += "when matched then update set " + strings.Join(updates, ", ") + " "
+	}
+
+	sql += "when not matched then insert (" + columnList + ") values (" + columnList + ");"
+
+	return sql, bindings
+}
+
+// PrepareBindingsForUpdate 对应 SqlServerGrammar::prepareBindingsForUpdate：
+// values 在前，除 select 外全部绑定在后。
+func (g *SqlServerGrammar) PrepareBindingsForUpdate(bindings map[string][]any, values map[string]any) []any {
+	out := make([]any, 0, len(values)+8)
+	for _, key := range sortedKeys(values) {
+		v := values[key]
+		if g.IsExpression(v) {
+			continue
+		}
+		out = append(out, flattenBinding(v))
+	}
+	for _, segment := range BindingSegments {
+		if segment == "select" {
+			continue
+		}
+		for _, v := range bindings[segment] {
+			out = append(out, flattenBinding(v))
+		}
+	}
+	return out
+}
+
+// compileJoinLateral 对应 SqlServerGrammar::compileJoinLateral：
+// left → outer apply，其余 → cross apply。
+func (g *SqlServerGrammar) compileJoinLateral(expr, joinType string) string {
+	if joinType == "left" {
+		return strings.TrimSpace("outer apply " + expr)
+	}
+	return strings.TrimSpace("cross apply " + expr)
+}
+
+// CompileSavepoint 对应 SqlServerGrammar::compileSavepoint。
+func (g *SqlServerGrammar) CompileSavepoint(name string) string {
+	return "SAVE TRANSACTION " + name
+}
+
+// CompileSavepointRollBack 对应 SqlServerGrammar::compileSavepointRollBack。
+func (g *SqlServerGrammar) CompileSavepointRollBack(name string) string {
+	return "ROLLBACK TRANSACTION " + name
 }
