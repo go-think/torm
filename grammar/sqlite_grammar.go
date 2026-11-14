@@ -7,14 +7,14 @@ import (
 	"github.com/go-think/torm/query"
 )
 
-// SQLiteGrammar 对应 Illuminate\Database\Query\Grammars\SQLiteGrammar。
+// SQLiteGrammar 为 SQLite 方言查询编译器。
 // 标识符为双引号（继承 BaseGrammar 默认实现）；JSON 走 json_extract/json_each。
 // 必须使用 NewSqliteQueryGrammar 构造。
 type SQLiteGrammar struct {
 	QueryGrammar
 
 	// useLegacyGroupLimit：SQLite < 3.25（无窗口函数）时置 true，
-	// groupLimit 降级为普通 select（对应 Laravel 的版本分支）。
+	// groupLimit 降级为普通 select（按版本分支切换）。
 	useLegacyGroupLimit bool
 }
 
@@ -183,6 +183,7 @@ func (g *SQLiteGrammar) compileInsertOrIgnore(q *query.Query, rows []query.Row) 
 	sql, bindings := g.QueryGrammar.baseCompileInsert(q, rows)
 	return replaceFirst("insert", "insert or ignore", sql), bindings
 }
+
 // CompileInsertOrIgnoreReturning 对应 SQLiteGrammar.php:300-309：
 // insert or ignore + returning（SQLite 3.35+）。
 func (g *SQLiteGrammar) CompileInsertOrIgnoreReturning(q *query.Query, rows []query.Row, returning, uniqueBy []string) (string, []any) {
@@ -194,7 +195,6 @@ func (g *SQLiteGrammar) CompileInsertOrIgnoreReturning(q *query.Query, rows []qu
 	sql += " returning " + strings.Join(returns, ", ")
 	return sql, bindings
 }
-
 
 func (g *SQLiteGrammar) compileInsertOrIgnoreUsing(q *query.Query, columns []any, sql string) string {
 	return replaceFirst("insert", "insert or ignore", g.QueryGrammar.CompileInsertUsing(q, columns, sql))
@@ -352,7 +352,7 @@ func (g *SQLiteGrammar) compileDeleteWithJoinsOrLimit(q *query.Query) string {
 // 先清 sqlite_sequence（绑定表名），再 delete from 表。
 func (g *SQLiteGrammar) compileTruncate(q *query.Query) []TruncateStatement {
 	table := fmtString(q.From)
-	// Laravel 先 delete from 表，再清 sqlite_sequence（SQLiteGrammar.php:487-497）
+	// 先 delete from 表，再清 sqlite_sequence
 	return []TruncateStatement{
 		{Sql: "delete from " + g.WrapTable(q.From)},
 		{

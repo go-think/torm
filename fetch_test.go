@@ -296,17 +296,19 @@ func TestFetchCursorPaginate(t *testing.T) {
 	if cur == nil {
 		t.Fatal("cursor roundtrip failed")
 	}
-	if v, ok := cur.Parameter("id").(int64); !ok || v != 3 {
+	if v, ok := cur.Parameter("id").(int64); !ok || v != 4 {
+		// next 游标取截断后页内末行（id=4），下一页严格小于 4 →
+		// 旧实现取 extra 行（id=3）会导致每页边界丢一行
 		t.Errorf("cursor param = %#v", cur.Parameter("id"))
 	}
 	if !cur.PointsToNextItems() {
 		t.Error("expect points to next items")
 	}
 
-	// 带游标的下一页：id < 3（游标参数经 json 解码后数值保持整型）
+	// 带游标的下一页：id < 4（游标参数经 json 解码后数值保持整型）
 	sql2 := `select * from "users" where ("id" < ?) order by "id" desc limit 3`
 	st.On(sql2, &fakeResult{Columns: []string{"id", "name"}, Rows: [][]driver.Value{
-		{int64(2), "b"}, {int64(1), "a"},
+		{int64(3), "c"}, {int64(2), "b"},
 	}})
 	var users2 []*pageUser
 	p2, err := b.Clone().CursorPaginate(&users2, 2, cur)
@@ -318,7 +320,7 @@ func TestFetchCursorPaginate(t *testing.T) {
 		t.Error("expect no more")
 	}
 	call := st.LastCall(t, sql2)
-	if !reflect.DeepEqual(asAny(call.Args), []any{int64(3)}) {
+	if !reflect.DeepEqual(asAny(call.Args), []any{int64(4)}) {
 		t.Errorf("args = %#v", call.Args)
 	}
 }
@@ -422,7 +424,7 @@ func TestFetchExistsOr(t *testing.T) {
 	st2.On(sql, &fakeResult{Columns: []string{"exists"}, Rows: [][]driver.Value{{int64(0)}}})
 	ran := false
 	ok, err = b2.From("users").DoesntExistOr(func() error { ran = true; return nil })
-	// 不存在 → 直接返回 true，不执行回调（对应 Laravel doesntExistOr）
+	// 不存在 → 直接返回 true，不执行回调（doesntExistOr 语义）
 	if err != nil || !ok || ran {
 		t.Errorf("doesntExistOr = %v, %v, ran=%v", ok, err, ran)
 	}

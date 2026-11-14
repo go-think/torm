@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// ---- Postgres Schema 编译（对齐 Illuminate\Database\Schema\Grammars\PostgresGrammar 输出） ----
+// ---- Postgres Schema 编译 ----
 
 func (g *PostgresGrammar) getColumnTypePG(c *ColumnDefinition) string {
 	switch c.Type {
@@ -81,8 +81,8 @@ func (g *PostgresGrammar) getColumnTypePG(c *ColumnDefinition) string {
 	}
 }
 
-// pgTimestampType：未指定精度按 (0)（对齐 Laravel 13 is_null($precision) ?
-// '(0)' 分支，项目既有 golden 也基于此约定）。
+// pgTimestampType：未指定精度按 (0)
+// （项目既有 golden 也基于此约定）。
 func (g *PostgresGrammar) pgTimestampType(precision int, tz bool) string {
 	suffix := " without time zone"
 	if tz {
@@ -201,12 +201,12 @@ func (g *PostgresGrammar) CompileCreate(b *Blueprint) []string {
 
 	createPrefix := "create table "
 	if b.Temporary {
-		// Laravel PostgresGrammar.php:244：create temporary table
+		// 临时表使用 create temporary table
 		createPrefix = "create temporary table "
 	}
 	out := []string{createPrefix + g.WrapTable(b.Table) + " (" + strings.Join(cols, ", ") + ")"}
 	// PG：index/unique/fulltext/spatialindex/vectorindex/foreign 为独立语句
-	//（primary 内联进 create，对齐 Laravel 命令循环）
+	//（primary 内联进 create）
 	out = append(out, g.compileSchemaIndexesPGFiltered(b, "index", "unique", "fulltext",
 		"spatialindex", "vectorindex", "foreign")...)
 	return out

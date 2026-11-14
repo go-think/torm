@@ -1,7 +1,9 @@
 package torm
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"sort"
 	"strconv"
 	"strings"
@@ -9,7 +11,7 @@ import (
 	gomysql "github.com/go-sql-driver/mysql"
 )
 
-// Connector 对应 Laravel 的 Connectors\ConnectorInterface：建立数据库连接。
+// Connector 数据库连接器接口：建立数据库连接。
 type Connector interface {
 	// Connect 打开数据库连接（实现可在连接前对 DSN 做方言化增强/校验）。
 	Connect(dsn string) (*sql.DB, error)
@@ -50,43 +52,83 @@ func openWithLostConnectionRetry(driver, dsn string) (*sql.DB, error) {
 	return db, err
 }
 
+// sessionConnector 包装 driver.Connector：在每个新物理连接上执行会话级
+// 语句（隔离级别等）。*sql.DB 连接池下 db.Exec 只落在随机一个连接上
+// （旧实现的缺陷），本包装保证每个物理连接建连即配置——对齐
+// 单连接会话的 configureConnection 语义。
+type sessionConnector struct {
+	inner      driver.Connector
+	statements []string
+}
+
+func (s *sessionConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	conn, err := s.inner.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, stmt := range s.statements {
+		if err := execOnRawConn(ctx, conn, stmt); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
+	return conn, nil
+}
+
+func (s *sessionConnector) Driver() driver.Driver { return s.inner.Driver() }
+
+// execOnRawConn 在裸 driver.Conn 上执行语句（优先 ExecerContext/Execer，
+// 兜底 Prepare+Exec——后者是 driver.Conn 的必需能力，任何驱动都可用）。
+func execOnRawConn(ctx context.Context, conn driver.Conn, query string) error {
+	if ec, ok := conn.(driver.ExecerContext); ok {
+		_, err := ec.ExecContext(ctx, query, nil)
+		return err
+	}
+	if ec, ok := conn.(driver.Execer); ok {
+		_, err := ec.Exec(query, nil)
+		return err
+	}
+	stmt, err := conn.Prepare(query)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	_, err = stmt.Exec(nil)
+	return err
+}
+
 // ---- MySQL ----
 
 // MySqlConnector MySQL 连接器（对应 Connectors\MySqlConnector）：校验 DSN 并
-// 自动附加 charset/collation/sql_mode/timezone 参数（来自 Config，已有参数不覆盖）。
+// 自动附加 charset/collation/sql_mode/timezone/parseTime 参数（来自 Config，
+// 已有参数不覆盖）；隔离级别经 driver.Connector 包装在每个物理连接上生效。
 type MySqlConnector struct {
 	config Config
 }
 
 // Connect 打开 MySQL 连接。
 func (c *MySqlConnector) Connect(dsn string) (*sql.DB, error) {
-	db, err := openWithLostConnectionRetry("mysql", c.BuildDsn(dsn))
-	if err != nil {
-		return nil, err
-	}
-	if err := c.configureSession(db); err != nil {
-		db.Close()
-		return nil, err
-	}
-	return db, nil
-}
-
-// configureSession 建连后的会话配置（对应 MySqlConnector::configureConnection）：
-// isolation_level 以 SET SESSION TRANSACTION ISOLATION LEVEL 生效（charset/
-// sql_mode/timezone 经 DSN 参数由驱动处理）。
-func (c *MySqlConnector) configureSession(db *sql.DB) error {
+	built := c.BuildDsn(dsn)
 	if c.config.IsolationLevel != "" {
-		if _, err := db.Exec("set session transaction isolation level " + c.config.IsolationLevel); err != nil {
-			return err
+		inner, err := gomysql.MySQLDriver{}.OpenConnector(built)
+		if err == nil {
+			sc := &sessionConnector{
+				inner:      inner,
+				statements: []string{"set session transaction isolation level " + c.config.IsolationLevel},
+			}
+			return sql.OpenDB(sc), nil
 		}
+		// OpenConnector 不可用时退回普通打开（隔离级别降级为建连 Exec，
+		// 仅首连接生效——保持旧行为，见配置注释）
 	}
-	return nil
+	return openWithLostConnectionRetry("mysql", built)
 }
 
 // BuildDsn 校验（非标准 DSN 原样返回，交给驱动在连接时报错）并增强 DSN。
 func (c *MySqlConnector) BuildDsn(dsn string) string {
 	if c.config.Charset == "" && c.config.Collation == "" &&
-		c.config.SqlMode == "" && len(c.config.Modes) == 0 && c.config.Timezone == "" {
+		c.config.SqlMode == "" && len(c.config.Modes) == 0 && c.config.Timezone == "" &&
+		!parseTimeDefault(c.config.ParseTime) {
 		return dsn
 	}
 	parsed, err := gomysql.ParseDSN(dsn)
@@ -111,6 +153,11 @@ func (c *MySqlConnector) BuildDsn(dsn string) string {
 	}
 	setParam("sql_mode", sqlMode)
 	setParam("time_zone", c.config.Timezone)
+	// parseTime 默认注入：time.Time 字段扫描必需（connection 层读侧依赖；
+	// Config.ParseTime=false 或 DSN 已带参时不注入）
+	if parseTimeDefault(c.config.ParseTime) && !hasDsnParam(dsn, "parseTime") {
+		setParam("parseTime", "true")
+	}
 	// charset 在 go-sql-driver 中是私有 charsets 字段（非普通 Params），
 	// collation 是专用字段：已有值（原始 DSN 中出现）时不覆盖
 	if c.config.Charset != "" && !hasDsnParam(dsn, "charset") {
@@ -122,38 +169,28 @@ func (c *MySqlConnector) BuildDsn(dsn string) string {
 	return parsed.FormatDSN()
 }
 
+// parseTimeDefault ParseTime 开关缺省语义：nil/true → 注入。
+func parseTimeDefault(v *bool) bool {
+	return v == nil || *v
+}
+
 // ---- Postgres ----
 
 // PostgresConnector Postgres 连接器（对应 Connectors\PostgresConnector）：
-// 自动附加 sslmode/search_path/timezone DSN 参数；isolation_level 在建连后
-// 以会话语句设置。
+// 自动附加 sslmode/search_path/timezone DSN 参数；isolation_level/
+// synchronous_commit 经 DSN options=-c 参数生效（连接池下每个物理连接
+// 均有效——libpq 标准参数，lib/pq 支持）。
 type PostgresConnector struct {
 	config Config
 }
 
 // Connect 打开 Postgres 连接。
 func (c *PostgresConnector) Connect(dsn string) (*sql.DB, error) {
-	db, err := openWithLostConnectionRetry(c.config.Driver, c.BuildDsn(dsn))
-	if err != nil {
-		return nil, err
-	}
-	if c.config.IsolationLevel != "" {
-		if _, err := db.Exec("set session characteristics as transaction isolation level " + c.config.IsolationLevel); err != nil {
-			db.Close()
-			return nil, err
-		}
-	}
-	if c.config.SynchronousCommit != "" {
-		if _, err := db.Exec("set synchronous_commit to '" + c.config.SynchronousCommit + "'"); err != nil {
-			db.Close()
-			return nil, err
-		}
-	}
-	return db, nil
+	return openWithLostConnectionRetry(c.config.Driver, c.BuildDsn(dsn))
 }
 
 // BuildDsn 附加 sslmode/sslcert/sslkey/sslrootcert/search_path/client_encoding/
-// application_name/TimeZone 参数（已有参数不覆盖）。
+// application_name/TimeZone/options 参数（已有参数不覆盖）。
 func (c *PostgresConnector) BuildDsn(dsn string) string {
 	var adds []string
 	if c.config.SslMode != "" && !hasDsnParam(dsn, "sslmode") {
@@ -180,42 +217,39 @@ func (c *PostgresConnector) BuildDsn(dsn string) string {
 	if c.config.Timezone != "" && !hasDsnParam(dsn, "timezone") {
 		adds = append(adds, "TimeZone="+c.config.Timezone)
 	}
+	// 会话级参数 → options=-c 形式（池安全；驱动不支持 options 时
+	// 建连报错，比"只在随机一个连接上生效"更早暴露问题）
+	var opts []string
+	if c.config.IsolationLevel != "" && !hasDsnParam(dsn, "options") {
+		opts = append(opts, "-c default_transaction_isolation="+c.config.IsolationLevel)
+	}
+	if c.config.SynchronousCommit != "" && !hasDsnParam(dsn, "options") {
+		opts = append(opts, "-c synchronous_commit="+c.config.SynchronousCommit)
+	}
+	if len(opts) > 0 {
+		// lib/pq 的 parseOpts 按空白切分，值必须单引号包裹（libpq 标准转义）
+		adds = append(adds, "options='"+strings.Join(opts, " ")+"'")
+	}
 	return appendDsnParams(dsn, adds)
 }
 
 // ---- SQLite ----
 
-// SQLiteConnector SQLite 连接器（对应 Connectors\SQLiteConnector）：经驱动
-// 参数附加 pragmas（foreign_keys/busy_timeout/journal_mode/synchronous）。
+// SQLiteConnector SQLite 连接器（对应 Connectors\SQLiteConnector）：全部
+// pragmas 经驱动 DSN 参数生效（_foreign_keys/_busy_timeout/_journal_mode/
+// _synchronous/_pragma）——连接池下每个物理连接均生效；旧实现自定义
+// pragmas 用 db.Exec 只落在池内随机一个连接上。
 type SQLiteConnector struct {
 	config Config
 }
 
 // Connect 打开 SQLite 连接。
 func (c *SQLiteConnector) Connect(dsn string) (*sql.DB, error) {
-	db, err := openWithLostConnectionRetry(c.config.Driver, c.BuildDsn(dsn))
-	if err != nil {
-		return nil, err
-	}
-	// 自定义 pragma（对应 SQLiteConnector::configurePragmas）：按键名排序，
-	// 逐条以会话语句执行
-	if len(c.config.Pragmas) > 0 {
-		keys := make([]string, 0, len(c.config.Pragmas))
-		for k := range c.config.Pragmas {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			if _, err := db.Exec("pragma " + k + " = " + c.config.Pragmas[k]); err != nil {
-				db.Close()
-				return nil, err
-			}
-		}
-	}
-	return db, nil
+	return openWithLostConnectionRetry(c.config.Driver, c.BuildDsn(dsn))
 }
 
-// BuildDsn 附加 sqlite pragma 参数。
+// BuildDsn 附加 sqlite pragma 参数。foreign_keys 缺省开启
+// （与 SQLite 默认 foreign_keys=true 对齐；显式 false 可关闭）。
 func (c *SQLiteConnector) BuildDsn(dsn string) string {
 	var adds []string
 	if c.config.ForeignKeys != nil {
@@ -224,6 +258,8 @@ func (c *SQLiteConnector) BuildDsn(dsn string) string {
 			v = "on"
 		}
 		adds = append(adds, "_foreign_keys="+v)
+	} else {
+		adds = append(adds, "_foreign_keys=on")
 	}
 	if c.config.BusyTimeout > 0 {
 		adds = append(adds, "_busy_timeout="+strconv.Itoa(c.config.BusyTimeout))
@@ -234,13 +270,26 @@ func (c *SQLiteConnector) BuildDsn(dsn string) string {
 	if c.config.Synchronous != "" {
 		adds = append(adds, "_synchronous="+c.config.Synchronous)
 	}
+	// 自定义 pragmas → mattn 的 _pragma=name(value) 形式（按键名排序保证确定性）
+	if len(c.config.Pragmas) > 0 {
+		keys := make([]string, 0, len(c.config.Pragmas))
+		for k := range c.config.Pragmas {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			adds = append(adds, "_pragma="+k+"("+c.config.Pragmas[k]+")")
+		}
+	}
 	return appendDsnParams(dsn, adds)
 }
 
 // ---- SQLServer ----
 
-// SqlServerConnector SQLServer 连接器（对应 Connectors\SqlServerConnector）：
-// isolation_level 在建连后以会话语句设置。
+// SqlServerConnector SQLServer 连接器（对应 Connectors\SqlServerConnector）。
+// 注意：go-mssqldb 的 DSN 不支持隔离级别参数，isolation_level 仍以建连后
+// SET 执行——连接池下仅对执行时选中的连接生效（已知限制，需要精确控制时
+// 建议在事务内显式 set transaction isolation level）。
 type SqlServerConnector struct {
 	config Config
 }

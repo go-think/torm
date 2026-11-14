@@ -37,7 +37,7 @@ func TestFakeConnection_SelectOne(t *testing.T) {
 	db, st := newFakeDB(t)
 	st.On("select * from users where id = ?", &fakeResult{
 		Columns: []string{"id", "name"},
-		Rows:   [][]driver.Value{{int64(1), "Andrew"}},
+		Rows:    [][]driver.Value{{int64(1), "Andrew"}},
 	})
 
 	var user User
@@ -54,7 +54,7 @@ func TestFakeConnection_SelectSliceOfPointers(t *testing.T) {
 	db, st := newFakeDB(t)
 	st.On("select * from users", &fakeResult{
 		Columns: []string{"id", "name"},
-		Rows:   [][]driver.Value{{int64(1), "Andrew"}, {int64(2), "Boston"}},
+		Rows:    [][]driver.Value{{int64(1), "Andrew"}, {int64(2), "Boston"}},
 	})
 
 	var users []*User
@@ -95,7 +95,7 @@ func TestFakeConnection_ScanScalars(t *testing.T) {
 	db, st := newFakeDB(t)
 	st.On("select count(*) from users", &fakeResult{
 		Columns: []string{"count(*)"},
-		Rows:   [][]driver.Value{{int64(7)}},
+		Rows:    [][]driver.Value{{int64(7)}},
 	})
 	var n int64
 	if err := db.Scan("select count(*) from users", nil, &n); err != nil {

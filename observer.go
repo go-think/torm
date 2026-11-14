@@ -7,10 +7,11 @@ import (
 	"github.com/go-think/torm/events"
 )
 
-// Observer 对应 Laravel 的模型观察者：按模型类型注册可选回调。
-// 回调返回 error 时中断当前操作（对应 Laravel 异常中断生命周期）。
+// Observer 模型观察者：按模型类型注册可选回调。
+// 回调返回 error 时中断当前操作（异常中断生命周期）。
 type Observer struct {
-	Retrieved func(model any)
+	Retrieving func(model any) error // 水合前触发，返回 error 取消该行水合（行保持扫描零值仍留在结果中，其他实现为不进结果集）
+	Retrieved  func(model any)
 
 	Saving   func(model any) error
 	Saved    func(model any) error
@@ -26,13 +27,15 @@ type Observer struct {
 
 	Restoring    func(model any) error
 	Restored     func(model any) error
+	Replicating  func(model any) error
 	ForceDeleted func(model any) error
 }
 
 var observerMu sync.Mutex
-var observers = map[reflect.Type]*Observer{}
+var observers = map[reflect.Type][]*Observer{}
 
-// Observe 为模型类型注册观察者（多次注册覆盖）。
+// Observe 为模型类型注册观察者（覆盖式：替换该类型当前的全部观察者，
+// 与 1.x 行为一致）。需要叠加多个观察者时使用 AddObserver。
 func (c *Connection) Observe(model any, o *Observer) {
 	t := reflect.TypeOf(model)
 	if t.Kind() == reflect.Ptr {
@@ -40,11 +43,41 @@ func (c *Connection) Observe(model any, o *Observer) {
 	}
 	observerMu.Lock()
 	defer observerMu.Unlock()
-	observers[t] = o
+	if o == nil {
+		delete(observers, t)
+		return
+	}
+	observers[t] = []*Observer{o}
 }
 
-// observerFor 取模型的观察者（无则 nil）。
-func observerFor(model any) *Observer {
+// AddObserver 追加注册观察者（observe 可叠加语义；
+// 按注册顺序执行，任一返回 error 中断）。
+func (c *Connection) AddObserver(model any, o *Observer) {
+	t := reflect.TypeOf(model)
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	if o == nil {
+		return
+	}
+	observerMu.Lock()
+	defer observerMu.Unlock()
+	observers[t] = append(observers[t], o)
+}
+
+// Unobserve 移除模型类型的全部观察者。
+func (c *Connection) Unobserve(model any) {
+	t := reflect.TypeOf(model)
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	observerMu.Lock()
+	defer observerMu.Unlock()
+	delete(observers, t)
+}
+
+// observerFor 取模型的观察者列表（无则 nil）。
+func observerFor(model any) []*Observer {
 	t := reflect.TypeOf(model)
 	if t == nil {
 		return nil
@@ -55,8 +88,8 @@ func observerFor(model any) *Observer {
 	return observerForType(t)
 }
 
-// observerForType 按模型类型取观察者。
-func observerForType(t reflect.Type) *Observer {
+// observerForType 按模型类型取观察者列表。
+func observerForType(t reflect.Type) []*Observer {
 	observerMu.Lock()
 	defer observerMu.Unlock()
 	return observers[t]
@@ -72,7 +105,7 @@ func fire(hook func(model any) error, model any) error {
 
 // fireRetrieved 对扫描结果逐模型触发 Retrieved，并分发 retrieved 事件；
 // 水合完成后为每个模型应用读侧 cast、固化 original 快照并置 exists 标记
-// （对应 Laravel 水合时的 original 初始化与 exists = true）。
+// （水合时的 original 初始化与 exists = true）。
 func (c *Connection) fireRetrieved(dest interface{}) {
 	rv := reflect.Indirect(reflect.ValueOf(dest))
 	var modelType reflect.Type
@@ -90,31 +123,73 @@ func (c *Connection) fireRetrieved(dest interface{}) {
 	default:
 		return
 	}
-	hydrateModels(dest)
-	if ob := observerForType(modelType); ob != nil && ob.Retrieved != nil {
-		if rv.Kind() == reflect.Slice {
-			for i := 0; i < rv.Len(); i++ {
-				elem := rv.Index(i)
-				if elem.Kind() == reflect.Ptr {
-					ob.Retrieved(elem.Interface())
-					continue
+	// retrieving：水合前逐模型触发（返回 error 取消该行——跳过水合与
+	// retrieved 回调；torm 以切片元素原地水合，无法移除元素，取消的行
+	// 仍留在结果中但保持扫描零值，与 "不进结果集" 行为的差异已在
+	// Observer.Retrieving 注释声明）
+	models := modelInstancesOf(dest, modelType)
+	cancelled := make([]bool, len(models))
+	for i, m := range models {
+		for _, ob := range observerForType(modelType) {
+			if ob.Retrieving != nil {
+				if err := ob.Retrieving(m); err != nil {
+					cancelled[i] = true
+					break
 				}
-				ob.Retrieved(elem.Addr().Interface())
 			}
-		} else {
-			ob.Retrieved(rv.Addr().Interface())
 		}
 	}
-	c.dispatchEvent(EventRetrieved, dest)
+	hydrateModels(dest, cancelled)
+	for i, m := range models {
+		if cancelled[i] {
+			continue
+		}
+		for _, ob := range observerForType(modelType) {
+			if ob.Retrieved != nil {
+				ob.Retrieved(m)
+			}
+		}
+		// retrieved 事件逐模型分发（每模型一条 Retrieved）
+		c.dispatchEvent(EventRetrieved, m)
+	}
+}
+
+// modelInstancesOf 收集扫描目标中每个模型的实例指针。
+func modelInstancesOf(dest interface{}, modelType reflect.Type) []any {
+	rv := reflect.Indirect(reflect.ValueOf(dest))
+	var out []any
+	switch rv.Kind() {
+	case reflect.Slice:
+		for i := 0; i < rv.Len(); i++ {
+			elem := rv.Index(i)
+			if elem.Kind() == reflect.Ptr {
+				out = append(out, elem.Interface())
+				continue
+			}
+			if elem.CanAddr() && elem.Type() == modelType {
+				out = append(out, elem.Addr().Interface())
+			}
+		}
+	case reflect.Struct:
+		if rv.CanAddr() && rv.Type() == modelType {
+			out = append(out, rv.Addr().Interface())
+		}
+	}
+	return out
 }
 
 // hydrateModels 对扫描结果里的每个模型：读侧 cast 规范化 → original 快照 →
-// exists 标记。读 cast 失败保持扫描原值（连接层扫描已保证基础类型正确）。
-func hydrateModels(dest interface{}) {
+// exists 标记。读 cast 失败保持扫描原值（连接层扫描已保证基础类型正确）；
+// cancelled 下标（Retrieving 取消的行）跳过水合。
+func hydrateModels(dest interface{}, cancelled []bool) {
+	skip := func(i int) bool { return i < len(cancelled) && cancelled[i] }
 	rv := reflect.Indirect(reflect.ValueOf(dest))
 	switch rv.Kind() {
 	case reflect.Slice:
 		for i := 0; i < rv.Len(); i++ {
+			if skip(i) {
+				continue
+			}
 			elem := rv.Index(i)
 			if elem.Kind() == reflect.Ptr {
 				hydrateModel(elem.Interface())
@@ -126,7 +201,7 @@ func hydrateModels(dest interface{}) {
 			hydrateModel(elem.Addr().Interface())
 		}
 	case reflect.Struct:
-		if rv.CanAddr() {
+		if rv.CanAddr() && !skip(0) {
 			hydrateModel(rv.Addr().Interface())
 		}
 	}
@@ -154,13 +229,16 @@ func applyReadCasts(model any) {
 
 // fireModelEvent 触发观察者钩子并分发同名事件；钩子出错中断后续。
 // withoutEvents 作用域内（Quietly 族）钩子与分发全部抑制。
-func (c *Connection) fireModelEvent(ob *Observer, name string, model any) error {
+// 观察者列表按注册顺序逐个执行（多观察者叠加语义）。
+func (c *Connection) fireModelEvent(obs []*Observer, name string, model any) error {
 	if eventsQuiet() {
 		return nil
 	}
-	if ob != nil {
+	for _, ob := range obs {
 		var hook func(any) error
 		switch name {
+		case events.Retrieving:
+			hook = ob.Retrieving
 		case events.Saving:
 			hook = ob.Saving
 		case events.Saved:
@@ -185,6 +263,8 @@ func (c *Connection) fireModelEvent(ob *Observer, name string, model any) error 
 			hook = ob.Restoring
 		case events.Restored:
 			hook = ob.Restored
+		case events.Replicating:
+			hook = ob.Replicating
 		case events.ForceDeleted:
 			hook = ob.ForceDeleted
 		}

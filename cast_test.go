@@ -45,7 +45,7 @@ func TestCastJSONRead(t *testing.T) {
 	conn, st := newFakeDB(t)
 	st.On("select * from `app_settings` where `id` = ? limit 1", &fakeResult{
 		Columns: []string{"id", "name", "config"},
-		Rows:   [][]driver.Value{{int64(1), "app", `{"theme":"light","locale":"en"}`}},
+		Rows:    [][]driver.Value{{int64(1), "app", `{"theme":"light","locale":"en"}`}},
 	})
 
 	var s AppSetting

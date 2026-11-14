@@ -2,7 +2,7 @@ package grammar
 
 import "fmt"
 
-// ---- SQLite Schema 编译（对齐 Illuminate\Database\Schema\Grammars\SQLiteGrammar） ----
+// ---- SQLite Schema 编译 ----
 //
 // 方言要点：
 //   - 无 unsigned 关键字（整数列一概 integer）；
@@ -11,8 +11,8 @@ import "fmt"
 //   - enum 为 varchar check ("col" in (...))；
 //   - timestamp/datetime 一概 datetime，date 为 date，time 为 time，year 为 integer；
 //   - create table 时 foreign key 内联（SQLite 不支持独立 add constraint）；
-//   - dropPrimary/dropForeign 需重建表，Laravel 走 compileAlter 重建，此处返回空串
-//     跳过（调用方 ToSql 忽略空语句），dropForeign 按名不支持（对齐 Laravel 抛错语义）。
+//   - dropPrimary/dropForeign 需重建表，此处返回空串
+//     跳过（调用方 ToSql 忽略空语句），dropForeign 按名不支持（抛错语义）。
 
 func (g *SQLiteGrammar) getColumnTypeSQLite(c *ColumnDefinition) string {
 	switch c.Type {
@@ -86,7 +86,7 @@ func (g *SQLiteGrammar) columnDefinitionSQLite(c *ColumnDefinition) string {
 	if c.NotNull || !c.IsNullable {
 		parts = append(parts, "not null")
 	}
-	// SQLite 对可空列不输出 "null"（对齐 Laravel SQLiteGrammar::modifyNullable）
+	// SQLite 对可空列不输出 "null"（可空即缺省，不再显式标注）
 	if c.DefaultRaw != "" {
 		parts = append(parts, "default "+c.DefaultRaw)
 	} else if c.DefaultValue != nil {
@@ -129,7 +129,7 @@ func (g *SQLiteGrammar) CompileCreate(b *Blueprint) []string {
 	table := g.WrapTable(b.Table)
 	prefix := "create table "
 	if b.Temporary {
-		// Laravel SQLiteGrammar.php:233-234：create temporary table
+		// 临时表使用 create temporary table
 		prefix = "create temporary table "
 	}
 	sql := prefix + table + " (" + joinComma(cols)
@@ -183,7 +183,7 @@ func (g *SQLiteGrammar) CompileAdd(b *Blueprint) []string {
 		case "unique":
 			out = append(out, "create unique index "+g.Wrap(idx.Name)+" on "+table+" ("+g.columnizeNamesSQLite(idx.Columns)+")")
 		case "foreign":
-			// SQLite 仅支持建表时内联外键（对齐 Laravel 运行时错误）
+			// SQLite 仅支持建表时内联外键（运行时抛错）
 			panic(ErrUnsupported{"This database driver does not support adding foreign keys after table creation."})
 		case "spatialindex":
 			panic(ErrUnsupported{"The database driver in use does not support spatial indexes."})
@@ -196,8 +196,8 @@ func (g *SQLiteGrammar) CompileAdd(b *Blueprint) []string {
 	return out
 }
 
-// CompileChange：SQLite 修改列需重建整表（Laravel compileAlter 的
-// __temp__ 重建流程依赖运行期内省），返回不支持错误。
+// CompileChange：SQLite 修改列需重建整表（__temp__ 重建流程
+// 依赖运行期内省），返回不支持错误。
 func (g *SQLiteGrammar) CompileChange(b *Blueprint, c *ColumnDefinition) []string {
 	panic(ErrUnsupported{"SQLite requires the table to be rebuilt for column changes."})
 }
@@ -233,8 +233,7 @@ func (g *SQLiteGrammar) CompileRenameIndex(b *Blueprint, from, to string) string
 	panic(ErrUnsupported{"SQLite requires the table to be rebuilt for index renames."})
 }
 
-// CompileDropPrimary：SQLite 不支持修改主键，对齐 Laravel 抛出运行时错误
-// （SQLiteGrammar.php:645-647）。
+// CompileDropPrimary：SQLite 不支持修改主键，抛出运行时错误。
 func (g *SQLiteGrammar) CompileDropPrimary(b *Blueprint, index string) string {
 	panic("RuntimeException: SQLite does not support altering primary keys")
 }
@@ -261,7 +260,7 @@ func (g *SQLiteGrammar) CompileDropVectorIndex(b *Blueprint, index string) strin
 	panic(ErrUnsupported{"The database driver in use does not support vector indexes."})
 }
 
-// CompileDropForeign：SQLite 不支持按名删除外键（Laravel 走建表重建）。
+// CompileDropForeign：SQLite 不支持按名删除外键（需重建表）。
 func (g *SQLiteGrammar) CompileDropForeign(b *Blueprint, index string) string {
 	panic(ErrUnsupported{"This database driver does not support dropping foreign keys by name."})
 }

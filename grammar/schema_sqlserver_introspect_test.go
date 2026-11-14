@@ -6,9 +6,9 @@ import (
 	"testing"
 )
 
-// SQL Server 内省编译 golden 测试（SQL 期望移植自 Laravel 13
-// SqlServerGrammar.php compileSchemas/compileTables/compileViews/compileColumns/
-// compileIndexes/compileForeignKeys/compileDropAll*）与 D5 默认约束前置块测试。
+// SQL Server 内省编译 golden 测试（覆盖 compileSchemas/compileTables/
+// compileViews/compileColumns/compileIndexes/compileForeignKeys/compileDropAll*）
+// 与 D5 默认约束前置块测试。
 
 func TestSchemaSQLServerIntrospectCompileSchemas(t *testing.T) {
 	sql, args := NewSqlServerGrammar().CompileSchemas()
@@ -115,7 +115,7 @@ func TestSchemaSQLServerIntrospectDropAll(t *testing.T) {
 func TestSchemaSQLServerChangeWithDefaultConstraint(t *testing.T) {
 	g := NewSqlServerGrammar()
 	b := NewBlueprint("users")
-	b.String("email").Change().Default("fix@laravel.com")
+	b.String("email").Change().Default("fix@example.com")
 
 	got := b.ToSql(g)
 	want := []string{
@@ -125,7 +125,7 @@ func TestSchemaSQLServerChangeWithDefaultConstraint(t *testing.T) {
 			`WHERE [object_id] = OBJECT_ID('"users"') AND [name] in ('email') AND [default_object_id] <> 0;` +
 			`EXEC(@sql)`,
 		`alter table "users" alter column "email" nvarchar(255) not null`,
-		`alter table "users" add default 'fix@laravel.com' for "email"`,
+		`alter table "users" add default 'fix@example.com' for "email"`,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("change =\n  %v\nwant\n  %v", got, want)

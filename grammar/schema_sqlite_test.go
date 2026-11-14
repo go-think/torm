@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// SQLite 方言 golden 测试（SQL 期望移植自 Laravel 13 SQLiteGrammar 输出）。
+// SQLite 方言 golden 测试（SQL 期望取自既有 golden 基线）。
 
 func sqliteG() *SQLiteGrammar { return &SQLiteGrammar{} }
 
@@ -122,7 +122,7 @@ func TestSchemaSQLiteDropPrimaryPanics(t *testing.T) {
 	defer func() {
 		r := recover()
 		if r == nil {
-			t.Fatal("DropPrimary must panic on SQLite (Laravel RuntimeException)")
+			t.Fatal("DropPrimary must panic on SQLite (RuntimeException)")
 		}
 	}()
 	b := NewBlueprint("users")

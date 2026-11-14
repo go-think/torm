@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// ---- Collection 补全测试（对照 Illuminate/Collections/Collection.php）----
+// ---- Collection 补全测试 ----
 
 type colItem struct {
 	ID    int64  `torm:"primary_key;column:id"`
@@ -288,7 +288,7 @@ func TestCollectionModelKeys(t *testing.T) {
 // ---- Collection 补全（countBy/collapse/flip/keys/pad/dictionary）----
 
 func TestCollectionCountBy(t *testing.T) {
-	// Laravel countBy：按回调结果分组计数
+	// countBy：按回调结果分组计数
 	c := Collection[colItem]{{Name: "a", Score: 80}, {Name: "b", Score: 90}, {Name: "c", Score: 70}}
 	counts := c.CountBy(func(i colItem) string {
 		if i.Score >= 80 {
@@ -417,15 +417,15 @@ func TestCollectionFresh(t *testing.T) {
 	})
 
 	items := Col([]*colItem{{ID: 1, Name: "A"}, {ID: 2, Name: "B"}})
-	// Fresh 仅对已持久化模型重查（对应 Laravel fresh 的 exists 判定）
+	// Fresh 仅对已持久化模型重查（基于 exists 判定）
 	setExists(items[0], true, false)
 	setExists(items[1], true, false)
 	fresh, err := items.Fresh(conn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 行消失的元素保留 nil 占位（对应 Laravel Eloquent Collection.php:1571
-	// 的 null 键位语义）；原集合不变
+	// 行消失的元素保留 nil 占位（缺失行对应 null 键位语义）；
+	// 原集合不变
 	if len(fresh) != 2 || fresh[0] == nil || fresh[0].Name != "A2" || fresh[0] == items[0] {
 		t.Errorf("fresh = %#v", fresh)
 	}
@@ -435,7 +435,7 @@ func TestCollectionFresh(t *testing.T) {
 	if len(items) != 2 || items[0].Name != "A" {
 		t.Errorf("original mutated = %#v", items)
 	}
-	// 原集合元素指针未被刷新（Laravel fresh 语义：返回新实例）
+	// 原集合元素指针未被刷新（fresh 语义：返回新实例）
 	if items[0].Name != "A" {
 		t.Errorf("original[0] = %#v", items[0])
 	}

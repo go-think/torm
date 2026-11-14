@@ -8,12 +8,13 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-think/torm/utils"
 )
 
-// cast 常量：Laravel 支持的常见 cast 名（本次扩展，json 为既有行为）。
+// cast 常量：本库支持的常见 cast 名（本次扩展，json 为既有行为）。
 const (
 	castDate     = "date"     // time.Time ↔ '2006-01-02'
 	castDatetime = "datetime" // time.Time ↔ '2006-01-02 15:04:05'
@@ -23,11 +24,63 @@ const (
 	castFloat    = "float" // 兼容 double/real
 )
 
+// 全局日期写入格式默认值（默认取通用方言格式。
+// 多方言毫秒精度等差异由调用方经 SetDateWriteFormats 按需配置——全局单值，
+// 多方言多连接场景不宜在连接打开时静默覆写）。
+var (
+	dateFormatMu              sync.Mutex
+	globalDateWriteFormat     = "2006-01-02"
+	globalDatetimeWriteFormat = "2006-01-02 15:04:05"
+)
+
+// SetDateWriteFormats 覆写 cast:date / cast:datetime 的写入格式（Go 布局）。
+func SetDateWriteFormats(date, datetime string) {
+	dateFormatMu.Lock()
+	defer dateFormatMu.Unlock()
+	if date != "" {
+		globalDateWriteFormat = date
+	}
+	if datetime != "" {
+		globalDatetimeWriteFormat = datetime
+	}
+}
+
+func dateWriteFormats() (string, string) {
+	dateFormatMu.Lock()
+	defer dateFormatMu.Unlock()
+	return globalDateWriteFormat, globalDatetimeWriteFormat
+}
+
+// phpCastArgToGoLayout 把 cast:datetime:Y-m-d 的 PHP date 风格参数转为 Go 布局
+// （token 集与 connection.phpDateToGoLayout 一致；空参回退全局默认）。
+func phpCastArgToGoLayout(arg string) string {
+	if strings.TrimSpace(arg) == "" {
+		return ""
+	}
+	repl := map[byte]string{
+		'Y': "2006", 'y': "06",
+		'm': "01", 'n': "1",
+		'd': "02", 'j': "2",
+		'H': "15", 'G': "3", 'h': "03", 'g': "3",
+		'i': "04", 's': "05", 'v': "000", 'u': "000000",
+	}
+	var b strings.Builder
+	for i := 0; i < len(arg); i++ {
+		if r, ok := repl[arg[i]]; ok {
+			b.WriteString(r)
+		} else {
+			b.WriteByte(arg[i])
+		}
+	}
+	return b.String()
+}
+
 // WriteCast 写入前转换：把字段 Go 值转为数据库绑定值。
 //
-// cast:json / cast:array —— 结构体/切片/映射序列化为字符串；空值对齐 Laravel：
-// nil/零值集合写 "[]"（PHP 空数组语义），零值结构体写 null。
-// cast:date / cast:datetime —— time.Time 按方言格式序列化。
+// cast:json / cast:array —— 结构体/切片/映射序列化为字符串；空值约定：
+// nil/零值集合写 "[]"（空集合语义），零值结构体写 null。
+// cast:date / cast:datetime —— time.Time 按格式序列化（cast:datetime:Y-m-d 自定义，
+// 否则全局默认 = 方言 GetDateFormat）。
 // cast:decimal:N —— 数字/字符串规范化为 N 位定点字符串。
 // cast:bool / cast:int / cast:float —— 规范化为对应标量。
 func (f *Field) WriteCast() (any, bool) {
@@ -43,10 +96,15 @@ func (f *Field) WriteCast() (any, bool) {
 		if !ok {
 			return nil, false
 		}
-		if f.CastName == castDate {
-			return t.Format("2006-01-02"), true
+		defDate, defDatetime := dateWriteFormats()
+		layout := defDate
+		if f.CastName == castDatetime {
+			layout = defDatetime
 		}
-		return t.Format("2006-01-02 15:04:05"), true
+		if arg := phpCastArgToGoLayout(f.CastArg); arg != "" {
+			layout = arg
+		}
+		return t.Format(layout), true
 	case castDecimal:
 		return f.writeCastDecimal()
 	case castBool:
@@ -61,7 +119,7 @@ func (f *Field) WriteCast() (any, bool) {
 }
 
 // writeCastJSON json/array cast 写入：零值集合写 "[]"，零值结构体写 null
-// （对齐 Laravel 空值语义，修正"零值跳过写入"偏差）。
+// （空值语义约定，修正"零值跳过写入"偏差）。
 func (f *Field) writeCastJSON() (any, bool) {
 	switch f.Value.Kind() {
 	case reflect.Slice, reflect.Map:
@@ -204,7 +262,7 @@ func (f *Field) castDeref() (reflect.Value, bool) {
 // ReadCast 读取后转换：把扫描结果规范化为字段语义类型。
 //
 // json cast 把字符串反序列化进结构体/切片（connection 层 holder 已完成时为 no-op）；
-// date cast 把 time.Time 截断到当天零点（对应 Laravel asDate）；
+// date cast 把 time.Time 截断到当天零点（asDate 语义）；
 // decimal cast 把字符串值规范化到指定精度。
 // 读侧要求驱动返回时间值（MySQL parseTime=true 惯例），字符串列无法在扫描后补救。
 func (f *Field) ReadCast() error {
@@ -358,6 +416,10 @@ func (f *Field) initialize() {
 		}
 		switch k {
 		case "-":
+			f.Ignored = true
+		case "PIVOT":
+			// pivot 载体字段（torm:"pivot:<关系名>"）：非数据库列，
+			// BTM/MTM 预加载时接收 pivot_ 前缀列
 			f.Ignored = true
 		case "PRIMARY_KEY":
 			f.Primary = true

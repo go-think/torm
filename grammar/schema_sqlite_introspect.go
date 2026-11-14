@@ -1,20 +1,24 @@
 package grammar
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
-// ---- SQLite Schema 内省编译（对齐 Illuminate\Database\Schema\Grammars\SQLiteGrammar.php:105-222 / :485-512） ----
+// ---- SQLite Schema 内省编译 ----
 //
 // 方言说明：
-//   - schema 为空时对齐 Laravel 的 $schema ?? 'main'（SQLiteBuilder 默认 main）；
-//   - CompileTables 不做 withSize 的 dbstat 版本（Laravel 会先探针
+//   - schema 为空时回落 'main'（SQLite 默认 attached schema 为 main）；
+//   - CompileTables 不做 withSize 的 dbstat 版本（需先探针
 //     compileDbstatExists 再决定是否 join dbstat；size 为可选信息，Go 侧
 //     SchemaTable.Size 恒为 0，如需可后续按 compileDbstatExists + dbstat 补齐）；
 //   - 3.37 以下版本走 compileLegacyTables（pragma_table_list 不可用）——版本
 //     分支依赖可注入的 serverVersion（TODO 接线点：SQLiteGrammar SetServerVersion）。
 
-// sqliteQuoteString 对应 Grammar::quoteString（SQLite 内省 SQL 内联字面量）。
+// sqliteQuoteString 对应 Grammar::quoteString（SQLite 内省 SQL 内联字面量）；
+// 内部单引号双写转义，schema/table 名含 `'` 时不再破坏内省 SQL。
 func sqliteQuoteString(v string) string {
-	return "'" + v + "'"
+	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
 }
 
 // CompileTables 对应 SQLiteGrammar::compileTables（:105-119）：
@@ -69,7 +73,7 @@ func (g *SQLiteGrammar) CompileIndexes(schema, table string) (string, []any) {
 
 // CompileForeignKeys 对应 SQLiteGrammar::compileForeignKeys（:211-222）：
 // pragma_foreign_key_list 按 id 分组（group_concat from/to 列），id desc 排序
-// 对齐 Laravel 使复合外键列序正确。
+// 按 id desc 排序保证复合外键列序正确。
 func (g *SQLiteGrammar) CompileForeignKeys(schema, table string) (string, []any) {
 	s := sqliteQuoteString(orMain(schema))
 	return fmt.Sprintf(

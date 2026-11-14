@@ -9,16 +9,16 @@ import (
 	"github.com/go-think/torm/query"
 )
 
-// MySqlGrammar 对应 Illuminate\Database\Query\Grammars\MySqlGrammar。
+// MySqlGrammar 为 MySQL 方言查询编译器。
 // 方言差异通过构造器注入的钩子实现；必须使用 NewMySqlGrammar 构造。
 type MySqlGrammar struct {
 	QueryGrammar
 
-	// useUpsertAlias：upsert 编译走 as laravel_upsert_alias 形式
+	// useUpsertAlias：upsert 编译走 as upsert_alias 形式
 	// （对应连接配置 use_upsert_alias）。
 	useUpsertAlias bool
 
-	// D7 版本分支注入参数（对应 Laravel connection->getServerVersion()/isMaria()，
+	// D7 版本分支注入参数（等价 connection 的 server version / isMaria 信息，
 	// 经 SetServerVersion/SetIsMaria 注入，避免 grammar 反向依赖 connection）。
 	serverVersion string
 	isMaria       bool
@@ -253,7 +253,7 @@ func (g *MySqlGrammar) compileLock(q *query.Query, value any) string {
 	return ""
 }
 
-// compileLimit MySQL 支持负值输出（与 Laravel 一致，limit 为 int）。
+// compileLimit MySQL 支持负值输出（limit 为 int）。
 func (g *MySqlGrammar) compileLimit(q *query.Query, limit int64) string {
 	return "limit " + intToString(limit)
 }
@@ -280,7 +280,7 @@ func (g *MySqlGrammar) compileUpsert(q *query.Query, rows []query.Row, uniqueBy,
 	sql, bindings := g.QueryGrammar.baseCompileInsert(q, rows)
 
 	if g.useUpsertAlias {
-		sql += " as laravel_upsert_alias"
+		sql += " as upsert_alias"
 	}
 
 	sql += " on duplicate key update "
@@ -288,7 +288,7 @@ func (g *MySqlGrammar) compileUpsert(q *query.Query, rows []query.Row, uniqueBy,
 	cols := make([]string, 0, len(update))
 	for _, column := range update {
 		if g.useUpsertAlias {
-			cols = append(cols, g.Wrap(column)+" = "+g.Wrap("laravel_upsert_alias")+"."+g.Wrap(column))
+			cols = append(cols, g.Wrap(column)+" = "+g.Wrap("upsert_alias")+"."+g.Wrap(column))
 			continue
 		}
 		cols = append(cols, g.Wrap(column)+" = values("+g.Wrap(column)+")")

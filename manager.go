@@ -10,9 +10,9 @@ import (
 	"github.com/go-think/torm/events"
 )
 
-// Config 连接配置（对应 Laravel database.connections[*]）。
+// Config 连接配置（对应配置文件中的 database.connections 节点）。
 type Config struct {
-	// Database 数据库名（对应 Laravel config['database']，内省与
+	// Database 数据库名（对应 config['database']，内省与
 	// CreateDatabase 使用）
 	Database string
 
@@ -25,6 +25,10 @@ type Config struct {
 	// Sticky sticky 模式：本连接发生写操作后，后续读强制走主连接
 	// （对应配置 sticky，配合 recordsModified 跟踪）。
 	Sticky bool
+	// StickyWindowSec sticky 时间窗（秒）：>0 时写后该窗口内读走主库、
+	// 窗口外恢复读写分离（默认 0 = 进程生命周期内永久粘主，1.x 语义；
+	// 其他实现为请求级语义，Go 无请求上下文时建议配置窗口）。
+	StickyWindowSec int
 
 	// MySQL 连接参数（MySqlConnector 自动附加到 DSN，已有参数不覆盖）
 	Charset   string // NAMES charset
@@ -48,12 +52,29 @@ type Config struct {
 	ApplicationName string
 
 	// SQLite pragmas
-	ForeignKeys *bool  // PRAGMA foreign_keys（nil 表示不设置）
+	ForeignKeys *bool  // PRAGMA foreign_keys（nil = 默认开启，与 sqlite 默认 foreign_keys=true 一致）
 	BusyTimeout int    // PRAGMA busy_timeout（毫秒，0 表示不设置）
 	JournalMode string // PRAGMA journal_mode
 	Synchronous string // PRAGMA synchronous
-	// Pragmas 自定义 pragma 集合（对应 config['pragmas']，建连后逐条执行）
+	// Pragmas 自定义 pragma 集合（对应 config['pragmas']，经 DSN _pragma 参数生效，
+	// 连接池下每个物理连接均生效）
 	Pragmas map[string]string
+
+	// MySQL 方言开关（GetQueryGrammar 注入；此前仅 schema 侧可达，查询侧死代码）
+	ServerVersion       string // 如 "8.0.36" / "10.5.2-MariaDB"（MySQL 5.7 分支、JSON 能力判定）
+	IsMariaDB           bool   // driver="mysql" 但实际为 MariaDB 时标记（影响 JSON/upsert 编译）
+	UseUpsertAlias      *bool  // MySQL 8.0.19+ 关闭 as 别名 upsert（nil = 按版本推断）
+	UseLegacyGroupLimit bool   // SQLite < 3.25 的 groupLimit 降级分支
+
+	// 连接池调优（对应 database/sql 的 Set* API；0 值 = 不设置，保留驱动默认）
+	MaxOpenConns       int
+	MaxIdleConns       int
+	ConnMaxLifetimeSec int // 连接最长存活时间（秒，0 = 不设置）
+	ConnMaxIdleTimeSec int // 连接最长空闲时间（秒，0 = 不设置）
+
+	// ParseTime MySQL DSN 是否自动附加 parseTime=true（nil/true = 附加，
+	// time.Time 字段扫描必需；显式 false 关闭注入）
+	ParseTime *bool
 }
 
 // DatabaseManager 具名连接管理器（连接复用 + 并发安全）。
@@ -329,6 +350,13 @@ func (m *Manager) Reconnect(name string) (*Connection, error) {
 	if !ok {
 		m.mu.Unlock()
 		return m.Connect(name)
+	}
+	// 事务进行中的连接禁止热替换句柄：adoptHandles 后 c.tx 指向失效句柄且
+	// level 卡住，后续查询全部报错且无法恢复（事务内断连有明确的
+	// nesting-level 异常语义，此处以显式错误提前拒绝）
+	if lvl := conn.TransactionLevel(); lvl > 0 {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("torm: cannot reconnect connection %q with %d active transaction(s)", name, lvl)
 	}
 	// 用连接自身的配置重建（方言参数在重连后照常生效）
 	config := conn.GetConfig()

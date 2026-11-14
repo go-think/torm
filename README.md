@@ -3,7 +3,7 @@
 </h1>
 
 <p align="center">
-	<strong>ThinkORM is a Laravel-style ORM for Go — query builder, Eloquent-like models, relations, schema builder and migrations.</strong>
+	<strong>ThinkORM is a batteries-included ORM for Go — query builder, active-record style models, relations, schema builder and migrations.</strong>
 </p>
 
 <p align="center">
@@ -16,9 +16,6 @@
 	<a href="https://pkg.go.dev/github.com/go-think/torm">
 		<img src="https://pkg.go.dev/badge/github.com/go-think/torm" alt="GoDoc">
   	</a>
-	<a href="https://github.com/go-think/torm/releases">
-		<img src="https://img.shields.io/github/release/go-think/torm.svg" alt="Latest Stable Version">
-	</a>
 	<a href="LICENSE">
 		<img src="https://img.shields.io/github/license/go-think/torm.svg" alt="License">
 	</a>
@@ -26,13 +23,13 @@
 
 ## Features
 
-- **Query Builder** — full where family (nested / sub-query / JSON / fulltext / binary / row values), joins (incl. lateral & join-sub), unions, aggregates, group limit, in-order-of, index hints, locks & timeouts
+- **Query Builder** — full where family (nested / sub-query / JSON / fulltext / binary / row values), joins (incl. lateral & join-sub), unions, aggregates, group limit, in-order-of, index hints, locks & timeouts, CTE (`WithExpression` / `WithRecursiveExpression`), cursor pagination (boundary-aware), chunkByIdDesc / lazyByIdDesc
 - **Multiple dialects** — MySQL, MariaDB, Postgres, SQLite, SQL Server (identifier quoting, limit/offset rewrites, upsert, returning, ctid/rowid deletes, JSON compilation)
-- **Eloquent-style Models** — timestamps, soft deletes, dirty tracking, mass-assignment guards, casts, UUID/ULID keys, increment, events & observers
-- **Relations** — hasOne / hasMany / hasOneThrough / hasManyThrough / belongsTo / morphOne / morphMany / morphTo / belongsToMany / morphToMany with eager loading, `WhereHas` family, `withCount` aggregates, pivot read & write side
-- **Connections** — named connections, read/write splitting with sticky, reconnect with lost-connection retry, query log & pretend, before/after hooks
-- **Transactions** — nested savepoints, deadlock retry, `AfterCommit` / `AfterRollBack` hooks, transaction events
-- **Schema Builder & Migrations** — full Blueprint (25+ column types, morphs, index kinds), per-dialect introspection, registered migrations with batching, step/batch/pretend and events
+- **Active-record style Models** — timestamps (customizable columns), soft deletes, dirty tracking, mass-assignment guards (Unguard/Reguard), casts (`cast:datetime:<layout>`), UUID/ULID keys, increment, events & observers, serialization (`ToMap`/`ToJson` with hidden/visible), `Replicate`, PG/SQLServer `RETURNING`-based id backfill
+- **Relations** — hasOne / hasMany / hasOneThrough / hasManyThrough / belongsTo / morphOne / morphMany / morphTo / belongsToMany / morphToMany with eager loading, `WhereHas` family, `withCount` aggregates (all relation shapes incl. pivot/through joins), pivot read (`WithPivot` + backfill into `torm:"pivot:..."` fields) & write side (incl. MorphToMany attach/detach/sync), relation-level soft-delete scopes, automatic parent `touches`
+- **Connections** — named connections, read/write splitting with sticky (optional time window), reconnect with lost-connection retry, query log & pretend, before/after hooks, pool tuning (`MaxOpenConns`/`ConnMaxLifetimeSec`...), pool-safe session config (MySQL connector wrapper / PG `options=-c` / SQLite DSN pragmas), SQLite `foreign_keys` default on, MySQL `parseTime` default injection
+- **Transactions** — nested savepoints, deadlock retry, `AfterCommit` / `AfterRollBack` hooks, transaction events, panic-safe rollback
+- **Schema Builder & Migrations** — full Blueprint (25+ column types, morphs, index kinds), per-dialect introspection, registered migrations with batching, step/batch/pretend, SQL-file `LoadDir`, `Fresh`, advisory locking (PG/MySQL), per-migration `WithinTransaction`
 - **Error classification** — deadlock / lost connection / unique constraint detection by driver error codes and messages
 
 ## Requirements
@@ -53,6 +50,9 @@ The test suite does not require a live database — an in-memory fake driver
 ```
 go test -race ./...
 ```
+
+CI runs build, vet and the full test suite on every push and pull request to
+`master` (see [.github/workflows/build.yml](.github/workflows/build.yml)).
 
 ## Quick Start
 
@@ -415,4 +415,4 @@ This project is licensed under the [Apache 2.0 license](LICENSE).
 
 If you have any issues or feature requests, please contact us. PR is welcomed.
 - https://github.com/go-think/torm/issues
-- duanpier@gmail.com
+- leeqvip@gmail.com

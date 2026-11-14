@@ -13,11 +13,11 @@ import (
 	"github.com/go-think/torm/utils"
 )
 
-// Relation 关系定义（对应 Laravel 关系的键约定）。
+// Relation 关系定义（约定关系两侧的键命名）。
 type Relation interface {
 	kind() string
 	targetModel() any
-	// GetResults 单父查询（对应 Laravel Relation::getResults）：
+	// GetResults 单父查询：
 	// 返回关联模型指针（*T）切片；无关联时返回空切片。
 	GetResults(parent any, c *Connection, constraints ...func(*Builder)) ([]any, error)
 }
@@ -86,7 +86,7 @@ func (r BelongsTo) GetResults(parent any, c *Connection, constraints ...func(*Bu
 		}
 		return nil, nil
 	}
-	nb := NewBuilder(c, c.GetQueryGrammar()).From(targetTable).Where(ownerKey, "=", v)
+	nb := relationTargetBuilder(c, r).Where(ownerKey, "=", v)
 	for _, cons := range constraints {
 		cons(nb)
 	}
@@ -210,7 +210,7 @@ type oneOfManyOrder struct {
 }
 
 // ofManyOrders one-of-many 的完整排序序列：极值列 + 主键 tie-break
-// （对应 Laravel CanBeOneOfMany.php:70-176 ofMany 强制追加 keyName =>
+// （ofMany 强制追加 keyName =>
 // aggregate——同刻并列以主键同向极值决断，latestOfMany 取 id 更大者）。
 func ofManyOrders(rel oneOfManyRel) ([]oneOfManyOrder, bool) {
 	col, dir, ok := rel.ofManyOrder()
@@ -265,7 +265,7 @@ func hasOneOrManyResults(rel Relation, parent any, c *Connection, constraints ..
 	if v == nil || utilsIsBlankValue(v) {
 		return nil, nil
 	}
-	nb := NewBuilder(c, c.GetQueryGrammar()).From(targetTable).WhereIn(fk, []any{v})
+	nb := relationTargetBuilder(c, rel).WhereIn(fk, []any{v})
 	for _, cons := range constraints {
 		cons(nb)
 	}
@@ -289,8 +289,8 @@ type pendingRelation struct {
 }
 
 // MorphCountSpec morphTo morphWithCount 的单条计数规格：
-// 对应 morphWithCount([类型 => [关系名, ...]]) 的一项；Laravel 按关系名
-// 隐式解析，Go 侧无容器需显式给出关系描述符。
+// morphWithCount([类型 => [关系名, ...]]) 的一项；原按关系名隐式解析，
+// Go 侧无容器需显式给出关系描述符。
 type MorphCountSpec struct {
 	Name     string   // 计数别名（对应 withCount('comments') → comments_count）
 	Relation Relation // 被计数的关系描述符
@@ -312,20 +312,17 @@ func (b *Builder) setPendingRelation(pr pendingRelation) *Builder {
 // With 预加载关系：Get 时自动执行关联查询并填充结构体字段
 // （字段名 = 关系名 StudlyCase；BelongsTo/HasOne 填 *T，HasMany 填 []T）。
 func (b *Builder) With(name string, rel Relation) *Builder {
-	b.relations = append(b.relations, pendingRelation{name: name, rel: rel})
-	return b
+	return b.setPendingRelation(pendingRelation{name: name, rel: rel})
 }
 
 // WithConstraints 带约束闭包的预加载（对应 with(['name' => fn($q) => ...])）。
 func (b *Builder) WithConstraints(name string, rel Relation, constraints ...func(*Builder)) *Builder {
-	b.relations = append(b.relations, pendingRelation{name: name, rel: rel, constraints: constraints})
-	return b
+	return b.setPendingRelation(pendingRelation{name: name, rel: rel, constraints: constraints})
 }
 
 // WithLimit 带限额的预加载：自动经 GroupLimit（row_number 分组）实现每组限额。
 func (b *Builder) WithLimit(name string, rel Relation, limit int64, constraints ...func(*Builder)) *Builder {
-	b.relations = append(b.relations, pendingRelation{name: name, rel: rel, constraints: constraints, limit: &limit})
-	return b
+	return b.setPendingRelation(pendingRelation{name: name, rel: rel, constraints: constraints, limit: &limit})
 }
 
 // WhereHas 关系存在性约束：where exists (select * from target where keys... and constraints...)
@@ -340,18 +337,18 @@ func (b *Builder) OrWhereHas(rel Relation, constraints func(*Builder)) *Builder 
 	return b.addHasWhere(rel, constraints, "or")
 }
 
-// Has 关系存在性/计数阈值（对应 Laravel has($relation, $operator, $count)）：
+// Has 关系存在性/计数阈值（has($relation, $operator, $count) 形态）：
 // Has(rel) 等价 Has(rel, ">=", 1)；Has(rel, 3) 默认操作符 >=；
 // Has(rel, ">", 2) 自定义操作符。实现见 builder.go hasImpl。
 func (b *Builder) Has(rel Relation, args ...any) *Builder { return b.hasImpl(rel, args...) }
 
-// OrHas 无约束关系存在性（or 布尔，对应 Laravel orHas()）。
+// OrHas 无约束关系存在性（or 布尔）。
 func (b *Builder) OrHas(rel Relation) *Builder { return b.OrWhereHas(rel, nil) }
 
-// DoesntHave 关系不存在性约束：where not exists (...)（对应 Laravel doesntHave）。
+// DoesntHave 关系不存在性约束：where not exists (...)。
 func (b *Builder) DoesntHave(rel Relation) *Builder { return b.WhereDoesntHave(rel, nil) }
 
-// WhereDoesntHave 关系不存在性约束（对应 Laravel whereDoesntHave）。
+// WhereDoesntHave 关系不存在性约束。
 func (b *Builder) WhereDoesntHave(rel Relation, constraints func(*Builder)) *Builder {
 	return b.addHasWhere(rel, constraints, "and-not")
 }
@@ -361,7 +358,7 @@ func (b *Builder) OrWhereDoesntHave(rel Relation, constraints func(*Builder)) *B
 	return b.addHasWhere(rel, constraints, "or-not")
 }
 
-// WhereHasMorph 多态关系存在性约束（对应 Laravel whereHasMorph）：
+// WhereHasMorph 多态关系存在性约束：
 // 子查询带 type 列 in (types) 过滤，types 为候选 morph key
 // （如 []string{"posts", "videos"}）；constraints 应用在目标查询上。
 func (b *Builder) WhereHasMorph(rel MorphMany, types []string, constraints ...func(*Builder)) *Builder {
@@ -392,7 +389,7 @@ func (b *Builder) addHasMorphWhere(rel MorphMany, types []string, constraints []
 	return b.appendExistsWhere(sub, boolean)
 }
 
-// WhereMorphedTo 匹配多态列指向特定目标的行（对应 Laravel whereMorphedTo）：
+// WhereMorphedTo 匹配多态列指向特定目标的行：
 // target 为已持久化模型实例（匹配 type + id）或模型零值（仅匹配 type）。
 func (b *Builder) WhereMorphedTo(morphName string, target any) *Builder {
 	return b.addMorphedTo(morphName, target, "and")
@@ -420,7 +417,7 @@ func (b *Builder) addMorphedTo(morphName string, target any, boolean string) *Bu
 	return b
 }
 
-// WhereBelongsTo 按父模型过滤（对应 Laravel whereBelongsTo）：
+// WhereBelongsTo 按父模型过滤：
 // where <singular(parentTable)_id | foreignKey> = parent 主键。
 func (b *Builder) WhereBelongsTo(parent any, foreignKey ...string) *Builder {
 	fk := ""
@@ -444,7 +441,7 @@ func (b *Builder) addHasWhere(rel Relation, constraints func(*Builder), boolean 
 	if constraints != nil {
 		constraints(sub)
 	}
-	// morphMany/morphOne：默认限定类型列 = 父 morphKey（对应 Laravel getMorphTypeFilter）
+	// morphMany/morphOne：默认限定类型列 = 父 morphKey
 	switch m := rel.(type) {
 	case MorphMany:
 		addMorphTypeFilter(sub, m.MorphName, m.TypeColumn, m.MorphKey, fmtString(b.Query.From))
@@ -463,9 +460,9 @@ func addMorphTypeFilter(sub *Builder, morphName, typeColumn, morphKey, parentTab
 	sub.Where(typeColumn, "=", morphKey)
 }
 
-// appendExistsWhere 把子查询并入父查询（对应 Laravel whereExists / whereNotExists）。
+// appendExistsWhere 把子查询并入父查询（where exists / where not exists）。
 func (b *Builder) appendExistsWhere(sub *Builder, boolean string) *Builder {
-	// 子查询绑定并入父查询（对齐 Laravel whereExists）
+	// 子查询绑定并入父查询
 	b.AddBinding(sub.GetRawBindings()["where"], "where")
 	typ := "Exists"
 	if boolean == "and-not" || boolean == "or-not" {
@@ -489,7 +486,7 @@ func (b *Builder) hasSubQuery(rel Relation) *Builder {
 
 	switch r := rel.(type) {
 	case MorphTo:
-		// 反向多态：目标表随行而变，无法构造静态子查询（对应 Laravel 需要
+		// 反向多态：目标表随行而变，无法构造静态子查询（需要
 		// whereHasMorph 显式给类型）。先于 relationTargetTable 判定（nil 目标防 panic）。
 		_ = r
 		return nil
@@ -503,9 +500,11 @@ func (b *Builder) hasSubQuery(rel Relation) *Builder {
 			_, idColumn = morphColumns(m.MorphName, m.TypeColumn, m.IDColumn)
 		}
 		// 类型列过滤由调用方追加：WhereHas 加 = morphKey，
-		// WhereHasMorph 加 in (types)（避免两者冲突）
-		sub := NewBuilder(b.Connection, b.grammar).From(table)
+		// WhereHasMorph 加 in (types)（避免两者冲突）。
+		// 模型建器 + 显式 scope：目标模型软删行不参与存在性判定
+		sub := relationBuilderWithModel(b.Connection, b.grammar, rel)
 		sub.WhereColumn(parentTable+".id", "=", table+"."+idColumn, "and")
+		sub.applyModelScopes()
 		return sub
 	case BelongsToMany:
 		table := relationTargetTable(rel)
@@ -513,8 +512,9 @@ func (b *Builder) hasSubQuery(rel Relation) *Builder {
 		pivotSub := NewBuilder(b.Connection, b.grammar).From(pivot)
 		pivotSub.WhereColumn(parentTable+".id", "=", pivot+"."+fpk, "and")
 		pivotSub.WhereColumn(pivot+"."+rpk, "=", table+"."+rk, "and")
-		sub := NewBuilder(b.Connection, b.grammar).From(table)
+		sub := relationBuilderWithModel(b.Connection, b.grammar, rel)
 		sub.WhereExists(pivotSub)
+		sub.applyModelScopes()
 		return sub
 	case MorphToMany:
 		table := relationTargetTable(rel)
@@ -522,9 +522,10 @@ func (b *Builder) hasSubQuery(rel Relation) *Builder {
 		pivotSub := NewBuilder(b.Connection, b.grammar).From(pivot)
 		pivotSub.WhereColumn(parentTable+".id", "=", pivot+"."+fpk, "and")
 		pivotSub.WhereColumn(pivot+"."+rpk, "=", table+"."+rk, "and")
-		pivotSub.Where(typeColumn, "=", morphKey)
-		sub := NewBuilder(b.Connection, b.grammar).From(table)
+		pivotSub.Where(typeColumn, "=", morphKeyForTable(morphKey, parentTable))
+		sub := relationBuilderWithModel(b.Connection, b.grammar, rel)
 		sub.WhereExists(pivotSub)
+		sub.applyModelScopes()
 		return sub
 	case HasManyThrough, HasOneThrough:
 		hmt, isHmt := rel.(HasManyThrough)
@@ -549,18 +550,26 @@ func (b *Builder) hasSubQuery(rel Relation) *Builder {
 		if secondKey == "" {
 			secondKey = stripPlural(throughTable) + "_id"
 		}
-		throughSub := NewBuilder(b.Connection, b.grammar).From(throughTable)
+		// 中间表/目标表均走模型建器 + 显式 scope：软删的中间行与关联行
+		// 不参与存在性判定（对齐中间表 join 构造时
+		// 的 SoftDeletes 检测）
+		throughSub := relationBuilderWithModel(b.Connection, b.grammar, throughMiddleRel{hmt.ThroughModel})
+		if hmt.WithTrashedParents {
+			throughSub = throughSub.WithTrashed()
+		}
 		throughSub.WhereColumn(throughTable+"."+slk, "=", table+"."+secondKey, "and")
 		throughSub.WhereColumn(parentTable+"."+lk, "=", throughTable+"."+firstKey, "and")
-		sub := NewBuilder(b.Connection, b.grammar).From(table)
+		throughSub.applyModelScopes()
+		sub := relationBuilderWithModel(b.Connection, b.grammar, rel)
 		sub.WhereExists(throughSub)
+		sub.applyModelScopes()
 		return sub
 	}
 
-	table := relationTargetTable(rel)
-	sub := NewBuilder(b.Connection, b.grammar).From(table)
+	sub := relationBuilderWithModel(b.Connection, b.grammar, rel)
 	fk, parentKey := relationKeysForHas(rel, parentTable)
-	sub.WhereColumn(parentTable+"."+parentKey, "=", table+"."+fk, "and")
+	sub.WhereColumn(parentTable+"."+parentKey, "=", relationTargetTable(rel)+"."+fk, "and")
+	sub.applyModelScopes()
 	return sub
 }
 
@@ -606,10 +615,10 @@ func mtmResolvedKeys(r MorphToMany, parentTable, relName string) (string, string
 	if rk == "" {
 		rk = "id"
 	}
+	// morphKey 兜底留空：调用方统一经 morphKeyForTable 解析
+	// （显式 > morph map 别名 > 父表名；此处直接回退表名会打穿别名查找，
+	// 注册 morph map 后与 MorphOne/Many 写读两侧错位）
 	morphKey := r.MorphKey
-	if morphKey == "" {
-		morphKey = parentTable
-	}
 	fpk := r.ForeignPivotKey
 	if fpk == "" {
 		fpk = idColumn
@@ -631,6 +640,29 @@ func relationKeysForHas(rel Relation, parentTable string) (string, string) {
 	return fk, lk
 }
 
+// throughKeys HasManyThrough 的键归一（LocalKey/SecondLocalKey/FirstKey/SecondKey；
+// parentTable 为上一跳表名，FirstKey 缺省推断用）。
+func throughKeys(hmt HasManyThrough, parentTable string) (string, string, string, string) {
+	lk := hmt.LocalKey
+	if lk == "" {
+		lk = "id"
+	}
+	slk := hmt.SecondLocalKey
+	if slk == "" {
+		slk = "id"
+	}
+	throughTable := inspectModel(hmt.ThroughModel).table
+	firstKey := hmt.FirstKey
+	if firstKey == "" {
+		firstKey = stripPlural(parentTable) + "_id"
+	}
+	secondKey := hmt.SecondKey
+	if secondKey == "" {
+		secondKey = stripPlural(throughTable) + "_id"
+	}
+	return lk, slk, firstKey, secondKey
+}
+
 // WithCount 关系计数子查询：select (select count(*) ...) as "name_count"。
 // 增强形态（对应 QueriesRelationships::withCount）：
 //   - 约束闭包：WithCount("posts", HasMany{...}, func(nb *Builder){...})
@@ -641,13 +673,13 @@ func (b *Builder) WithCount(name string, rel Relation, rest ...any) *Builder {
 	return b.withAggregate(name, rel, "count", "*", rest...)
 }
 
-// WithAggregate 通用关系聚合子查询（对应 Laravel withAggregate）：
+// WithAggregate 通用关系聚合子查询：
 // select (select fn(col) from target where keys...) as "name_fn_col | alias"。
 func (b *Builder) WithAggregate(name string, rel Relation, function, column string, alias ...string) *Builder {
 	return b.withAggregate(name, rel, function, column, anySlice(alias)...)
 }
 
-// WithMax 关系最大值聚合（对应 Laravel withMax('posts', 'votes')）。
+// WithMax 关系最大值聚合。
 func (b *Builder) WithMax(name string, rel Relation, column string, alias ...string) *Builder {
 	return b.withAggregate(name, rel, "max", column, anySlice(alias)...)
 }
@@ -717,22 +749,51 @@ func (b *Builder) withAggregate(name string, rel Relation, function, column stri
 		baseAlias = joinName + "_" + function + "_" + column
 	}
 
-	// 嵌套段逐层下钻：编译为内层 exists（对齐 Laravel 嵌套 withCount 的
-	// 嵌套关系计数语义；这里以 exists 内嵌实现）
+	// 嵌套段逐层下钻：编译为内层 exists（对齐嵌套 withCount 的
+	// 嵌套关系计数语义）。按关系形态编译关联条件——旧实现统一走 relationKeys，
+	// morph/BTM/through 嵌套段落 ("id","id") 生成错误关联
 	var extraConds []string
 	if len(nested) > 0 {
-		curRel := rel
 		curTable := relationTargetTable(rel)
 		for _, nrel := range nested {
 			nextTable := relationTargetTable(nrel)
-			nfk, npk := relationKeys(nrel, curTable)
-			cond := "exists (select * from " + b.grammar.WrapTable(nextTable) +
-				" where " + b.grammar.Wrap(nextTable+"."+nfk) +
-				" = " + b.grammar.Wrap(curTable+"."+npk) + ")"
+			var cond string
+			switch nr := nrel.(type) {
+			case MorphMany, MorphOne:
+				var typeCol, idCol string
+				if mm, ok := nrel.(MorphMany); ok {
+					typeCol, idCol = morphColumns(mm.MorphName, mm.TypeColumn, mm.IDColumn)
+				} else {
+					mo := nrel.(MorphOne)
+					typeCol, idCol = morphColumns(mo.MorphName, mo.TypeColumn, mo.IDColumn)
+				}
+				cond = "exists (select * from " + b.grammar.WrapTable(nextTable) +
+					" where " + b.grammar.Wrap(nextTable+"."+idCol) +
+					" = " + b.grammar.Wrap(curTable+".id") +
+					" and " + b.grammar.Wrap(typeCol) + " = ?)"
+				b.AddBinding([]any{morphKeyForTable("", curTable)}, "where")
+			case BelongsToMany:
+				pivot, fpk, rpk, rk := btmResolvedKeys(nr, curTable)
+				cond = "exists (select * from " + b.grammar.WrapTable(nextTable) +
+					" inner join " + b.grammar.WrapTable(pivot) + " on " +
+					b.grammar.Wrap(nextTable+"."+rk) + " = " + b.grammar.Wrap(pivot+"."+rpk) +
+					" where " + b.grammar.Wrap(pivot+"."+fpk) + " = " + b.grammar.Wrap(curTable+".id") + ")"
+			case HasManyThrough:
+				thr := inspectModel(nr.ThroughModel).table
+				lk, slk, firstKey, secondKey := throughKeys(nr, curTable)
+				cond = "exists (select * from " + b.grammar.WrapTable(nextTable) +
+					" inner join " + b.grammar.WrapTable(thr) + " on " +
+					b.grammar.Wrap(thr+"."+slk) + " = " + b.grammar.Wrap(nextTable+"."+secondKey) +
+					" where " + b.grammar.Wrap(thr+"."+firstKey) + " = " + b.grammar.Wrap(curTable+"."+lk) + ")"
+			default:
+				nfk, npk := relationKeys(nrel, curTable)
+				cond = "exists (select * from " + b.grammar.WrapTable(nextTable) +
+					" where " + b.grammar.Wrap(nextTable+"."+nfk) +
+					" = " + b.grammar.Wrap(curTable+"."+npk) + ")"
+			}
 			extraConds = append(extraConds, cond)
-			curRel, curTable = nrel, nextTable
+			curTable = nextTable
 		}
-		_ = curRel
 	}
 
 	// 别名（count 无约束无嵌套时保持 name_count 的既有金标准形态）
@@ -754,69 +815,93 @@ func (b *Builder) withAggregate(name string, rel Relation, function, column stri
 	return b
 }
 
-// aggregateSubQuery 编译聚合子查询主体（含 morph type 过滤）。
-// TODO(model.go)：BelongsToMany/HasManyThrough 形态的聚合暂未支持，
-// 需经 pivot/中间表 join，待 builder 暴露子查询编译入口后补齐。
+// aggregateSubQuery 编译聚合子查询主体（含 morph type 过滤与全形态关联）。
 func (b *Builder) aggregateSubQuery(rel Relation, function, column string, constraints []func(*Builder)) (string, []any) {
 	table := relationTargetTable(rel)
 	parentTable := fmtString(b.Query.From)
-	cond := ""
-	constrain := func(extra string) { cond = extra }
-	var bindings []any
+	// 子查询统一经模型建器编译：关联条件、约束闭包（全 where 类型）、
+	// 软删 scope 都走 CompileSelect 通路——旧实现手拼 SQL，BelongsToMany/
+	// HasManyThrough/MorphToMany 形态回退 ("id","id") 生成错误关联、约束只认
+	// Basic、morphKey 字符串拼接未参数化
+	sub := relationBuilderWithModel(b.Connection, b.grammar, rel)
+	parentKey := b.keyName()
 
 	switch r := rel.(type) {
 	case MorphMany, MorphOne:
-		var typeColumn, idColumn string
-		morphKey := ""
+		var typeColumn, idColumn, morphKeyExplicit string
 		if m, ok := rel.(MorphMany); ok {
 			typeColumn, idColumn = morphColumns(m.MorphName, m.TypeColumn, m.IDColumn)
-			morphKey = m.MorphKey
+			morphKeyExplicit = m.MorphKey
 		} else {
 			m := rel.(MorphOne)
 			typeColumn, idColumn = morphColumns(m.MorphName, m.TypeColumn, m.IDColumn)
-			morphKey = m.MorphKey
+			morphKeyExplicit = m.MorphKey
 		}
-		if morphKey == "" {
-			morphKey = parentTable
+		sub.WhereColumn(table+"."+idColumn, "=", parentTable+"."+parentKey)
+		// morphKey 与写侧/eager 同口径（显式 > morph map 别名 > 父表名），参数化绑定
+		sub.Where(typeColumn, "=", morphKeyForTable(morphKeyExplicit, parentTable))
+	case BelongsToMany:
+		pivot, fpk, rpk, rk := btmResolvedKeys(r, parentTable)
+		sub.Join(pivot, pivot+"."+rpk, "=", table+"."+rk)
+		sub.WhereColumn(pivot+"."+fpk, "=", parentTable+"."+parentKey)
+		// pivot 范围与读取口径一致（WithPivotValue 参与聚合过滤）
+		for _, col := range r.pivotValueKeys() {
+			sub.Where(pivot+"."+col, "=", r.pivotValues[col])
 		}
-		base := b.grammar.Wrap(table+"."+idColumn) + " = " + b.grammar.Wrap(parentTable+".id") +
-			" and " + b.grammar.Wrap(typeColumn) + " = '" + morphKey + "'"
-		constrain(base)
-		_ = r
+	case MorphToMany:
+		pivot, fpk, rpk, rk, typeColumn, morphKeyExplicit := mtmResolvedKeys(r, parentTable, "")
+		sub.Join(pivot, pivot+"."+rpk, "=", table+"."+rk)
+		sub.WhereColumn(pivot+"."+fpk, "=", parentTable+"."+parentKey)
+		sub.Where(typeColumn, "=", morphKeyForTable(morphKeyExplicit, parentTable))
+	case HasManyThrough, HasOneThrough:
+		hmt, isHmt := rel.(HasManyThrough)
+		if !isHmt {
+			hmt = rel.(HasOneThrough).asHasManyThrough()
+		}
+		throughTable := inspectModel(hmt.ThroughModel).table
+		lk := hmt.LocalKey
+		if lk == "" {
+			lk = "id"
+		}
+		slk := hmt.SecondLocalKey
+		if slk == "" {
+			slk = "id"
+		}
+		firstKey := hmt.FirstKey
+		if firstKey == "" {
+			firstKey = stripPlural(parentTable) + "_id"
+		}
+		secondKey := hmt.SecondKey
+		if secondKey == "" {
+			secondKey = stripPlural(throughTable) + "_id"
+		}
+		sub.Join(throughTable, throughTable+"."+slk, "=", table+"."+secondKey)
+		sub.WhereColumn(throughTable+"."+firstKey, "=", parentTable+"."+lk)
+		// 中间表软删过滤（对齐 join 构造的 SoftDeletes 检测；
+		// WithTrashedParents 时跳过，与预加载口径一致）
+		if !hmt.WithTrashedParents {
+			if mi := inspectModel(hmt.ThroughModel); mi.softDeletes && mi.deletedAtField != "" {
+				sub.WhereNull(throughTable + "." + mi.deletedAtField)
+			}
+		}
 	default:
-		fk, parentKey := relationKeys(rel, parentTable)
-		base := b.grammar.Wrap(table+"."+fk) + " = " + b.grammar.Wrap(parentTable+"."+parentKey)
-		constrain(base)
+		fk, pk := relationKeys(rel, parentTable)
+		sub.WhereColumn(table+"."+fk, "=", parentTable+"."+pk)
 	}
 
 	for _, c := range constraints {
-		if c == nil {
-			continue
-		}
-		nb := NewBuilder(b.Connection, b.grammar).From(table)
-		c(nb)
-		// 约束闭包的 wheres 以原生 SQL 拼进子查询（golden 场景覆盖简单等值条件）
-		for _, w := range nb.Query.Wheres {
-			if w.Type == "Basic" && w.Column != nil {
-				col := fmtString(w.Column)
-				op := w.Operator
-				if op == "" {
-					op = "="
-				}
-				cond += " and " + b.grammar.Wrap(col) + " " + op + " ?"
-				bindings = append(bindings, w.Value)
-			}
+		if c != nil {
+			c(sub)
 		}
 	}
+	// 软删 scope 物化进子查询（CompileSelect 手动编译，不经过 Get）
+	sub.applyModelScopes()
 
 	if function == "exists" {
-		return "select exists(select * from " + b.grammar.WrapTable(table) + " where " + cond + ")", bindings
+		return "select exists(" + b.grammar.CompileSelect(sub.Query) + ")", sub.GetBindings()
 	}
-	colExpr := b.grammar.Wrap(column)
-	if column == "*" {
-		colExpr = "*"
-	}
-	return "select " + function + "(" + colExpr + ") from " + b.grammar.WrapTable(table) + " where " + cond, bindings
+	sub.SetAggregate(function, []interface{}{column})
+	return b.grammar.CompileSelect(sub.Query), sub.GetBindings()
 }
 
 // relationTargetTable 目标模型表名。
@@ -824,8 +909,41 @@ func relationTargetTable(rel Relation) string {
 	return inspectModel(rel.targetModel()).table
 }
 
+// relationTargetBuilder 构造带模型元数据的目标表查询（软删等全局 scope 随
+// 执行生效，对齐目标模型 newQuery() 的口径）；MorphTo 等无目标模型时退回
+// 裸表建器。旧实现所有关系查询用裸 NewBuilder().From(table)，关联模型的
+// 软删 scope 系统性缺位（软删关联行泄漏）。
+func relationTargetBuilder(c *Connection, rel Relation) *Builder {
+	return relationBuilderWithModel(c, nil, rel)
+}
+
+// throughMiddleRel 中间模型的关系壳：复用 relationBuilderWithModel 的
+// modelInfo 挂载，使 through 子查询应用中间模型的软删 scope。
+type throughMiddleRel struct{ model any }
+
+func (r throughMiddleRel) kind() string     { return "throughMiddle" }
+func (r throughMiddleRel) targetModel() any { return r.model }
+func (r throughMiddleRel) GetResults(any, *Connection, ...func(*Builder)) ([]any, error) {
+	return nil, nil
+}
+
+// relationBuilderWithModel 同上，支持 golden 测试等无 Connection 场景
+// （g 可为已有 grammar；modelInfo 直接挂载，软删 scope 依旧生效）。
+func relationBuilderWithModel(conn *Connection, g grammar.Grammar, rel Relation) *Builder {
+	if conn != nil && g == nil {
+		g = conn.GetQueryGrammar()
+	}
+	nb := NewBuilder(conn, g)
+	if m := rel.targetModel(); m != nil {
+		info := inspectModel(m)
+		nb.modelInfo = info
+		return nb.From(info.table)
+	}
+	return nb.From(relationTargetTable(rel))
+}
+
 // relationKeys 归一关系键：返回 (目标表列, 父表列)。
-// BelongsTo：目标列 = OwnerKey(id)，父列 = ForeignKey(目标表单数_id，Laravel 约定)；
+// BelongsTo：目标列 = OwnerKey(id)，父列 = ForeignKey(目标表单数_id，约定命名)；
 // HasOne/HasMany：目标列 = ForeignKey(父表单数_id)，父列 = LocalKey(id)。
 func relationKeys(rel Relation, parentTable string) (string, string) {
 	switch r := rel.(type) {
@@ -864,40 +982,47 @@ func relationKeys(rel Relation, parentTable string) (string, string) {
 }
 
 // loadRelations 在 Get 之后执行预加载并填充父结构体。
-func (b *Builder) loadRelations(dest interface{}) {
+func (b *Builder) loadRelations(dest interface{}) error {
+	var firstErr error
+	recordErr := func(err error) {
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
 	if len(b.relations) == 0 {
-		return
+		return nil
 	}
 	rv := reflect.Indirect(reflect.ValueOf(dest))
 	if rv.Kind() != reflect.Slice {
-		return
+		return nil
 	}
 
 	parentTable := fmtString(b.Query.From)
 	for _, pr := range b.relations {
 		switch r := pr.rel.(type) {
 		case BelongsToMany:
-			b.loadBelongsToMany(rv, pr, parentTable)
+			recordErr(b.loadBelongsToMany(rv, pr, parentTable))
 		case HasManyThrough:
-			b.loadHasManyThrough(rv, pr, parentTable)
+			recordErr(b.loadHasManyThrough(rv, pr, parentTable))
 		case HasOneThrough:
-			b.loadHasOneThrough(rv, pr, parentTable)
+			recordErr(b.loadHasOneThrough(rv, pr, parentTable))
 		case MorphMany:
-			b.loadMorph(rv, pr, parentTable, false)
+			recordErr(b.loadMorph(rv, pr, parentTable, false))
 		case MorphOne:
-			b.loadMorph(rv, pr, parentTable, true)
+			recordErr(b.loadMorph(rv, pr, parentTable, true))
 		case MorphTo:
-			b.loadMorphTo(rv, pr)
+			recordErr(b.loadMorphTo(rv, pr))
 		case MorphToMany:
-			b.loadMorphToMany(rv, pr, parentTable)
+			recordErr(b.loadMorphToMany(rv, pr, parentTable))
 		default:
 			_ = r
-			b.loadRelation(rv, pr)
+			recordErr(b.loadRelation(rv, pr))
 		}
 	}
+	return firstErr
 }
 
-func (b *Builder) loadRelation(parents reflect.Value, pr pendingRelation) {
+func (b *Builder) loadRelation(parents reflect.Value, pr pendingRelation) error {
 	rel := pr.rel
 	kind := rel.kind()
 	targetType := reflect.TypeOf(rel.targetModel())
@@ -906,7 +1031,7 @@ func (b *Builder) loadRelation(parents reflect.Value, pr pendingRelation) {
 	}
 	targetTable := relationTargetTable(rel)
 
-	// 收集父表键值（外键默认取父查询表名单数 + _id，对齐 Laravel 约定）
+	// 收集父表键值（外键默认取父查询表名单数 + _id）
 	parentTypeName := fmtString(b.Query.From)
 	if parentTypeName == "" {
 		parentTypeName = "parent"
@@ -927,18 +1052,18 @@ func (b *Builder) loadRelation(parents reflect.Value, pr pendingRelation) {
 		}
 	}
 	if len(keys) == 0 {
-		return
+		return nil
 	}
 
-	// 查询目标表
-	nb := NewBuilder(b.Connection, b.grammar).From(targetTable)
+	// 查询目标表（模型建器：关联模型的软删等全局 scope 生效）
+	nb := relationBuilderWithModel(b.Connection, b.grammar, rel)
 	nb.WhereIn(fk, keys)
 	for _, c := range pr.constraints {
 		c(nb)
 	}
 	// one-of-many（latestOfMany/oldestOfMany/ofMany）：极值列 + 主键
 	// tie-break 排序 + limit 1，经下方 GroupLimit 转换编译为
-	// row_number() over (partition by fk order by col, pk) <= 1——与 Laravel
+	// row_number() over (partition by fk order by col, pk) <= 1——与
 	// CanBeOneOfMany 的 row_number 语义一致
 	if om, ok := rel.(oneOfManyRel); ok {
 		if orders, ok2 := ofManyOrders(om); ok2 && nb.Query.Limit == nil {
@@ -948,7 +1073,7 @@ func (b *Builder) loadRelation(parents reflect.Value, pr pendingRelation) {
 			nb.Limit(1)
 		}
 	}
-	// 约束/显式设置的 limit 自动接入 GroupLimit（row_number 分组限额，对齐 Laravel 预加载 limit）
+	// 约束/显式设置的 limit 自动接入 GroupLimit（row_number 分组限额，对齐预加载 limit 语义）
 	if pr.limit != nil && nb.Query.Limit == nil {
 		v := uint64(*pr.limit)
 		nb.Limit(v)
@@ -959,7 +1084,7 @@ func (b *Builder) loadRelation(parents reflect.Value, pr pendingRelation) {
 	}
 	related := reflect.New(reflect.SliceOf(targetType))
 	if err := nb.Get(related.Interface()); err != nil {
-		return
+		return err
 	}
 
 	// 分组：key → 行集合
@@ -1018,6 +1143,7 @@ func (b *Builder) loadRelation(parents reflect.Value, pr pendingRelation) {
 		}
 	}
 	_ = kind
+	return nil
 }
 
 // keyValue 取结构体（或其指针）中指定列的值。
@@ -1099,12 +1225,12 @@ type BelongsToMany struct {
 	RelatedKey      string // 目标表主键（id）
 
 	// pivot 读侧选项（对应 InteractsWithPivotTable / BelongsToMany 链式配置）
-	PivotColumns    []string        // WithPivot：select 附加的 pivot 列（pivot_ 前缀别名）
-	PivotTimestamps bool            // WithTimestamps：pivot 表 created_at/updated_at
-	pivotWheres     []pivotWhere    // WherePivot 族（basic/in/notIn/between/.../null）
-	pivotOrders     []pivotOrder    // OrderByPivot
-	pivotValues     map[string]any  // WithPivotValue：attach/sync 每行附加的固定值
-	pivotValuesSet  bool            // 区分“未设置”与空 map（对应 Laravel null | array）
+	PivotColumns    []string       // WithPivot：select 附加的 pivot 列（pivot_ 前缀别名）
+	PivotTimestamps bool           // WithTimestamps：pivot 表 created_at/updated_at
+	pivotWheres     []pivotWhere   // WherePivot 族（basic/in/notIn/between/.../null）
+	pivotOrders     []pivotOrder   // OrderByPivot
+	pivotValues     map[string]any // WithPivotValue：attach/sync 每行附加的固定值
+	pivotValuesSet  bool           // 区分“未设置”与空 map（对应 null | array 两态）
 }
 
 // pivotWhere pivot 表 where 条件（对应 wherePivot* 全族）。
@@ -1148,6 +1274,14 @@ func (r BelongsToMany) WithPivotValue(column string, value any) BelongsToMany {
 	}
 	r.pivotValues[column] = value
 	return r
+}
+
+// pivotValueKeys WithPivotValue 固定值的确定性键序（join 查询条件顺序稳定）。
+func (r BelongsToMany) pivotValueKeys() []string {
+	if !r.pivotValuesSet || len(r.pivotValues) == 0 {
+		return nil
+	}
+	return sortedColumnNames(r.pivotValues)
 }
 
 // withPivotValueAttrs 归一 attach 行属性：固定值打底，显式 attrs 覆盖。
@@ -1265,11 +1399,61 @@ func (r BelongsToMany) GetResults(parent any, c *Connection, constraints ...func
 		return nil, nil
 	}
 	q := buildBelongsToManyQuery(c.GetQueryGrammar(), r, parentTable, []any{v})
+	// 约束闭包/limit/目标模型软删 scope 生效（旧实现在此路径被静默丢弃）
+	if frag, tail, fbinds, ok := (&Builder{Connection: c, grammar: c.GetQueryGrammar(), Bindings: getDefaultBindings()}).joinConstraintFragment(r, constraints, nil); ok {
+		q.sql += " and (" + frag + ")" + tail
+		q.bindings = append(q.bindings, fbinds...)
+	}
 	rows, err := c.SelectMaps(q.sql, q.bindings)
 	if err != nil {
 		return nil, err
 	}
 	return modelAnySlice(rowsToModels(rows, reflect.TypeOf(r.RelatedModel))), nil
+}
+
+// joinConstraintFragment 把约束闭包 / 目标模型软删 scope / limit 编译为可
+// 拼接到手拼 join 查询的 SQL 片段（BTM/MTM/through 的预加载与单父查询此前
+// 静默丢弃约束闭包与目标模型软删过滤）。返回 (where 片段, 尾片段(order/limit),
+// 绑定, 是否有附加条件)。
+func (b *Builder) joinConstraintFragment(rel Relation, constraints []func(*Builder), limit *int64) (string, string, []any, bool) {
+	var info *modelInfo
+	if m := rel.targetModel(); m != nil {
+		info = inspectModel(m)
+	}
+	needScope := info != nil && info.softDeletes && info.deletedAtField != ""
+	if len(constraints) == 0 && limit == nil && !needScope {
+		return "", "", nil, false
+	}
+	sb := relationBuilderWithModel(b.Connection, b.grammar, rel)
+	for _, cons := range constraints {
+		if cons != nil {
+			cons(sb)
+		}
+	}
+	if limit != nil && sb.Query.Limit == nil {
+		sb.Limit(uint64(*limit))
+	}
+	sb.applyModelScopes()
+	// 闭包内 union/group/having/GroupLimit/无 limit 的 offset 无法安全切出
+	// where 片段——显式报错优于产出非法 SQL
+	if len(sb.Query.Unions) > 0 || len(sb.Query.Groups) > 0 || len(sb.Query.Havings) > 0 ||
+		sb.Query.GroupLimit != nil || (sb.Query.Offset != nil && sb.Query.Limit == nil) {
+		panic(ErrInvalid{Msg: "relation constraints do not support union/group/having/groupLimit/offset"})
+	}
+	sql2 := sb.ToSql()
+	i := strings.Index(sql2, " where ")
+	if i < 0 {
+		return "", "", nil, false
+	}
+	rest := sql2[i+len(" where "):]
+	cut := len(rest)
+	if j := strings.Index(rest, " order by "); j >= 0 && j < cut {
+		cut = j
+	}
+	if k := strings.Index(rest, " limit "); k >= 0 && k < cut {
+		cut = k
+	}
+	return rest[:cut], rest[cut:], sb.GetBindings(), true
 }
 
 // btmJoinQuery belongsToMany join 查询构造结果。
@@ -1321,7 +1505,7 @@ func buildBelongsToManyQuery(g grammar.Grammar, rel BelongsToMany, parentTable s
 				op = "not in"
 			}
 			if len(w.values) == 0 {
-				// 空集合：in 恒假、not in 恒真（对齐 Laravel whereIn 空集语义）
+				// 空集合：in 恒假、not in 恒真（对齐 whereIn 空集语义）
 				conds = append(conds, map[bool]string{true: "1 = 0", false: "1 = 1"}[kind == "in"])
 				continue
 			}
@@ -1343,13 +1527,22 @@ func buildBelongsToManyQuery(g grammar.Grammar, rel BelongsToMany, parentTable s
 			bindings = append(bindings, w.value)
 		}
 	}
+	// WithPivotValue 固定值参与读取范围（对齐 withPivotValue 语义：
+	// 读取查询与 sync/detach 范围都受固定值约束；旧实现只写不读）
+	pivotValueKeys := rel.pivotValueKeys()
+	for _, col := range pivotValueKeys {
+		conds = append(conds, wrappedPivot+"."+g.Wrap(col)+" = ?")
+		bindings = append(bindings, rel.pivotValues[col])
+	}
+
 	where := conds[0]
 	for i, cond := range conds {
 		if i == 0 {
 			continue
 		}
 		boolWord := "and"
-		if w := rel.pivotWheres[i-1]; w.or {
+		// 布尔词只存在于 pivotWheres 段；WithPivotValue 固定值条件恒为 and
+		if i-1 < len(rel.pivotWheres) && rel.pivotWheres[i-1].or {
 			boolWord = "or"
 		}
 		where += " " + boolWord + " " + cond
@@ -1372,10 +1565,10 @@ func buildBelongsToManyQuery(g grammar.Grammar, rel BelongsToMany, parentTable s
 }
 
 // loadBelongsToMany 经 pivot 表预加载。
-func (b *Builder) loadBelongsToMany(parents reflect.Value, pr pendingRelation, parentTable string) {
+func (b *Builder) loadBelongsToMany(parents reflect.Value, pr pendingRelation, parentTable string) error {
 	rel, ok := pr.rel.(BelongsToMany)
 	if !ok {
-		return
+		return nil
 	}
 
 	keys := make([]interface{}, 0, parents.Len())
@@ -1392,13 +1585,23 @@ func (b *Builder) loadBelongsToMany(parents reflect.Value, pr pendingRelation, p
 		}
 	}
 	if len(keys) == 0 {
-		return
+		return nil
 	}
 
 	q := buildBelongsToManyQuery(b.grammar, rel, parentTable, keys)
+	if pr.limit != nil {
+		// join 形态无 per-parent 分组限额语义：普通 limit 会先到先得、
+		// 后面的父拿 0 行——显式报错优于静默错果
+		return ErrInvalid{Msg: "WithLimit is not supported for belongsToMany eager loading (no per-parent grouping on pivot joins)"}
+	}
+	// 约束闭包/目标模型软删 scope 生效（旧实现在 BTM 预加载路径被静默丢弃）
+	if frag, tail, fbinds, ok := b.joinConstraintFragment(rel, pr.constraints, nil); ok {
+		q.sql += " and (" + frag + ")" + tail
+		q.bindings = append(q.bindings, fbinds...)
+	}
 	rows, err := b.Connection.SelectMaps(q.sql, q.bindings)
 	if err != nil {
-		return
+		return err
 	}
 
 	// 按父键分组并填充目标结构体
@@ -1440,6 +1643,60 @@ func (b *Builder) loadBelongsToMany(parents reflect.Value, pr pendingRelation, p
 			}
 		}
 		field.Set(out)
+	}
+	// pivot 列回填（WithPivot 声明的 `torm:"pivot:roles"` 载体字段）
+	fillPivotFields(parents, pr.name, rows, pivotCol, "id")
+	return nil
+}
+
+// fillPivotFields BTM/MTM 预加载后把 pivot_ 前缀列回填进父结构体的
+// `torm:"pivot:<关系名>"` 字段（map[string]any，键不带前缀；充当
+// pivot 属性载体——WithPivot 列此前查回后无处可取）。
+func fillPivotFields(parents reflect.Value, relName string, rows []map[string]any, groupCol string, parentKeyCol string) {
+	for i := 0; i < parents.Len(); i++ {
+		parent := parents.Index(i)
+		if parent.Kind() == reflect.Ptr {
+			parent = parent.Elem()
+		}
+		if !parent.CanAddr() {
+			continue
+		}
+		schema, err := NewSchema(parent.Addr().Interface())
+		if err != nil {
+			continue
+		}
+		var target *Field
+		for _, f := range schema.Fields {
+			v, ok := f.GetAttr("PIVOT")
+			if !ok {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(v), relName) && f.Value.Kind() == reflect.Map {
+				target = f
+			}
+		}
+		if target == nil {
+			continue
+		}
+		// 分组键与关联装配一致（父模型主键；旧实现误用 pivot 外键列在
+		// 父模型上找值，载体字段恒不填充）
+		want := keyValue(parent, parentKeyCol)
+		if want == nil {
+			continue
+		}
+		m := reflect.MakeMap(target.Value.Type())
+		for _, row := range rows {
+			pv, has := row[groupCol]
+			if !has || fmt.Sprint(pv) != fmt.Sprint(want) {
+				continue
+			}
+			for k, val := range row {
+				if strings.HasPrefix(k, "pivot_") {
+					m.SetMapIndex(reflect.ValueOf(strings.TrimPrefix(k, "pivot_")), reflect.ValueOf(val))
+				}
+			}
+		}
+		target.Value.Set(m)
 	}
 }
 
@@ -1501,7 +1758,7 @@ func setSchemaFieldsFromMap(model any, row map[string]any) {
 	}
 }
 
-// HasManyThrough 远程一对多（经中间表，Laravel hasManyThrough）。
+// HasManyThrough 远程一对多（经中间表）。
 // 例：User HasManyThrough Comment，经 Post：
 //
 //	ThroughModel: Post{}; FirstKey: "user_id"(posts 上的父外键);
@@ -1513,7 +1770,7 @@ type HasManyThrough struct {
 	LocalKey       string
 	SecondLocalKey string
 	TargetModel    any
-	// WithTrashedParents 跳过中间表软删过滤（对应 Laravel withTrashedParents；
+	// WithTrashedParents 跳过中间表软删过滤（对应 withTrashedParents 语义；
 	// 默认：中间模型有 deleted_at 字段时 join 条件追加 deleted_at is null）
 	WithTrashedParents bool
 }
@@ -1521,7 +1778,7 @@ type HasManyThrough struct {
 func (r HasManyThrough) kind() string     { return "hasManyThrough" }
 func (r HasManyThrough) targetModel() any { return r.TargetModel }
 
-// WithTrashedParents 跳过中间模型软删过滤（对应 Laravel 同名方法）。
+// WithTrashedParents 跳过中间模型软删过滤。
 func (r HasManyThrough) WithTrashed() HasManyThrough {
 	r.WithTrashedParents = true
 	return r
@@ -1539,6 +1796,11 @@ func (r HasManyThrough) GetResults(parent any, c *Connection, constraints ...fun
 		return nil, nil
 	}
 	q := buildHasManyThroughQuery(c.GetQueryGrammar(), r, parentTable, []any{v})
+	// 约束闭包/目标模型软删 scope 生效（旧实现在此路径被静默丢弃）
+	if frag, tail, fbinds, ok := (&Builder{Connection: c, grammar: c.GetQueryGrammar(), Bindings: getDefaultBindings()}).joinConstraintFragment(r, constraints, nil); ok {
+		q.sql += " and (" + frag + ")" + tail
+		q.bindings = append(q.bindings, fbinds...)
+	}
 	rows, err := c.SelectMaps(q.sql, q.bindings)
 	if err != nil {
 		return nil, err
@@ -1580,7 +1842,7 @@ func buildHasManyThroughQuery(g grammar.Grammar, rel HasManyThrough, parentTable
 
 	wrappedTarget := g.WrapTable(targetTable)
 	wrappedThrough := g.WrapTable(throughTable)
-	throughKeyAlias := "laravel_through_key"
+	throughKeyAlias := "through_key"
 
 	sql := "select " + wrappedTarget + ".*, " + wrappedThrough + "." + g.Wrap(firstKey) +
 		" as " + g.Wrap(throughKeyAlias) +
@@ -1591,7 +1853,7 @@ func buildHasManyThroughQuery(g grammar.Grammar, rel HasManyThrough, parentTable
 		strings.Repeat("?, ", len(keys)-1) + "?)"
 	bindings := append([]any{}, keys...)
 
-	// 中间模型软删过滤（对齐 Laravel HasOneOrManyThrough::performJoin 的
+	// 中间模型软删过滤（对齐中间表 join 构造时的
 	// SoftDeletes 检测）
 	if throughInfo.softDeletes && !rel.WithTrashedParents {
 		sql += " and " + wrappedThrough + "." + g.Wrap(throughInfo.deletedAtField) + " is null"
@@ -1600,10 +1862,10 @@ func buildHasManyThroughQuery(g grammar.Grammar, rel HasManyThrough, parentTable
 }
 
 // loadHasManyThrough 远程一对多预加载。
-func (b *Builder) loadHasManyThrough(parents reflect.Value, pr pendingRelation, parentTable string) {
+func (b *Builder) loadHasManyThrough(parents reflect.Value, pr pendingRelation, parentTable string) error {
 	rel, ok := pr.rel.(HasManyThrough)
 	if !ok {
-		return
+		return nil
 	}
 
 	lk := rel.LocalKey
@@ -1625,13 +1887,13 @@ func (b *Builder) loadHasManyThrough(parents reflect.Value, pr pendingRelation, 
 		}
 	}
 	if len(keys) == 0 {
-		return
+		return nil
 	}
 
 	q := buildHasManyThroughQuery(b.grammar, rel, parentTable, keys)
 	rows, err := b.Connection.SelectMaps(q.sql, q.bindings)
 	if err != nil {
-		return
+		return err
 	}
 
 	targetType := reflect.TypeOf(rel.TargetModel)
@@ -1673,10 +1935,11 @@ func (b *Builder) loadHasManyThrough(parents reflect.Value, pr pendingRelation, 
 		}
 		field.Set(out)
 	}
+	return nil
 }
 
-// HasOneThrough 远程一对一（对应 Laravel HasOneThrough，HasOneOrManyThrough
-// 子类）：键约定与 HasManyThrough 相同，仅取首条结果。
+// HasOneThrough 远程一对一（HasManyThrough 的
+// 单行变体）：键约定与 HasManyThrough 相同，仅取首条结果。
 // 例：Mechanic HasOneThrough CarOwner（经 Car）：
 //
 //	ThroughModel: Car{}; FirstKey: "mechanic_id"(cars 上的父外键);
@@ -1695,7 +1958,7 @@ type HasOneThrough struct {
 func (r HasOneThrough) kind() string     { return "hasOneThrough" }
 func (r HasOneThrough) targetModel() any { return r.TargetModel }
 
-// WithTrashed 跳过中间模型软删过滤（对应 Laravel withTrashed）。
+// WithTrashed 跳过中间模型软删过滤。
 func (r HasOneThrough) WithTrashed() HasOneThrough {
 	r.WithTrashedParents = true
 	return r
@@ -1741,10 +2004,10 @@ func (r HasOneThrough) GetResults(parent any, c *Connection, constraints ...func
 // 查询，按 throughKey 分组后每组取首行回填单值字段（对应 HasOneThrough::match
 // 的 matchOne 语义）。约束闭包经 join 后置 where 形式不支持（与 HasManyThrough
 // 预加载一致，join 为手拼 SQL）。
-func (b *Builder) loadHasOneThrough(parents reflect.Value, pr pendingRelation, parentTable string) {
+func (b *Builder) loadHasOneThrough(parents reflect.Value, pr pendingRelation, parentTable string) error {
 	rel, ok := pr.rel.(HasOneThrough)
 	if !ok {
-		return
+		return nil
 	}
 	hmt := rel.asHasManyThrough()
 
@@ -1767,13 +2030,13 @@ func (b *Builder) loadHasOneThrough(parents reflect.Value, pr pendingRelation, p
 		}
 	}
 	if len(keys) == 0 {
-		return
+		return nil
 	}
 
 	q := buildHasManyThroughQuery(b.grammar, hmt, parentTable, keys)
 	rows, err := b.Connection.SelectMaps(q.sql, q.bindings)
 	if err != nil {
-		return
+		return err
 	}
 
 	targetType := reflect.TypeOf(hmt.TargetModel)
@@ -1815,9 +2078,10 @@ func (b *Builder) loadHasOneThrough(parents reflect.Value, pr pendingRelation, p
 			break // 每组只取首条（对应 HasOneThrough 语义）
 		}
 	}
+	return nil
 }
 
-// ---- 惰性加载（对应 Laravel $model->load('relation')）----
+// ---- 惰性加载 ----
 
 var (
 	loadedRelationMu sync.RWMutex
@@ -1826,7 +2090,7 @@ var (
 	loadedRelations = map[any]map[string][]any{}
 )
 
-// SetLoadedRelation 把关系结果缓存到模型（对应 Laravel relation 属性赋值）。
+// SetLoadedRelation 把关系结果缓存到模型。
 func SetLoadedRelation(model any, name string, models []any) {
 	loadedRelationMu.Lock()
 	defer loadedRelationMu.Unlock()
@@ -1850,7 +2114,7 @@ func LoadedRelation(model any, name string) ([]any, bool) {
 	return models, ok
 }
 
-// RelationLoaded 关系是否已加载（对应 Laravel relationLoaded）。
+// RelationLoaded 关系是否已加载。
 func RelationLoaded(model any, name string) bool {
 	_, ok := LoadedRelation(model, name)
 	return ok
@@ -1863,7 +2127,7 @@ func ForgetLoadedRelations(model any) {
 	delete(loadedRelations, model)
 }
 
-// Load 显式触发关系加载并缓存到模型（对应 Laravel $model->load(name)）：
+// Load 显式触发关系加载并缓存到模型：
 // 结果经 SetLoadedRelation 缓存；模型存在同名关系字段（StudlyCase）时同步回填。
 func (c *Connection) Load(model any, name string, rel Relation, constraints ...func(*Builder)) error {
 	results, err := rel.GetResults(model, c, constraints...)
@@ -1878,8 +2142,8 @@ func (c *Connection) Load(model any, name string, rel Relation, constraints ...f
 	return nil
 }
 
-// LoadMissing 惰性加载已加载则跳过的关系（对应 Laravel Model.php loadMissing：
-// relationLoaded 时直接返回，不发关联查询）。
+// LoadMissing 惰性加载已加载则跳过的关系（relationLoaded 时直接返回，
+// 不发关联查询）。
 func (c *Connection) LoadMissing(model any, name string, rel Relation, constraints ...func(*Builder)) error {
 	if RelationLoaded(model, name) {
 		return nil
@@ -1953,7 +2217,7 @@ func fillLoadedRelationField(model any, name string, rel Relation, results []any
 // ---- touches 级联（对应 HasRelationships.php:978-1002 touchOwners）----
 
 // modelTouchesRelations 解析模型 `torm:"touches=rel1,rel2"` tag 声明的所属
-// 关系名（对应 Laravel $touches 数组属性；tag 可挂任意字段）。
+// 关系名（对应 touches 数组声明；tag 可挂任意字段）。
 func modelTouchesRelations(model any) []string {
 	schema, err := NewSchema(model)
 	if err != nil {
@@ -1983,8 +2247,8 @@ func modelTouchesRelations(model any) []string {
 // （LoadedRelation）时逐个 touch 已加载的父模型实例并递归其 touches；
 // 否则按 belongsTo 键约定反查：父表 = pluralize(关系名)，外键 = 关系名_id，
 // 执行 update <parent> set updated_at = now where id = <fk 值>。
-// 注意：Save/Delete 生命周期不会自动调用（模型保存入口在 model.go，本迭代
-// 不允许改动），需在 save/delete 后显式调用。
+// Save/Delete/软删生命周期自动触发（model.go 的 Save/DeleteModel/Restore
+// 在成功写库后调用 TouchOwners）。
 func (c *Connection) TouchOwners(model any) error {
 	return c.touchOwners(model, map[uintptr]bool{})
 }
@@ -2007,7 +2271,7 @@ func (c *Connection) touchOwners(model any, visiting map[uintptr]bool) error {
 	g := c.GetQueryGrammar()
 	for _, name := range names {
 		if loaded, ok := LoadedRelation(model, name); ok && len(loaded) > 0 {
-			// 已加载：touch 父模型实例并递归其 touches（对齐 Laravel 递归语义）
+			// 已加载：touch 父模型实例并递归其 touches
 			for _, p := range loaded {
 				if err := c.touch(p); err != nil {
 					return err
@@ -2025,7 +2289,14 @@ func (c *Connection) touchOwners(model any, visiting map[uintptr]bool) error {
 		if v == nil || utilsIsBlankValue(v) {
 			continue
 		}
-		sql := "update " + g.WrapTable(table) + " set " + g.Wrap("updated_at") + " = ? where " + g.Wrap("id") + " = ?"
+		// updated 列名取该表模型元数据（可能经 SetTimestampColumns/tag 改名）
+		updatedAtCol := "updated_at"
+		if m := MorphModelForAlias(name); m != nil {
+			if mi := inspectModel(m); mi.hasTimestamps && mi.updatedAtField != "" {
+				updatedAtCol = mi.updatedAtField
+			}
+		}
+		sql := "update " + g.WrapTable(table) + " set " + g.Wrap(updatedAtCol) + " = ? where " + g.Wrap("id") + " = ?"
 		if _, err := c.Update(sql, nowFunc(), v); err != nil {
 			return err
 		}
@@ -2033,7 +2304,7 @@ func (c *Connection) touchOwners(model any, visiting map[uintptr]bool) error {
 	return nil
 }
 
-// Touches 模型是否声明触碰指定关系（对应 Laravel touches($relation)）。
+// Touches 模型是否声明触碰指定关系。
 func Touches(model any, relation string) bool {
 	return containsString(modelTouchesRelations(model), relation)
 }
@@ -2134,7 +2405,7 @@ func (c *Connection) RelationSole(parent any, rel Relation, constraints ...func(
 }
 
 // ---- associate / dissociate（对应 BelongsTo.php:187-235、MorphTo.php:246-280）----
-// 均只写模型属性，不自动落库（对齐 Laravel）。
+// 均只写模型属性，不自动落库。
 
 // Associate 把 owner 的主键写入 parent 的外键列
 // （外键缺省 = singular(owner 表名)_id；不自动 save）。
@@ -2180,14 +2451,13 @@ func MorphToDissociate(parent any, morphName string) error {
 	return setModelAttribute(parent, typeColumn, nil)
 }
 
-// ---- 模型级 insert-or-ignore 保存（对应 Laravel Model.php:1432 saveOrIgnore）----
+// ---- 模型级 insert-or-ignore 保存 ----
 
-// SaveOrIgnore 未持久化模型以 insert or ignore 写入（对应 Laravel
-// saveOrIgnore → performInsertOrIgnore）：唯一约束冲突时静默跳过并返回
-// (false, nil)；已持久化（exists）模型返回错误（Laravel 抛 LogicException）。
+// SaveOrIgnore 未持久化模型以 insert or ignore 写入：唯一约束冲突时静默
+// 跳过并返回 (false, nil)；已持久化（exists）模型返回错误。
 // 成功时固时间戳、回填自增主键、置 exists/wasRecentlyCreated 并触发
 // creating/created/saved 事件（对齐 performInsertOrIgnore 生命周期）。
-// 差异说明：Laravel 的 uniqueBy 形参经 insertOrIgnoreReturning 下推到方言
+// 差异说明：uniqueBy 形参需经 insertOrIgnoreReturning 下推到方言
 // 编译，Go 侧编译钩子待接线（见待接线清单），故不提供该参数。
 func (c *Connection) SaveOrIgnore(model any) (bool, error) {
 	if Exists(model) {
@@ -2210,11 +2480,11 @@ func (c *Connection) SaveOrIgnore(model any) (bool, error) {
 	applyCreateTimestamps(model)
 	attributes := schema.Attributes()
 	if TimestampsIgnored() {
-		delete(attributes, "created_at")
-		delete(attributes, "updated_at")
+		delete(attributes, inspectModel(model).createdAtField)
+		delete(attributes, inspectModel(model).updatedAtField)
 	}
 	if len(attributes) == 0 {
-		// Laravel：空属性视为已保存（不写库、不置 exists）
+		// 空属性：视为已保存（不写库、不置 exists）
 		return true, nil
 	}
 	nb := c.newModelQuery(model)
@@ -2224,11 +2494,11 @@ func (c *Connection) SaveOrIgnore(model any) (bool, error) {
 		return false, err
 	}
 	if affected == 0 {
-		// 冲突被忽略：不回填、不置 exists（对应 Laravel 返回 false）
+		// 冲突被忽略：不回填、不置 exists（返回 false）
 		return false, nil
 	}
 	if schema.PrimaryField == nil || schema.PrimaryField.IsBlank {
-		// 自增回填（对应 Laravel incrementing 分支）；冲突场景 affected==0 已提前返回
+		// 自增主键回填；冲突场景 affected==0 已提前返回
 		_ = schema.SetId(lastID)
 	}
 	setExists(model, true, true)
@@ -2262,7 +2532,7 @@ func (c *Connection) RelationCreate(parent any, rel Relation, attributes map[str
 }
 
 // RelationSave 保存关联模型：先填外键（+morph type）再 Save
-// （无主键 → insert，有主键 → update 脏列；对齐 Laravel saveOnRelation）。
+// （无主键 → insert，有主键 → update 脏列）。
 func (c *Connection) RelationSave(parent any, rel Relation, related any) error {
 	if err := applyRelationForeignKeys(related, parent, rel); err != nil {
 		return err
@@ -2270,8 +2540,7 @@ func (c *Connection) RelationSave(parent any, rel Relation, related any) error {
 	return c.Save(related)
 }
 
-// RelationFirstOrCreate 按外键 + attributes 查找或创建关联模型
-// （对应 Laravel firstOrCreate）。
+// RelationFirstOrCreate 按外键 + attributes 查找或创建关联模型。
 func (c *Connection) RelationFirstOrCreate(parent any, rel Relation, attributes map[string]any, values ...map[string]any) (any, error) {
 	inst, err := newRelatedInstance(rel)
 	if err != nil {
@@ -2284,7 +2553,7 @@ func (c *Connection) RelationFirstOrCreate(parent any, rel Relation, attributes 
 	for k, v := range attributes {
 		merged[k] = v
 	}
-	// 外键/morph 列并入查找条件（对齐 Laravel 关系 firstOrCreate 语义）
+	// 外键/morph 列并入查找条件（关系版 firstOrCreate 语义）
 	for k, v := range relationForeignKeyAttributes(parent, rel) {
 		merged[k] = v
 	}
@@ -2294,8 +2563,7 @@ func (c *Connection) RelationFirstOrCreate(parent any, rel Relation, attributes 
 	return inst, nil
 }
 
-// RelationUpdateOrCreate 按外键 + attributes 查找并更新，或创建新关联模型
-// （对应 Laravel updateOrCreate）。
+// RelationUpdateOrCreate 按外键 + attributes 查找并更新，或创建新关联模型。
 func (c *Connection) RelationUpdateOrCreate(parent any, rel Relation, attributes, values map[string]any) (any, error) {
 	inst, err := newRelatedInstance(rel)
 	if err != nil {
@@ -2470,30 +2738,32 @@ func pivotResolvedKeys(parent any, rel BelongsToMany) (pivot, fpk, rpk, targetTa
 	return pivot, fpk, rpk, targetTable
 }
 
-// Attach 建立 pivot 关联（对应 attach）：逐对插入；pivotAttrs 为附加列值，
+// Attach 建立 pivot 关联（对应 attach；BelongsToMany / MorphToMany 均可）：
+// 单条多值 INSERT（每 100 行一批，规避 SQLite 变量上限与 SQLServer 1000 行
+// 限制）；pivotAttrs 为附加列值，WithPivotValue 固定值打底、显式 attrs 覆盖；
 // PivotTimestamps 时自动带 created_at/updated_at。parent 可为模型或其主键值。
-func (c *Connection) Attach(parent any, rel BelongsToMany, ids []any, pivotAttrs ...map[string]any) error {
-	pivot, fpk, rpk, _ := pivotResolvedKeys(parent, rel)
-	// WithPivotValue 固定值打底，显式 pivotAttrs 覆盖（对应 Laravel attach
-	// 每行 merge withPivotValues）
-	attrs := rel.withPivotValueAttrs(nil)
-	if len(pivotAttrs) > 0 {
-		attrs = rel.withPivotValueAttrs(pivotAttrs[0])
+func (c *Connection) Attach(parent any, rel PivotRelation, ids []any, pivotAttrs ...map[string]any) error {
+	if len(ids) == 0 {
+		return nil
 	}
-
-	cols := []string{fpk, rpk}
-	vals := []string{"?", "?"}
-	if rel.PivotTimestamps {
+	spec := rel.pivotWriteSpec(parent)
+	// WithPivotValue 固定值打底，显式 pivotAttrs 覆盖（attach
+	// 每行 merge withPivotValues）
+	attrs := spec.Attrs
+	if len(pivotAttrs) > 0 && len(pivotAttrs[0]) > 0 {
+		attrs = mergePivotAttrs(attrs, pivotAttrs[0])
+	}
+	if spec.Timestamps {
 		attrs = mergePivotAttrs(attrs, map[string]any{"created_at": nowFunc(), "updated_at": nowFunc()})
 	}
-	for k := range attrs {
-		cols = append(cols, k)
-		vals = append(vals, "?")
-	}
-	// map 迭代顺序不定 → 固定排序保证 SQL/绑定稳定
-	sort.Strings(cols[2:])
 
+	g := c.GetQueryGrammar()
+	cols := []string{spec.FPK, spec.RPK}
+	for _, k := range sortedColumnNames(attrs) {
+		cols = append(cols, k)
+	}
 	parentKey := modelKeyValue(parent)
+	batch := make([][]any, 0, len(ids))
 	for _, id := range ids {
 		// 每行新分配绑定切片（连接层可能保留引用，复用会串行污染）
 		args := make([]any, 0, len(cols))
@@ -2501,9 +2771,24 @@ func (c *Connection) Attach(parent any, rel BelongsToMany, ids []any, pivotAttrs
 		for _, col := range cols[2:] {
 			args = append(args, attrs[col])
 		}
-		sql := "insert into " + c.GetQueryGrammar().WrapTable(pivot) +
-			" (" + joinWrappedCols(c.GetQueryGrammar(), cols) + ") values (" + strings.Join(vals, ", ") + ")"
-		if _, _, err := c.Insert(sql, args...); err != nil {
+		batch = append(batch, args)
+	}
+	// 批量行数受占位符上限约束（SQLite 999 / SQLServer 2100）：
+	// chunk = min(100, 900/列数)，至少 1 行
+	chunkSize := 100
+	if n := 900 / len(cols); n < chunkSize {
+		chunkSize = n
+	}
+	if chunkSize < 1 {
+		chunkSize = 1
+	}
+	for start := 0; start < len(batch); start += chunkSize {
+		end := start + chunkSize
+		if end > len(batch) {
+			end = len(batch)
+		}
+		sql, binds := attachRowsSQL(g, spec, cols, batch[start:end])
+		if _, _, err := c.Insert(sql, binds...); err != nil {
 			return err
 		}
 	}
@@ -2511,20 +2796,25 @@ func (c *Connection) Attach(parent any, rel BelongsToMany, ids []any, pivotAttrs
 }
 
 // Detach 解除 pivot 关联（对应 detach）：ids 为空时解除全部，返回受影响行数。
-func (c *Connection) Detach(parent any, rel BelongsToMany, ids ...any) (int64, error) {
-	pivot, fpk, rpk, _ := pivotResolvedKeys(parent, rel)
+func (c *Connection) Detach(parent any, rel PivotRelation, ids ...any) (int64, error) {
+	spec := rel.pivotWriteSpec(parent)
 	g := c.GetQueryGrammar()
-	sql := "delete from " + g.WrapTable(pivot) + " where " + g.Wrap(fpk) + " = ?"
+	sql := "delete from " + g.WrapTable(spec.Pivot) + " where " + g.Wrap(spec.FPK) + " = ?"
 	args := []any{modelKeyValue(parent)}
+	// 类型列/wherePivot/固定值限定 sync 范围（morph 多态与 WithPivotValue）
+	if scope, binds := pivotScopeSQL(g, spec); scope != "" {
+		sql += scope
+		args = append(args, binds...)
+	}
 	if len(ids) > 0 {
-		sql += " and " + g.Wrap(rpk) + " in (" + strings.Repeat("?, ", len(ids)-1) + "?)"
+		sql += " and " + g.Wrap(spec.RPK) + " in (" + strings.Repeat("?, ", len(ids)-1) + "?)"
 		args = append(args, ids...)
 	}
 	affected, err := c.Delete(sql, args...)
 	return affected, err
 }
 
-// SyncResult sync 的返回（对应 Laravel ['attached'=>[], 'detached'=>[], 'updated'=>[]]）。
+// SyncResult sync 的返回（attached/detached/updated 三组）。
 type SyncResult struct {
 	Attached []any
 	Detached []any
@@ -2533,7 +2823,7 @@ type SyncResult struct {
 
 // Sync 全量同步 pivot（对应 sync）：附加缺失、解除多余、更新现存（带
 // pivotAttrs 时），返回 attached/detached/updated。
-func (c *Connection) Sync(parent any, rel BelongsToMany, ids []any, pivotAttrs ...map[string]any) (*SyncResult, error) {
+func (c *Connection) Sync(parent any, rel PivotRelation, ids []any, pivotAttrs ...map[string]any) (*SyncResult, error) {
 	res, err := c.syncPivot(parent, rel, ids, true, pivotAttrs...)
 	if err != nil {
 		return nil, err
@@ -2542,12 +2832,12 @@ func (c *Connection) Sync(parent any, rel BelongsToMany, ids []any, pivotAttrs .
 }
 
 // SyncWithoutDetaching 同步但不解除缺失项（对应 syncWithoutDetaching）。
-func (c *Connection) SyncWithoutDetaching(parent any, rel BelongsToMany, ids []any, pivotAttrs ...map[string]any) (*SyncResult, error) {
+func (c *Connection) SyncWithoutDetaching(parent any, rel PivotRelation, ids []any, pivotAttrs ...map[string]any) (*SyncResult, error) {
 	return c.syncPivot(parent, rel, ids, false, pivotAttrs...)
 }
 
 // Toggle 切换 pivot 关联（对应 toggle）：已关联的解除、未关联的附加。
-func (c *Connection) Toggle(parent any, rel BelongsToMany, ids []any) (*SyncResult, error) {
+func (c *Connection) Toggle(parent any, rel PivotRelation, ids []any) (*SyncResult, error) {
 	current, err := c.currentPivotKeys(parent, rel)
 	if err != nil {
 		return nil, err
@@ -2586,13 +2876,13 @@ func (c *Connection) Toggle(parent any, rel BelongsToMany, ids []any) (*SyncResu
 }
 
 // UpdateExistingPivot 更新现存 pivot 行（对应 updateExistingPivot），返回受影响行数。
-func (c *Connection) UpdateExistingPivot(parent any, rel BelongsToMany, id any, attrs map[string]any) (int64, error) {
+func (c *Connection) UpdateExistingPivot(parent any, rel PivotRelation, id any, attrs map[string]any) (int64, error) {
 	if len(attrs) == 0 {
 		return 0, nil
 	}
-	pivot, fpk, rpk, _ := pivotResolvedKeys(parent, rel)
+	spec := rel.pivotWriteSpec(parent)
 	g := c.GetQueryGrammar()
-	if rel.PivotTimestamps {
+	if spec.Timestamps {
 		attrs = mergePivotAttrs(attrs, map[string]any{"updated_at": nowFunc()})
 	}
 	sets := make([]string, 0, len(attrs))
@@ -2606,16 +2896,20 @@ func (c *Connection) UpdateExistingPivot(parent any, rel BelongsToMany, id any, 
 		sets = append(sets, g.Wrap(k)+" = ?")
 		args = append(args, attrs[k])
 	}
-	sql := "update " + g.WrapTable(pivot) + " set " + strings.Join(sets, ", ") +
-		" where " + g.Wrap(fpk) + " = ? and " + g.Wrap(rpk) + " = ?"
+	sql := "update " + g.WrapTable(spec.Pivot) + " set " + strings.Join(sets, ", ") +
+		" where " + g.Wrap(spec.FPK) + " = ? and " + g.Wrap(spec.RPK) + " = ?"
 	args = append(args, modelKeyValue(parent), id)
+	if scope, binds := pivotScopeSQL(g, spec); scope != "" {
+		sql += scope
+		args = append(args, binds...)
+	}
 	return c.Update(sql, args...)
 }
 
 // SyncWithPivotValues 以给定 pivot 值同步 ids（对应 syncWithPivotValues）：
 // 缺失的附加（带 values）、现存的更新 values；detaching=false 时
 // syncWithoutDetaching 语义（不解除其它关联）。ids 可为模型或裸键。
-func (c *Connection) SyncWithPivotValues(parent any, rel BelongsToMany, ids []any, values map[string]any, detaching ...bool) (*SyncResult, error) {
+func (c *Connection) SyncWithPivotValues(parent any, rel PivotRelation, ids []any, values map[string]any, detaching ...bool) (*SyncResult, error) {
 	detach := true
 	if len(detaching) > 0 {
 		detach = detaching[0]
@@ -2623,30 +2917,30 @@ func (c *Connection) SyncWithPivotValues(parent any, rel BelongsToMany, ids []an
 	return c.syncPivot(parent, rel, ids, detach, values)
 }
 
-// ---- pivot 写侧 OrFail 族（对应 Laravel orFail 后缀方法；失败以
+// ---- pivot 写侧 OrFail 族（对应 *OrFail 后缀形态；失败以
 // *FailError panic，可 recover 后经 Unwrap 取原始错误）----
 
 // AttachOrFail 建立 pivot 关联，失败 panic *FailError{Op:"attach"}。
-func (c *Connection) AttachOrFail(parent any, rel BelongsToMany, ids []any, pivotAttrs ...map[string]any) {
+func (c *Connection) AttachOrFail(parent any, rel PivotRelation, ids []any, pivotAttrs ...map[string]any) {
 	orFail("attach", c.Attach(parent, rel, ids, pivotAttrs...))
 }
 
 // DetachOrFail 解除 pivot 关联，失败 panic *FailError{Op:"detach"}，返回受影响行数。
-func (c *Connection) DetachOrFail(parent any, rel BelongsToMany, ids ...any) int64 {
+func (c *Connection) DetachOrFail(parent any, rel PivotRelation, ids ...any) int64 {
 	n, err := c.Detach(parent, rel, ids...)
 	orFail("detach", err)
 	return n
 }
 
 // SyncOrFail 全量同步 pivot，失败 panic *FailError{Op:"sync"}。
-func (c *Connection) SyncOrFail(parent any, rel BelongsToMany, ids []any, pivotAttrs ...map[string]any) *SyncResult {
+func (c *Connection) SyncOrFail(parent any, rel PivotRelation, ids []any, pivotAttrs ...map[string]any) *SyncResult {
 	res, err := c.Sync(parent, rel, ids, pivotAttrs...)
 	orFail("sync", err)
 	return res
 }
 
 // ToggleOrFail 切换 pivot 关联，失败 panic *FailError{Op:"toggle"}。
-func (c *Connection) ToggleOrFail(parent any, rel BelongsToMany, ids []any) *SyncResult {
+func (c *Connection) ToggleOrFail(parent any, rel PivotRelation, ids []any) *SyncResult {
 	res, err := c.Toggle(parent, rel, ids)
 	orFail("toggle", err)
 	return res
@@ -2654,14 +2948,14 @@ func (c *Connection) ToggleOrFail(parent any, rel BelongsToMany, ids []any) *Syn
 
 // UpdateExistingPivotOrFail 更新现存 pivot 行，失败 panic
 // *FailError{Op:"updateExistingPivot"}，返回受影响行数。
-func (c *Connection) UpdateExistingPivotOrFail(parent any, rel BelongsToMany, id any, attrs map[string]any) int64 {
+func (c *Connection) UpdateExistingPivotOrFail(parent any, rel PivotRelation, id any, attrs map[string]any) int64 {
 	n, err := c.UpdateExistingPivot(parent, rel, id, attrs)
 	orFail("updateExistingPivot", err)
 	return n
 }
 
 // syncPivot sync/toggle 共用实现；detachMissing 控制是否解除缺失项。
-func (c *Connection) syncPivot(parent any, rel BelongsToMany, ids []any, detachMissing bool, pivotAttrs ...map[string]any) (*SyncResult, error) {
+func (c *Connection) syncPivot(parent any, rel PivotRelation, ids []any, detachMissing bool, pivotAttrs ...map[string]any) (*SyncResult, error) {
 	current, err := c.currentPivotKeys(parent, rel)
 	if err != nil {
 		return nil, err
@@ -2673,15 +2967,43 @@ func (c *Connection) syncPivot(parent any, rel BelongsToMany, ids []any, detachM
 	idSet := map[string]bool{}
 	res := &SyncResult{}
 
+	// 有 attrs 时按行值比对：仅实际变化才 update 并计入 Updated
+	// （对齐 sync 的 updated 语义）
+	var rows []map[string]any
+	if len(pivotAttrs) > 0 && len(pivotAttrs[0]) > 0 {
+		r, err := c.currentPivotRows(parent, rel)
+		if err != nil {
+			return nil, err
+		}
+		rows = r
+	}
+	spec := rel.pivotWriteSpec(parent)
+	rowByID := map[string]map[string]any{}
+	for _, row := range rows {
+		if v, ok := row[spec.RPK]; ok {
+			rowByID[fmt.Sprint(v)] = row
+		}
+	}
+
 	var toAttach []any
 	for _, id := range ids {
 		idSet[fmt.Sprint(id)] = true
 		if currentSet[fmt.Sprint(id)] {
 			if len(pivotAttrs) > 0 && len(pivotAttrs[0]) > 0 {
-				if _, err := c.UpdateExistingPivot(parent, rel, id, pivotAttrs[0]); err != nil {
-					return nil, err
+				row := rowByID[fmt.Sprint(id)]
+				changed := false
+				for k, v := range pivotAttrs[0] {
+					if cur, ok := row[k]; !ok || fmt.Sprint(cur) != fmt.Sprint(v) {
+						changed = true
+						break
+					}
 				}
-				res.Updated = append(res.Updated, id)
+				if changed {
+					if _, err := c.UpdateExistingPivot(parent, rel, id, pivotAttrs[0]); err != nil {
+						return nil, err
+					}
+					res.Updated = append(res.Updated, id)
+				}
 			}
 			continue
 		}
@@ -2711,22 +3033,33 @@ func (c *Connection) syncPivot(parent any, rel BelongsToMany, ids []any, detachM
 }
 
 // currentPivotKeys 查询父模型当前的 pivot 关联键集合。
-func (c *Connection) currentPivotKeys(parent any, rel BelongsToMany) ([]any, error) {
-	pivot, fpk, rpk, _ := pivotResolvedKeys(parent, rel)
-	sql := "select " + c.GetQueryGrammar().Wrap(rpk) + " from " +
-		c.GetQueryGrammar().WrapTable(pivot) + " where " +
-		c.GetQueryGrammar().Wrap(fpk) + " = ?"
-	rows, err := c.SelectMaps(sql, []any{modelKeyValue(parent)})
+func (c *Connection) currentPivotKeys(parent any, rel PivotRelation) ([]any, error) {
+	rows, err := c.currentPivotRows(parent, rel)
 	if err != nil {
 		return nil, err
 	}
+	spec := rel.pivotWriteSpec(parent)
 	out := make([]any, 0, len(rows))
 	for _, row := range rows {
-		if v, ok := row[rpk]; ok {
+		if v, ok := row[spec.RPK]; ok {
 			out = append(out, v)
 		}
 	}
 	return out, nil
+}
+
+// currentPivotRows 取父侧当前 pivot 行（rpk + 全列；sync 的值变更判定用）。
+func (c *Connection) currentPivotRows(parent any, rel PivotRelation) ([]map[string]any, error) {
+	spec := rel.pivotWriteSpec(parent)
+	sql := "select * from " +
+		c.GetQueryGrammar().WrapTable(spec.Pivot) + " where " +
+		c.GetQueryGrammar().Wrap(spec.FPK) + " = ?"
+	args := []any{modelKeyValue(parent)}
+	if scope, binds := pivotScopeSQL(c.GetQueryGrammar(), spec); scope != "" {
+		sql += scope
+		args = append(args, binds...)
+	}
+	return c.SelectMaps(sql, args)
 }
 
 // mergePivotAttrs 合并 pivot 附加属性（后者覆盖前者）。

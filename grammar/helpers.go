@@ -7,8 +7,10 @@ import (
 	"strings"
 )
 
-// BindingSegments 绑定段的固定顺序（对应 Laravel 的 bindings 属性键序）。
+// BindingSegments 绑定段的固定顺序（与查询构造器 bindings 属性键序一致）。
+// "with" 段居首：CTE 编译在最终 SQL 最前，其占位符必须最先求值。
 var BindingSegments = []string{
+	"with",
 	"select",
 	"from",
 	"join",
@@ -44,7 +46,7 @@ func sortedKeys(m map[string]any) []string {
 	return keys
 }
 
-// flattenBinding 对应 Laravel 的 Arr::flatten（JSON 数组值展平）。
+// flattenBinding 展平绑定值（JSON 数组值仅剥去最外层单元素包装）。
 func flattenBinding(v any) any {
 	if arr, ok := v.([]any); ok {
 		if len(arr) == 0 {
@@ -62,7 +64,7 @@ func intToString(n int64) string {
 	return strconv.FormatInt(n, 10)
 }
 
-// replaceFirst 对应 Laravel 的 Str::replaceFirst。
+// replaceFirst 只替换第一次出现的子串。
 func replaceFirst(search, replace, subject string) string {
 	idx := strings.Index(subject, search)
 	if idx < 0 {

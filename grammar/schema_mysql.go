@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// ---- MySQL Schema 编译（对齐 Illuminate\Database\Schema\Grammars\MySqlGrammar 输出） ----
+// ---- MySQL Schema 编译 ----
 
 // getColumnType 方言类型映射入口（子方言可经由 columnDefinitionWith /
 // compileAddWith 注入自定义映射，见 schema_mariadb.go）。
@@ -64,7 +64,7 @@ func (g *MySqlGrammar) baseColumnType(c *ColumnDefinition) string {
 		}
 		return "datetime"
 	case "datetimetz":
-		// MySQL 无时区类型，对齐 Laravel typeDateTimeTz → typeDateTime
+		// MySQL 无时区类型，datetimetz 回落为 datetime 类型
 		if c.Precision > 0 {
 			return fmt.Sprintf("datetime(%d)", c.Precision)
 		}
@@ -75,7 +75,7 @@ func (g *MySqlGrammar) baseColumnType(c *ColumnDefinition) string {
 		}
 		return "timestamp"
 	case "timestamptz":
-		// MySQL 无时区类型，对齐 Laravel typeTimestampTz → typeTimestamp
+		// MySQL 无时区类型，timestamptz 回落为 timestamp 类型
 		if c.Precision > 0 {
 			return fmt.Sprintf("timestamp(%d)", c.Precision)
 		}
@@ -86,13 +86,13 @@ func (g *MySqlGrammar) baseColumnType(c *ColumnDefinition) string {
 		}
 		return "time"
 	case "timetz":
-		// 对齐 Laravel typeTimeTz → typeTime
+		// timetz 回落为 time 类型（MySQL 无时区时间类型）
 		if c.Precision > 0 {
 			return fmt.Sprintf("time(%d)", c.Precision)
 		}
 		return "time"
 	case "geometry", "geography":
-		// 对齐 Laravel typeGeometry：子类型白名单 + srid
+		// geometry：子类型白名单 + srid
 		sub := strings.ToLower(c.Subtype)
 		switch sub {
 		case "point", "linestring", "polygon", "geometrycollection", "multipoint", "multilinestring", "multipolygon":
@@ -172,7 +172,7 @@ func (g *MySqlGrammar) columnDefinition(c *ColumnDefinition) string {
 // columnDefinitionWith：类型映射函数可被子方言覆盖（MariaDB json 等）。
 func (g *MySqlGrammar) columnDefinitionWith(c *ColumnDefinition, ct func(*ColumnDefinition) string) string {
 	// useCurrent / useCurrentOnUpdate 在 timestamp/datetime 家族上注入默认值
-	// （对齐 Laravel typeTimestamp/typeDateTime 的 default 注入语义）
+	// （default current_timestamp / on update current_timestamp 注入语义）
 	if c.UseCurrent && isDatetimeFamily(c.Type) {
 		c = cloneColumn(c)
 		if c.DefaultRaw == "" && c.DefaultValue == nil {
@@ -307,7 +307,7 @@ func (g *MySqlGrammar) compileCreateWith(b *Blueprint, ct func(*ColumnDefinition
 		sql += " engine = " + b.Engine
 	}
 
-	// MySQL：index/unique/foreign 在 create 场景下也是独立 alter 语句（对齐 Laravel）
+	// MySQL：index/unique/foreign 在 create 场景下也是独立 alter 语句
 	out := []string{sql}
 	out = append(out, g.compileSchemaIndexesNonPrimary(b)...)
 	return out
@@ -448,10 +448,10 @@ func (g *MySqlGrammar) CompileRenameColumn(b *Blueprint, from, to string) string
 	return "alter table " + g.WrapTable(b.Table) + " rename column " + g.Wrap(from) + " to " + g.Wrap(to)
 }
 
-// compileLegacyRenameColumn 对应 MySqlGrammar::compileLegacyRenameColumn（:357-380）：
-// alter table t change from to <完整列定义>。Laravel 经内省（getColumns）取列
-// 定义；Go 侧优先从 Blueprint 已有列定义取（同迁移内重命名场景），取不到时
-// 保守回退现代 rename column。TODO 接线点：接入列内省后可完整对齐 Laravel。
+// compileLegacyRenameColumn：老版本 MySQL 的列重命名走
+// alter table t change from to <完整列定义>，需先取得列定义；Go 侧优先从
+// Blueprint 已有列定义取（同迁移内重命名场景），取不到时
+// 保守回退现代 rename column。TODO 接线点：接入列内省后可完整支持。
 func (g *MySqlGrammar) compileLegacyRenameColumn(b *Blueprint, from, to string) string {
 	table := g.WrapTable(b.Table)
 	for _, c := range b.Columns {
@@ -524,7 +524,7 @@ func (g *MySqlGrammar) CompileSpatialIndex(b *Blueprint, idx *IndexDefinition) s
 	return g.compileSchemaIndexes(b)[0]
 }
 
-// CompileVectorIndex MySQL 不支持向量索引（对齐 Laravel 运行时错误）。
+// CompileVectorIndex MySQL 不支持向量索引（抛出运行时错误）。
 func (g *MySqlGrammar) CompileVectorIndex(b *Blueprint, idx *IndexDefinition) string {
 	panic(ErrUnsupported{"The database driver in use does not support vector indexes."})
 }

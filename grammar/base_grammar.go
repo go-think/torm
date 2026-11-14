@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// BaseGrammar 对应 Illuminate\Database\Grammar：标识符 wrap、参数占位、表达式求值。
+// BaseGrammar 为各方言 grammar 的公共基类：标识符 wrap、参数占位、表达式求值。
 // 默认双引号（SQL 标准方言）；方言构造器通过 wrapValueFn / wrapJsonSelectorFn 覆盖。
 type BaseGrammar struct {
 	tablePrefix string
@@ -188,7 +188,9 @@ func (g *BaseGrammar) Parameter(value any) string {
 	return "?"
 }
 
-// QuoteString 引用一个字符串字面量。
+// QuoteString 引用一个字符串字面量（对齐 quoteString 语义：内部单引号双写
+// 转义，enum 值/字符串默认值含 `'` 时不再破坏 DDL）。bool 输出 '1'/'0'
+// （对齐 getDefaultValue 的 bool 分支）。
 func (g *BaseGrammar) QuoteString(value any) string {
 	switch v := value.(type) {
 	case []string:
@@ -203,8 +205,15 @@ func (g *BaseGrammar) QuoteString(value any) string {
 			parts[i] = g.QuoteString(s)
 		}
 		return strings.Join(parts, ", ")
+	case bool:
+		if v {
+			return "'1'"
+		}
+		return "'0'"
+	case string:
+		return "'" + strings.ReplaceAll(v, "'", "''") + "'"
 	default:
-		return "'" + fmt.Sprint(v) + "'"
+		return "'" + strings.ReplaceAll(fmt.Sprint(v), "'", "''") + "'"
 	}
 }
 
@@ -236,7 +245,7 @@ func (g *BaseGrammar) CompileSavepointRollBack(name string) string {
 	return "ROLLBACK TO SAVEPOINT " + name
 }
 
-// ErrUnsupported 对应 Laravel 各 grammar 方法的 RuntimeException。
+// ErrUnsupported 表示各方言 grammar 遇到不支持语法时返回的运行时错误。
 type ErrUnsupported struct{ Msg string }
 
 func (e ErrUnsupported) Error() string { return e.Msg }

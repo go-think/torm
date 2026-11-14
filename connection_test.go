@@ -711,10 +711,17 @@ func TestMySqlConnectorBuildDsn(t *testing.T) {
 		t.Errorf("BuildDsn overrode existing charset: %q", got)
 	}
 
-	// 未配置参数时 DSN 原样返回
-	plain := &MySqlConnector{}
+	// 未配置参数且 ParseTime 显式关闭时 DSN 原样返回
+	pt := false
+	plain := &MySqlConnector{config: Config{ParseTime: &pt}}
 	if got := plain.BuildDsn("root@tcp(host)/db"); got != "root@tcp(host)/db" {
 		t.Errorf("BuildDsn with empty config = %q", got)
+	}
+
+	// ParseTime 默认注入（time.Time 扫描必需；DSN 已带参不覆盖）
+	got2 := (&MySqlConnector{}).BuildDsn("root@tcp(host)/db")
+	if !strings.Contains(got2, "parseTime=true") {
+		t.Errorf("BuildDsn missing default parseTime: %q", got2)
 	}
 
 	// 非标准 DSN 原样返回（交由驱动在连接时校验报错）
@@ -1188,19 +1195,65 @@ func TestMySqlConnectorBuildDsn_Modes(t *testing.T) {
 }
 
 func TestMySqlConnector_ConfigureSessionIsolationLevel(t *testing.T) {
-	st := faketb.NewNamed("mysql_session_iso")
-	st.On("set session transaction isolation level serializable", &fakeResult{})
-
-	c := &MySqlConnector{config: Config{IsolationLevel: "serializable"}}
-	db, err := sql.Open("fake", st.Name())
+	// 会话级 SET 经 sessionConnector 在每个物理连接上执行（连接池安全）：
+	// 用测试桩 connector 验证建连即执行
+	sc := &sessionConnector{
+		inner:      &stubConnector{conn: &stubConn{}},
+		statements: []string{"set session transaction isolation level serializable"},
+	}
+	raw, err := sc.Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
-	if err := c.configureSession(db); err != nil {
-		t.Fatal(err)
+	defer raw.Close()
+	got := raw.(*stubConn).execs
+	if len(got) != 1 || got[0] != "set session transaction isolation level serializable" {
+		t.Errorf("session execs = %v", got)
 	}
-	st.LastCall(t, "set session transaction isolation level serializable")
+	// 建连失败（语句报错）时连接被关闭
+	bad := &sessionConnector{inner: &stubConnector{conn: &stubConn{failSQL: "set session transaction isolation level serializable"}}, statements: []string{"set session transaction isolation level serializable"}}
+	if _, err := bad.Connect(context.Background()); err == nil {
+		t.Fatal("expected session stmt failure to fail Connect")
+	}
+}
+
+// stubConnector / stubConn：driver.Connector 最小桩（记录会话语句执行）。
+type stubConnector struct{ conn *stubConn }
+
+func (s *stubConnector) Connect(context.Context) (driver.Conn, error) { return s.conn, nil }
+func (s *stubConnector) Driver() driver.Driver                        { return stubDriver{} }
+
+type stubDriver struct{}
+
+func (stubDriver) Open(string) (driver.Conn, error) { return nil, errors.New("not used") }
+
+type stubConn struct {
+	execs   []string
+	failSQL string
+}
+
+func (s *stubConn) Prepare(query string) (driver.Stmt, error) {
+	return &stubStmt{conn: s, q: query}, nil
+}
+func (s *stubConn) Close() error              { return nil }
+func (s *stubConn) Begin() (driver.Tx, error) { return nil, errors.New("not used") }
+
+type stubStmt struct {
+	conn *stubConn
+	q    string
+}
+
+func (s *stubStmt) Close() error  { return nil }
+func (s *stubStmt) NumInput() int { return -1 }
+func (s *stubStmt) Exec(args []driver.Value) (driver.Result, error) {
+	if s.conn.failSQL == s.q {
+		return nil, errors.New("stub session failure")
+	}
+	s.conn.execs = append(s.conn.execs, s.q)
+	return driver.RowsAffected(1), nil
+}
+func (s *stubStmt) Query(args []driver.Value) (driver.Rows, error) {
+	return nil, errors.New("not used")
 }
 
 func TestPostgresConnectorBuildDsn_SslAndEncoding(t *testing.T) {
@@ -1229,45 +1282,41 @@ func TestPostgresConnectorBuildDsn_SslAndEncoding(t *testing.T) {
 }
 
 func TestPostgresConnector_ConnectSessionConfig(t *testing.T) {
-	st := faketb.NewNamed("pg_session")
-	st.On("set session characteristics as transaction isolation level serializable", &fakeResult{})
-	st.On("set synchronous_commit to 'off'", &fakeResult{})
-
+	// 会话级参数经 DSN options=-c 生效（连接池下每个物理连接均有效，
+	// 旧实现 db.Exec 只落在池内随机一个连接上）
 	c := &PostgresConnector{config: Config{
 		Driver: "fake", IsolationLevel: "serializable", SynchronousCommit: "off",
 	}}
-	db, err := c.Connect(st.Name())
-	if err != nil {
-		t.Fatal(err)
+	got := c.BuildDsn("host=pg.local dbname=shop")
+	if !strings.Contains(got, "default_transaction_isolation=serializable") {
+		t.Errorf("BuildDsn missing isolation via options: %q", got)
 	}
-	defer db.Close()
-	st.LastCall(t, "set session characteristics as transaction isolation level serializable")
-	st.LastCall(t, "set synchronous_commit to 'off'")
+	if !strings.Contains(got, "synchronous_commit=off") {
+		t.Errorf("BuildDsn missing synchronous_commit via options: %q", got)
+	}
 }
 
 func TestSqliteConnector_ConnectPragmas(t *testing.T) {
-	st := faketb.NewNamed("sqlite_pragmas")
-	st.On("pragma cache_size = 2000", &fakeResult{})
-	st.On("pragma mmap_size = 268435456", &fakeResult{})
-
+	// pragmas 全部经 DSN 参数生效（连接池安全）；foreign_keys 默认开启
 	c := &SQLiteConnector{config: Config{
 		Driver:  "fake",
 		Pragmas: map[string]string{"cache_size": "2000", "mmap_size": "268435456"},
 	}}
-	db, err := c.Connect(st.Name())
-	if err != nil {
-		t.Fatal(err)
+	got := c.BuildDsn("file:data.db")
+	for _, want := range []string{
+		"_foreign_keys=on", "_pragma=cache_size(2000)",
+		"_pragma=mmap_size(268435456)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("BuildDsn missing %q: %q", want, got)
+		}
 	}
-	defer db.Close()
-	st.LastCall(t, "pragma cache_size = 2000")
-	st.LastCall(t, "pragma mmap_size = 268435456")
 
-	// pragma 失败时建连整体失败
-	st2 := faketb.NewNamed("sqlite_pragmas_err")
-	st2.On("pragma bad = 1", &fakeResult{Err: errors.New("fake: no such pragma")})
-	c2 := &SQLiteConnector{config: Config{Driver: "fake", Pragmas: map[string]string{"bad": "1"}}}
-	if _, err := c2.Connect(st2.Name()); err == nil {
-		t.Error("want error on failed pragma")
+	// 显式关闭 foreign_keys
+	off := false
+	got = (&SQLiteConnector{config: Config{ForeignKeys: &off}}).BuildDsn("file:data.db")
+	if strings.Contains(got, "_foreign_keys=on") || !strings.Contains(got, "_foreign_keys=off") {
+		t.Errorf("BuildDsn foreign_keys=off expected: %q", got)
 	}
 }
 

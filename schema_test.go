@@ -20,7 +20,7 @@ func TestNewSchema(t *testing.T) {
 	t.Log(schema.Fields)
 }
 
-// 期望 SQL 移植自 laravel/framework tests/Database/DatabaseMySqlSchemaGrammarTest.php 等。
+// 期望 SQL 取自既有 golden 基线。
 
 func mysqlSchemaGrammar(prefix ...string) grammar.SchemaGrammar {
 	g := grammar.NewMySqlGrammar()
@@ -119,7 +119,7 @@ func TestSchemaMySQLForeign(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("statements = %v", got)
 	}
-	// 对齐 Laravel：MySQL 建表只含列，外键为独立 alter 语句
+	// MySQL 建表只含列，外键为独立 alter 语句
 	if !strings.Contains(got[1], "alter table `orders` add constraint `orders_user_id_foreign` foreign key (`user_id`) references `users` (`id`) on delete cascade") {
 		t.Errorf("sql = %s", got[1])
 	}
@@ -776,11 +776,12 @@ func TestSchemaBuilderCreateAndDropDatabase(t *testing.T) {
 
 func TestSchemaBuilderRename(t *testing.T) {
 	conn, st := newFakeDB(t)
-	st.On("alter table `users` rename to `people`", &fakeResult{})
+	// Rename 走各方言 grammar 编译（Builder.php:610）：MySQL 为 rename table
+	st.On("rename table `users` to `people`", &fakeResult{})
 	if err := conn.Schema().Rename("users", "people"); err != nil {
 		t.Fatal(err)
 	}
-	st.LastCall(t, "alter table `users` rename to `people`")
+	st.LastCall(t, "rename table `users` to `people`")
 }
 
 func TestSchemaBuilderDropColumns(t *testing.T) {
@@ -1390,6 +1391,6 @@ func TestSchemaBuilderDropColumnsSqlServer(t *testing.T) {
 	if err := conn.Schema().DropColumns("users", "a", "b"); err != nil {
 		t.Fatal(err)
 	}
-	// Laravel dropColumns 经 Blueprint → compileDropColumn（含默认约束前置块）
+	// dropColumns 经 Blueprint → compileDropColumn（含默认约束前置块）
 	st.LastCall(t, sql)
 }

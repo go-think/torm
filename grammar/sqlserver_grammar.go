@@ -7,7 +7,7 @@ import (
 	"github.com/go-think/torm/query"
 )
 
-// SqlServerGrammar 对应 Illuminate\Database\Query\Grammars\SqlServerGrammar 的常用子集。
+// SqlServerGrammar 为 SQL Server（T-SQL）方言查询编译器的常用子集。
 // 覆盖：[标识符] wrap、insertGetId（output inserted）、随机 NEWID()、日期函数、
 // insert 空值 default values、truncate、lock（rowlock/updlock/holdlock）。
 // 未覆盖：top(n) limit/offset 重写、groupLimit。
@@ -61,10 +61,41 @@ func NewSqlServerGrammar() *SqlServerGrammar {
 	g.compileDeleteWithoutJoinsFn = g.compileDeleteWithoutJoins
 	g.compileJsonValueCastFn = g.compileJsonValueCast
 
+	// JSON 选择器（wrapJsonSelector 的 json_query 实现；
+	// 此前未注册 → 任何 JSON 选择器列都会 panic）
+	g.BaseGrammar.wrapJsonSelectorFn = g.wrapJsonSelector
+	g.BaseGrammar.wrapJsonBoolSelFn = g.wrapJsonBooleanSelector
+	g.BaseGrammar.wrapJsonBoolValueFn = g.wrapJsonBooleanValue
+
 	return g
 }
 
-// CompileSelect 对应 Laravel SqlServerGrammar::compileSelect：
+// wrapJsonSelector 对应 SqlServerGrammar::wrapJsonSelector：
+// JSON_PATH 函数（json_query(field, 'lax $.a."b"')）。
+func (g *SqlServerGrammar) wrapJsonSelector(value string) string {
+	field, path := g.wrapJsonFieldAndPath(value)
+	return "json_query(" + field + path + ")"
+}
+
+// wrapJsonBooleanSelector 对应 SqlServerGrammar::wrapJsonBooleanSelector：
+// coalesce(json_query(...), 'false')——布尔上下文缺省 false。
+func (g *SqlServerGrammar) wrapJsonBooleanSelector(value string) string {
+	field, path := g.wrapJsonFieldAndPath(value)
+	return "coalesce(json_query(" + field + path + "), 'false')"
+}
+
+// wrapJsonBooleanValue 对应 SqlServerGrammar::wrapJsonBooleanValue。
+func (g *SqlServerGrammar) wrapJsonBooleanValue(value string) string {
+	return "'" + value + "'::nvarchar(10)"
+}
+
+// wrapJsonPathSegment 对应 SqlServerGrammar::wrapJsonPathSegment：
+// '."segment"' 片段（路径段双引号包裹，整数下标同样加引号处理）。
+func (g *SqlServerGrammar) wrapJsonPathSegment(segment string) string {
+	return `'."` + segment + `"'.'`
+}
+
+// CompileSelect 编译 select 语句：
 // 有 offset 而无 order by 时追加 order by (SELECT 0) 兜底（SQL Server 的
 // offset 必须 order by）。
 func (g *SqlServerGrammar) CompileSelect(q *query.Query) string {
@@ -74,7 +105,7 @@ func (g *SqlServerGrammar) CompileSelect(q *query.Query) string {
 	return g.QueryGrammar.CompileSelect(q)
 }
 
-// CompileExists 对应 Laravel SqlServerGrammar::compileExists：
+// CompileExists 编译 exists 检查：
 // clone 后 selectRaw('1 [exists]')->limit(1) → select top 1 1 [exists]。
 func (g *SqlServerGrammar) CompileExists(q *query.Query) string {
 	exists := *q
@@ -100,7 +131,7 @@ func (g *SqlServerGrammar) compileRandom(seed any) string {
 	return "NEWID()"
 }
 
-// compileFrom 对应 Laravel SqlServerGrammar::compileFrom：
+// compileFrom 编译 from 段：
 // lock 拼接在 from 之后（with(rowlock,updlock,holdlock) 形式）。
 func (g *SqlServerGrammar) compileFrom(q *query.Query, table any) string {
 	// 直接内联基础实现（compileFromFn 钩子会再次路由回本方法）
@@ -118,7 +149,7 @@ func (g *SqlServerGrammar) compileFrom(q *query.Query, table any) string {
 	return from
 }
 
-// compileLock 对应 Laravel SqlServerGrammar::compileLock：返回空串
+// compileLock 返回空串：
 // （锁已由 compileFrom 拼进 from，语句末尾不再出现 lock）。
 func (g *SqlServerGrammar) compileLock(q *query.Query, value any) string {
 	return ""
@@ -146,8 +177,7 @@ func (g *SqlServerGrammar) compileInsertGetId(q *query.Query, rows []query.Row, 
 	return parts[0] + " output inserted." + g.wrapValue(sequence) + " values " + parts[1], bindings
 }
 
-// whereDate/whereTime 对应 Laravel SqlServerGrammar.php:167-186：
-// T-SQL 无 date()/time() 函数，使用 cast(col as date/time)。
+// whereDate/whereTime：T-SQL 无 date()/time() 函数，使用 cast(col as date/time)。
 func (g *SqlServerGrammar) whereDate(q *query.Query, w *query.Where) string {
 	return "cast(" + g.Wrap(w.Column) + " as date) " + w.Operator + " " + g.Parameter(w.Value)
 }
@@ -205,7 +235,7 @@ func (g *SqlServerGrammar) PrepareBindingForJsonContains(binding any) any {
 	return binding
 }
 
-// compileColumns 有 limit 且无 offset 时输出 select top(n)（对齐 Laravel SqlServerGrammar）。
+// compileColumns 有 limit 且无 offset 时输出 select top(n)。
 func (g *SqlServerGrammar) compileColumns(q *query.Query, columns []any) string {
 	if q.Aggregate != nil {
 		return ""
@@ -255,7 +285,7 @@ func (g *SqlServerGrammar) compileRowNumber(partition, orders string) string {
 		orders = "order by (select 0)"
 	}
 	over := strings.TrimSpace("partition by " + g.Wrap(partition) + " " + orders)
-	return ", row_number() over (" + over + ") as " + g.Wrap("laravel_row")
+	return ", row_number() over (" + over + ") as " + g.Wrap("group_row")
 }
 
 // whereNullSafeEquals 对应 SqlServerGrammar::whereNullSafeEquals：
@@ -346,18 +376,18 @@ func (g *SqlServerGrammar) compileUpsert(q *query.Query, rows []query.Row, uniqu
 		parameters = append(parameters, "("+strings.Join(rowParts, ", ")+")")
 	}
 
-	sql += "using (values " + strings.Join(parameters, ", ") + ") " + g.WrapTable("laravel_source") + " (" + columnList + ") "
+	sql += "using (values " + strings.Join(parameters, ", ") + ") " + g.WrapTable("merge_source") + " (" + columnList + ") "
 
 	on := make([]string, 0, len(uniqueBy))
 	for _, column := range uniqueBy {
-		on = append(on, g.Wrap("laravel_source."+column)+" = "+g.Wrap(fmtString(q.From)+"."+column))
+		on = append(on, g.Wrap("merge_source."+column)+" = "+g.Wrap(fmtString(q.From)+"."+column))
 	}
 	sql += "on " + strings.Join(on, " and ") + " "
 
 	if len(update) > 0 {
 		updates := make([]string, 0, len(update))
 		for _, column := range update {
-			updates = append(updates, g.Wrap(column)+" = "+g.Wrap("laravel_source."+column))
+			updates = append(updates, g.Wrap(column)+" = "+g.Wrap("merge_source."+column))
 		}
 		sql += "when matched then update set " + strings.Join(updates, ", ") + " "
 	}

@@ -43,7 +43,7 @@ func TestSchemaMySQLRenameColumnLegacy(t *testing.T) {
 }
 
 func TestSchemaMySQLRenameColumnLegacyNoDefinition(t *testing.T) {
-	// Blueprint 无该列定义时保守回退现代 rename（Laravel 需列内省，TODO 接线点）
+	// Blueprint 无该列定义时保守回退现代 rename（需列内省，TODO 接线点）
 	g := NewMySqlGrammar()
 	g.SetServerVersion("5.7.42")
 	b := NewBlueprint("users")

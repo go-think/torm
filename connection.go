@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"iter"
-	"log"
 	"math/rand"
 	"reflect"
 	"strings"
@@ -19,7 +18,7 @@ import (
 	"github.com/go-think/torm/grammar"
 )
 
-// ErrMultipleColumnsSelected 对应 Laravel 的 MultipleColumnsSelectedException
+// ErrMultipleColumnsSelected 单行查询命中多列时返回的错误
 // （Scalar 命中多列时抛出）。
 var ErrMultipleColumnsSelected = errors.New("torm: multiple columns selected")
 
@@ -28,33 +27,33 @@ type Connection struct {
 	tablePrefix string
 	driver      string
 	dsn         string
-	config      Config // 完整连接配置（重连时保留方言参数）
+	config      Config  // 完整连接配置（重连时保留方言参数）
 	readDB      *sql.DB // 读写分离的只读连接（Config.ReadDsn / ReadDsns）
 	readDsn     string  // 实际选中的只读 DSN
 	readDsns    []string
 
-	// 连接标识（对应 Laravel $name / $readWriteType）
+	// 连接标识（连接名 / 读写类型）
 	name          string
 	readWriteType string
 	// pinnedType 管理层 ::read/::write 路由固定（对应 setPdoForType）
 	pinnedType string
 
-	// 事务状态（Laravel transactions 计数语义）
+	// 事务状态（嵌套事务层级计数）
 	txMu               sync.Mutex
 	tx                 *sql.Tx
 	level              int
 	afterCommitHooks   []txHook
 	afterRollbackHooks []txHook
 
-	// 执行前回调（对应 Laravel beforeStartingTransaction / beforeExecuting）
+	// 执行前回调（事务开始前 / 每条语句执行前触发）
 	beforeStartingTransaction []func()
-	beforeExecutingMu        sync.Mutex
-	beforeExecuting          []func(query string, bindings []any)
+	beforeExecutingMu         sync.Mutex
+	beforeExecuting           []func(query string, bindings []any)
 
 	// connMu 保护 DB / readDB 的热替换（断连重连时切换句柄）
 	connMu sync.Mutex
 
-	// 查询事件钩子（对应 Laravel QueryExecuted/DB::listen）
+	// 查询事件钩子（查询执行后分发 QueryExecuted）
 	onQuery   func(QueryExecuted) // 兼容：单回调（OnQuery）
 	listeners []func(QueryExecuted)
 
@@ -71,14 +70,15 @@ type Connection struct {
 	sticky                bool
 	readOnWriteConnection bool
 	recordsModified       bool
+	recordsModifiedAt     time.Time // 最近一次写操作时间（StickyWindowSec 时间窗判定）
 
 	// 状态锁：保护上述查询日志/监听器/recordsModified 等可变状态
 	stateMu sync.Mutex
 
-	// 模型事件分发器（对应 Laravel Dispatcher）
+	// 模型事件分发器（事件总线）
 	dispatcher events.Dispatcher
 
-	// 断连重连回调（对应 Laravel reconnector；reconnect() 优先调用，
+	// 断连重连回调（reconnect() 优先调用，
 	// 未设置时走内建重连）
 	reconnector func(*Connection) error
 
@@ -252,7 +252,7 @@ func (c *Connection) logQuery(sqlStr string, bindings []any, d time.Duration, rw
 		ReadWriteType:  rw,
 	}
 	if c.pretending {
-		// dry-run 时记录插值后的原始 SQL（对应 Laravel pretending 分支）
+		// dry-run 时记录插值后的原始 SQL（pretending 分支）
 		e.Sql = e.RawSql
 	}
 	hasListener := c.onQuery != nil || len(c.listeners) > 0
@@ -266,8 +266,10 @@ func (c *Connection) logQuery(sqlStr string, bindings []any, d time.Duration, rw
 	}
 	c.stateMu.Unlock()
 
+	// 无监听器时不再默认打印到 stdout（默认不输出查询日志；
+	// 生产环境逐条 log.Println 是噪音与性能损耗。需要调试时 EnableQueryLog
+	// 或注册 OnQuery/Listen 监听器）
 	if !hasListener {
-		log.Println(sqlStr)
 		return
 	}
 	for _, fn := range listeners {
@@ -281,10 +283,11 @@ func (c *Connection) readWriteTypeFor(forceWrite bool) string {
 	tx := c.tx
 	c.txMu.Unlock()
 	if tx == nil {
+		now := time.Now()
 		c.stateMu.Lock()
 		pinned := c.pinnedType
 		readOnWrite := c.readOnWriteConnection
-		stickyHit := c.recordsModified && c.sticky
+		stickyHit := c.sticky && c.stickyActiveLocked(now)
 		c.stateMu.Unlock()
 		if c.hasReadDB() && (pinned == "read" ||
 			(!forceWrite && pinned != "write" && !readOnWrite && !stickyHit)) {
@@ -308,7 +311,7 @@ func (c *Connection) hasReadDB() bool {
 // read 标记读路径（走 readQueryer 路由，含事务/只读/sticky 语义），写路径走
 // queryer()。
 func (c *Connection) run(query string, bindings []any, rw string, read, forceWrite bool, fn func(queryer) error) error {
-	// Laravel：beforeExecuting 在 pretending 检查之前触发（Connection.php:799-803）
+	// beforeExecuting 在 pretending 检查之前触发
 	c.fireBeforeExecuting(query, bindings)
 
 	if c.isPretending() {
@@ -469,7 +472,7 @@ func (c *Connection) Query() *Builder {
 }
 
 // SelectOne Run a select statement and return a single result（只取第一行，
-// 对应 Laravel selectOne 的 array_shift 语义）。
+// 等价于 select 后 array_shift 的语义）。
 func (c *Connection) SelectOne(query string, bindings []interface{}, dest interface{}) error {
 	return c.runSelect(query, bindings, dest, false, true)
 }
@@ -479,7 +482,7 @@ func (c *Connection) Select(query string, bindings []interface{}, dest interface
 	return c.runSelect(query, bindings, dest, false, false)
 }
 
-// SelectFromWrite 强制走写连接的 select（对应 Laravel useWritePdo）。
+// SelectFromWrite 强制走写连接的 select（忽略读连接路由）。
 func (c *Connection) SelectFromWrite(query string, bindings []interface{}, dest interface{}) error {
 	return c.runSelect(query, bindings, dest, true, false)
 }
@@ -683,7 +686,24 @@ func (c *Connection) Insert(query string, args ...interface{}) (int64, int64, er
 }
 
 // InsertGetId 执行 insert 并返回自增 id。
+// PG/SQLServer 的 grammar 编译同款 insert ... returning/output 语句，
+// 驱动不支持 LastInsertId（lib/pq、mssqldb 返回 0 或报错）——改为消费返回行，
+// 从 returning/output 结果集中取自增 id。
 func (c *Connection) InsertGetId(query string, args ...interface{}) (int64, error) {
+	switch strings.ToLower(c.driver) {
+	case "postgres", "postgresql", "pgsql", "sqlserver":
+		ids := []int64{}
+		if err := c.runSelect(query, args, &ids, true, true); err != nil {
+			return 0, err
+		}
+		if len(ids) == 0 {
+			return 0, errors.New("torm: insert get id returned no rows")
+		}
+		// returning 路径经 runSelect（读通道执行），补写标记——sticky 语义
+		// 与 affectingStatement 路径一致
+		c.recordsHaveBeenModified(true)
+		return ids[0], nil
+	}
 	insertId, _, err := c.affectingStatement(query, args...)
 	return insertId, err
 }
@@ -801,14 +821,14 @@ func (c *Connection) dispatchEvent(name string, model any) {
 	}
 }
 
-// BeforeStartingTransaction 注册事务开始前的回调（对应 Laravel 同名 API）。
+// BeforeStartingTransaction 注册事务开始前的回调。
 func (c *Connection) BeforeStartingTransaction(fn func()) {
 	c.txMu.Lock()
 	c.beforeStartingTransaction = append(c.beforeStartingTransaction, fn)
 	c.txMu.Unlock()
 }
 
-// BeforeExecuting 注册每条语句执行前的回调（对应 Laravel 同名 API）。
+// BeforeExecuting 注册每条语句执行前的回调。
 func (c *Connection) BeforeExecuting(fn func(query string, bindings []any)) {
 	c.beforeExecutingMu.Lock()
 	c.beforeExecuting = append(c.beforeExecuting, fn)
@@ -825,28 +845,56 @@ func (c *Connection) fireBeforeExecuting(query string, bindings []any) {
 	}
 }
 
-// Driver 返回连接驱动名（对应 Laravel Connection::getDriverName）。
+// Driver 返回连接驱动名。
 func (c *Connection) Driver() string {
 	return c.driver
 }
 
-// GetQueryGrammar 按 driver 构造方言 grammar，并接线上表前缀。
-// 对应 Laravel 各连接子类的 getDefaultQueryGrammar 方言分发：PG/SQLite/
+// WriteDB 返回主（写）句柄快照（connMu 保护；迁移锁等需要专用物理连接的
+// 场景经 db.Conn 再取独占连接）。
+func (c *Connection) WriteDB() *sql.DB {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+	return c.DB
+}
+
+// GetQueryGrammar 按 driver 构造方言 grammar，并接线上表前缀与 Config 方言
+// 开关（ServerVersion/IsMariaDB/UseUpsertAlias/UseLegacyGroupLimit——此前这些
+// setter 只有 schema 侧可达，查询路径上是死代码）。
+// 按 driver 做方言分发：PG/SQLite/
 // SqlServer/MariaDb 连接必须路由到各自的语法编译器，否则运行时全部按 MySQL
 // 语法编译。
 func (c *Connection) GetQueryGrammar() grammar.Grammar {
+	// config 可能被 setConfig/SetDatabaseName 热替换（stateMu 保护），快照读取
+	c.stateMu.Lock()
+	cfg := c.config
+	c.stateMu.Unlock()
 	var g grammar.Grammar
 	switch strings.ToLower(c.driver) {
 	case "postgres", "postgresql", "pgsql":
 		g = grammar.NewPostgresGrammar()
 	case "sqlite":
-		g = grammar.NewSqliteQueryGrammar()
+		sq := grammar.NewSqliteQueryGrammar()
+		if cfg.UseLegacyGroupLimit {
+			sq.SetUseLegacyGroupLimit(true)
+		}
+		g = sq
 	case "sqlserver":
 		g = grammar.NewSqlServerGrammar()
 	case "mariadb":
 		g = grammar.NewMariaDbGrammar()
 	default:
-		g = grammar.NewMySqlGrammar()
+		mg := grammar.NewMySqlGrammar()
+		if cfg.ServerVersion != "" {
+			mg.SetServerVersion(cfg.ServerVersion)
+		}
+		if cfg.IsMariaDB {
+			mg.SetIsMaria(true)
+		}
+		if cfg.UseUpsertAlias != nil {
+			mg.SetUseUpsertAlias(*cfg.UseUpsertAlias)
+		}
+		g = mg
 	}
 	g.SetTablePrefix(c.tablePrefix)
 	return g
@@ -1012,6 +1060,8 @@ func (c *Connection) initReadDB(dsns []string) error {
 	if err != nil {
 		return err
 	}
+	// 只读连接同样应用池参数（旧实现仅写连接生效）
+	applyPoolParams(db, c.configForReconnect())
 	c.readDB = db
 	c.readDsn = dsn
 	return nil
@@ -1031,10 +1081,11 @@ func (c *Connection) readQueryerUnlocked(forceWrite bool) queryer {
 	if tx != nil {
 		return tx
 	}
+	now := time.Now()
 	c.stateMu.Lock()
 	pinned := c.pinnedType
 	readOnWrite := c.readOnWriteConnection
-	stickyHit := c.recordsModified && c.sticky
+	stickyHit := c.sticky && c.stickyActiveLocked(now)
 	c.stateMu.Unlock()
 	c.connMu.Lock()
 	readDB, mainDB := c.readDB, c.DB
@@ -1070,13 +1121,32 @@ func (c *Connection) UseWriteConnectionWhenReading(value ...bool) {
 // ---- recordsModified 跟踪（对应 hasModifiedRecords 等） ----
 
 // recordsHaveBeenModified 标记已发生写操作（仅首次为 true 时生效，对应
-// recordsHaveBeenModified 的幂等语义）。
+// recordsHaveBeenModified 的幂等语义；记录时间供 StickyWindowSec 判定）。
 func (c *Connection) recordsHaveBeenModified(value bool) {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
-	if !c.recordsModified {
-		c.recordsModified = value
+	if value {
+		// 每次写都刷新时间戳：StickyWindowSec 以"最近一次写"计时
+		// （首次写计时会让长进程窗口过期后误回落只读库）
+		c.recordsModified = true
+		c.recordsModifiedAt = time.Now()
+		return
 	}
+	c.recordsModified = false
+}
+
+// stickyActive 判定 sticky 窗口是否命中：StickyWindowSec > 0 时仅在窗口期内
+// 强制主库读（默认 0 = 进程生命周期内永久粘主——1.x 语义；
+// Go 无请求上下文时建议配置窗口时间）。
+func (c *Connection) stickyActiveLocked(now time.Time) bool {
+	if !c.recordsModified {
+		return false
+	}
+	window := c.config.StickyWindowSec
+	if window <= 0 {
+		return true
+	}
+	return now.Sub(c.recordsModifiedAt) < time.Duration(window)*time.Second
 }
 
 // HasModifiedRecords 报告自上次重置以来是否发生过写操作。
@@ -1130,7 +1200,7 @@ func (c *Connection) CursorQuery(query string, bindings []interface{}, forceWrit
 	var stmt *sql.Stmt
 	var rows *sql.Rows
 	var columns []string
-	err := c.run(query, bindings, rw, true, false, func(q queryer) error {
+	err := c.run(query, bindings, rw, true, forceWrite, func(q queryer) error {
 		var err error
 		stmt, err = c.prepareStmt(q, query)
 		if err != nil {
@@ -1138,10 +1208,19 @@ func (c *Connection) CursorQuery(query string, bindings []interface{}, forceWrit
 		}
 		rows, err = stmt.Query(c.prepareBindings(bindings)...)
 		if err != nil {
+			// 打开失败时释放已 Prepare 的语句，避免池连接被钉住泄漏
+			stmt.Close()
+			stmt = nil
 			return err
 		}
 		columns, err = rows.Columns()
-		return err
+		if err != nil {
+			rows.Close()
+			stmt.Close()
+			rows, stmt = nil, nil
+			return err
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -1285,8 +1364,8 @@ type threadCountCompiler interface {
 	CompileThreadCount() string
 }
 
-// compileThreadCount 返回线程/连接数查询（对齐 Laravel 各方言 grammar 的
-// compileThreadCount；未支持的驱动返回空串）。
+// compileThreadCount 返回线程/连接数查询（按方言 grammar 的
+// compileThreadCount 编译；未支持的驱动返回空串）。
 func (c *Connection) compileThreadCount() string {
 	if tc, ok := c.GetQueryGrammar().(threadCountCompiler); ok {
 		return tc.CompileThreadCount()

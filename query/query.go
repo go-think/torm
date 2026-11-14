@@ -1,8 +1,8 @@
 package query
 
-// Query 是 Laravel Query Builder 状态的 Go 映射。
-// 字段语义与 Illuminate\Database\Query\Builder 的属性一一对应；
-// nil/零值表示 Laravel 中的 null（未设置）。
+// Query 是查询构建器的状态结构。
+// 字段语义与常见查询构建器（query builder）的属性一一对应；
+// nil/零值表示未设置（null）。
 
 type Query struct {
 	Aggregate *Aggregate
@@ -25,12 +25,12 @@ type Query struct {
 	// Groups: 元素为 string 或 Expression
 	Groups []any
 
-	// Havings 与 Where 同构（Laravel havings 即 where 数组）
+	// Havings 与 Where 同构（havings 即 where 数组）
 	Havings []*Where
 
 	Orders []*Order
 
-	// Limit/Offset: nil 表示未设置（对应 Laravel 的 null）
+	// Limit/Offset: nil 表示未设置（null）
 	Limit  *int64
 	Offset *int64
 
@@ -42,11 +42,11 @@ type Query struct {
 	// Lock: nil / bool / string
 	Lock any
 
-	// CTE（Laravel 10+ with/withRecursive）
+	// CTE（with/withRecursive）
 	Withes        []*With
 	WithRecursive bool
 
-	// GroupLimit：Eloquent 预加载分组 limit（compileGroupLimit）
+	// GroupLimit：预加载分组 limit（compileGroupLimit）
 	GroupLimit *GroupLimit
 
 	// 标记当前 Query 是 join 子句（编译 on 而非 where）
@@ -61,7 +61,7 @@ type Aggregate struct {
 	Columns  []any
 }
 
-// IndexHint 对应 Laravel 的 Query\IndexHint：type ∈ hint/force/ignore
+// IndexHint 索引提示：type ∈ hint/force/ignore
 type IndexHint struct {
 	Type  string
 	Index string
@@ -72,9 +72,9 @@ type Join struct {
 	Type string
 	// Table: string 或 Expression（joinSub / joinLateral 场景）
 	Table any
-	// Lateral 标记 lateral join（Laravel JoinLateralClause）
+	// Lateral 标记 lateral join（joinLateral 子句）
 	Lateral bool
-	// 嵌套 join（Laravel JoinClause->joins）
+	// 嵌套 join（JoinClause->joins）
 	Joins  []*Join
 	Wheres []*Where
 }
@@ -88,7 +88,7 @@ type Where struct {
 	// whereColumn 的两列比较 / whereRowValues 等
 	First  any
 	Second any
-	// 括号分组字段（Laravel whereBetweenColumns / RowValues 的多列）
+	// 括号分组字段（whereBetweenColumns / RowValues 的多列）
 	Columns []any
 	// Raw 的 SQL 片段（string 或 Expression）
 	Sql any
@@ -120,7 +120,7 @@ type Union struct {
 	Query *Query
 }
 
-// GroupLimit 对应 Laravel 的 groupLimit（预加载分组限额）。
+// GroupLimit 表示 groupLimit（预加载分组限额）。
 type GroupLimit struct {
 	Column string
 	Value  int64

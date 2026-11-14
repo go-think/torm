@@ -4,7 +4,7 @@ import (
 	"strings"
 )
 
-// ColumnDefinition 对应 Laravel Schema\ColumnDefinition。
+// ColumnDefinition 为单列的 Schema 定义。
 // 字段为导出结构体字段；fluent 修饰符方法见下方（与字段同名的方法在 Go 中
 // 不允许共存，故部分 setter 以 Set 前缀命名）。
 type ColumnDefinition struct {
@@ -44,7 +44,7 @@ type ColumnDefinition struct {
 	Dimensions         int      // vector 维度
 }
 
-// IndexDefinition 对应 Laravel 的索引定义。
+// IndexDefinition 为索引定义。
 type IndexDefinition struct {
 	Type    string // index / unique / primary / foreign / fulltext / spatialindex / vectorindex
 	Name    string
@@ -125,7 +125,7 @@ func (i *IndexDefinition) NoActionOnUpdate() *IndexDefinition {
 	return i
 }
 
-// Command 对应 Laravel 中一条 DDL 命令（dropColumn / renameColumn / dropIndex 等）。
+// Command 为一条 DDL 命令（dropColumn / renameColumn / dropIndex 等）。
 type Command struct {
 	Name    string // dropColumn / renameColumn / rename / dropPrimary / dropUnique / dropIndex / dropFullText / dropSpatialIndex / dropVectorIndex / dropForeign / renameIndex / drop / dropIfExists
 	Columns []string
@@ -135,7 +135,7 @@ type Command struct {
 	Comment string
 }
 
-// Blueprint 对应 Laravel Schema\Blueprint。
+// Blueprint 为一张表的 Schema 定义（建表与变更命令的载体）。
 type Blueprint struct {
 	Table     string
 	Create    bool
@@ -154,7 +154,7 @@ func NewBlueprint(table string) *Blueprint {
 }
 
 // CreateIndexName 对应 Blueprint::createIndexName（:1826-1839）：table_cols_type，
-// 全小写，'-'/'.' 替换为 '_'。Laravel 不做长度截断，保持一致。
+// 全小写，'-'/'.' 替换为 '_'，不做长度截断。
 func (b *Blueprint) CreateIndexName(kind string, columns []string) string {
 	index := strings.ToLower(b.Table + "_" + strings.Join(columns, "_") + "_" + kind)
 	return strings.NewReplacer("-", "_", ".", "_").Replace(index)
@@ -167,7 +167,7 @@ func (b *Blueprint) addColumn(def *ColumnDefinition) *ColumnDefinition {
 	return def
 }
 
-// ID 自增主键（bigIncrements，Laravel 10+ 默认）。
+// ID 自增主键（bigIncrements）。
 func (b *Blueprint) ID(name ...string) *ColumnDefinition {
 	n := "id"
 	if len(name) > 0 {
@@ -186,7 +186,7 @@ func (b *Blueprint) Increments(name string) *ColumnDefinition {
 	return b.addColumn(&ColumnDefinition{Name: name, Type: "int", IsUnsigned: true, IsNullable: false, IsAutoIncrement: true, PrimaryKey: true})
 }
 
-// IntegerIncrements int 自增主键（同 Increments，对齐 Laravel integerIncrements）。
+// IntegerIncrements int 自增主键（同 Increments，即 integerIncrements）。
 func (b *Blueprint) IntegerIncrements(name string) *ColumnDefinition {
 	return b.Increments(name)
 }
@@ -294,7 +294,7 @@ func (b *Blueprint) UnsignedBigInteger(name string) *ColumnDefinition {
 	return b.addColumn(&ColumnDefinition{Name: name, Type: "bigint", IsUnsigned: true})
 }
 
-// Float 单精度浮点（precision 可选，Laravel 默认 53）。
+// Float 单精度浮点（precision 可选，缺省 53）。
 func (b *Blueprint) Float(name string, precision ...int) *ColumnDefinition {
 	p := 0
 	if len(precision) > 0 {
@@ -519,7 +519,7 @@ func (c *ColumnDefinition) StartingValue(v int64) *ColumnDefinition {
 	return c
 }
 
-// Unsigned 无符号 setter（字段名 IsUnsigned，对应 Laravel unsigned 修饰符）。
+// Unsigned 无符号 setter（字段名 IsUnsigned，即 unsigned 修饰符）。
 func (c *ColumnDefinition) Unsigned(v ...bool) *ColumnDefinition {
 	c.IsUnsigned = len(v) == 0 || v[0]
 	return c
@@ -537,7 +537,7 @@ func (c *ColumnDefinition) SetComment(text string) *ColumnDefinition {
 	return c
 }
 
-// Change 标记该列为 alter change（对应 Laravel ->change()）。
+// Change 标记该列为 alter change（->change() 语义）。
 func (c *ColumnDefinition) Change(v ...bool) *ColumnDefinition {
 	c.IsChange = len(v) == 0 || v[0]
 	return c
@@ -879,7 +879,7 @@ func (b *Blueprint) Rename(to string) {
 }
 
 // DropIndexCommand 家族：index 参数既可为显式索引名，也可为列切片（按惯例名推导）。
-// index 缺省时对齐 Laravel indexCommand 的回退：以命令名作为 createIndexName
+// index 缺省时的回退：以命令名作为 createIndexName
 // 的 type（如 DropPrimary() → {table}__dropprimary）。
 func (b *Blueprint) addDropIndexCommand(name, kind string, index any) *Command {
 	cmd := &Command{Name: name}

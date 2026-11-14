@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-// MariaDB Schema 编译继承 MySqlGrammar（对齐 Laravel 13 MariaDbGrammar：
+// MariaDB Schema 编译继承 MySqlGrammar：
 // 未覆写任何 schema compile 方法；json 类型在 MariaDB 10.5+ 服务端即
-// longtext + json_valid check 别名）。
+// longtext + json_valid check 别名。
 
 func mariaG() *MariaDbGrammar { return NewMariaDbGrammar() }
 

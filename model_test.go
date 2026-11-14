@@ -172,7 +172,7 @@ func TestModelSaveEventOrderAndObserverMutation(t *testing.T) {
 }
 
 // 第 1 条：Save 无脏列时不发 UPDATE 业务列；带时间戳的模型仍会触碰 updated_at
-// （对齐 Laravel updateTimestamps 的 touch 语义），无时间戳的干净模型则完全无 SQL。
+// （保存时自动触碰 updated_at），无时间戳的干净模型则完全无 SQL。
 func TestModelSaveCleanSkipsSQL(t *testing.T) {
 	conn, st := newFakeDB(t)
 	sel := "select * from `posts` where `id` = ? and `posts`.`deleted_at` is null limit 1"
@@ -189,7 +189,7 @@ func TestModelSaveCleanSkipsSQL(t *testing.T) {
 	})
 	defer conn.Observe(&Post{}, nil)
 
-	// 干净保存：Laravel save() 先判 isDirty——不发任何 SQL（含 touch）、
+	// 干净保存：save 先判 isDirty——无脏列则不发任何 SQL（含 touch）、
 	// 不触发 updating/updated，仅 finishSave 的 saved 事件。
 	if err := conn.Save(p); err != nil {
 		t.Fatal(err)
@@ -252,8 +252,8 @@ func TestModelSaveCleanWithoutTimestampsSkipsSQL(t *testing.T) {
 	st.LastCall(t, upd)
 }
 
-// Laravel save() 以 exists 决定 insert/update：手工构造（未水合）的模型即便
-// 主键有值也走 INSERT（主键列一并写入，对齐 Model.php:1441）。
+// save 以 exists 决定 insert/update：手工构造（未水合）的模型即便
+// 主键有值也走 INSERT（主键列一并写入）。
 func TestModelSaveHandBuiltInserts(t *testing.T) {
 	conn, st := newFakeDB(t)
 	now := time.Now()
@@ -356,7 +356,7 @@ func TestModelDeleteSoftTouchesUpdatedAtAndFiresTrashed(t *testing.T) {
 	conn.Observe(&Post{}, &Observer{Trashed: func(any) error { trashed++; return nil }})
 	defer conn.Observe(&Post{}, nil)
 
-	// 先水合模型（Laravel delete() 对 exists=false 的模型静默返回）
+	// 先水合模型（delete 对 exists=false 的模型静默返回）
 	sel := "select * from `posts` where `id` = ? and `posts`.`deleted_at` is null limit 1"
 	st.On(sel, &fakeResult{Columns: []string{"id", "title"}, Rows: [][]driver.Value{{int64(3), "t"}}})
 	p := Post{ID: 3, Title: "t"}
@@ -402,7 +402,7 @@ func TestModelDeleteSoftAndRestore(t *testing.T) {
 	})
 	defer conn.Observe(&Post{}, nil)
 
-	// 先水合模型（Laravel delete() 对 exists=false 的模型静默返回）
+	// 先水合模型（delete 对 exists=false 的模型静默返回）
 	sel := "select * from `posts` where `id` = ? and `posts`.`deleted_at` is null limit 1"
 	st.On(sel, &fakeResult{Columns: []string{"id", "title"}, Rows: [][]driver.Value{{int64(3), "t"}}})
 	p := Post{ID: 3, Title: "t"}
@@ -455,7 +455,7 @@ func TestModelRestoreAbortsOnRestoringError(t *testing.T) {
 
 func TestModelForceDelete(t *testing.T) {
 	conn, st := newFakeDB(t)
-	// 先水合（Laravel forceDelete→delete() 对 !exists 静默返回，forceDeleted 不触发）
+	// 先水合（forceDelete 对 !exists 静默返回，forceDeleted 事件不触发）
 	sel := "select * from `posts` where `id` = ? and `posts`.`deleted_at` is null limit 1"
 	st.On(sel, &fakeResult{Columns: []string{"id", "title"}, Rows: [][]driver.Value{{int64(5), "t"}}})
 	p := Post{ID: 5, Title: "t"}
@@ -523,10 +523,10 @@ func TestModelBuilderDeleteSoftDeletes(t *testing.T) {
 	var deleted, trashed int
 	bus := NewEventBus()
 	conn.SetEventDispatcher(bus)
-	// Laravel builder 级 onDelete 不分发任何模型事件（无模型实例）：
+	// builder 级 onDelete 不分发任何模型事件（无模型实例）：
 	// 两个计数应保持 0
 
-	// exists 守卫：需先水合模型（Laravel delete() 对 !exists 静默返回）
+	// exists 守卫：需先水合模型（delete 对 !exists 静默返回）
 	sel := "select * from `posts` where `title` = ? and `posts`.`deleted_at` is null"
 	st.On(sel, &fakeResult{Columns: []string{"id", "title"}, Rows: [][]driver.Value{{int64(1), "x"}, {int64(2), "x"}}})
 	var dp []Post
@@ -547,7 +547,7 @@ func TestModelBuilderDeleteSoftDeletes(t *testing.T) {
 	if tv, ok := call.Args[0].(time.Time); !ok || tv.IsZero() {
 		t.Errorf("deleted_at arg = %#v", call.Args[0])
 	}
-	// builder 级删除无模型实例：Laravel onDelete 不分发模型事件
+	// builder 级删除无模型实例：onDelete 不分发模型事件
 	if deleted != 0 || trashed != 0 {
 		t.Errorf("events deleting=%d trashed=%d, want 0/0", deleted, trashed)
 	}
@@ -725,7 +725,7 @@ func TestModelRestoreOrCreate(t *testing.T) {
 	st2.On(sel, &fakeResult{Columns: []string{"id"}, Rows: nil})
 	insert := "insert into `articles` (`created_at`, `slug`, `title`, `updated_at`) values (?, ?, ?, ?)"
 	st2.On(insert, &fakeResult{Affected: 1, LastID: 2})
-	// 创建后的 restore 触碰 updated_at（Laravel restore() 语义）
+	// 创建后的 restore 触碰 updated_at（恢复软删时同步更新时间戳）
 	touch := "update `articles` set `updated_at` = ? where `id` = ?"
 	st2.On(touch, &fakeResult{Affected: 1})
 
@@ -1288,7 +1288,7 @@ func TestModelExistsAndWasRecentlyCreated(t *testing.T) {
 	})
 	defer conn.Observe(&Article{}, nil)
 
-	// creating 钩子内 exists=false（对齐 Laravel）
+	// creating 钩子内 exists=false（尚未入库）
 	if Exists(a) {
 		t.Fatal("new model should not exist")
 	}
@@ -1313,7 +1313,7 @@ func TestModelExistsAndWasRecentlyCreated(t *testing.T) {
 		t.Error("hydrated model: exists=true wasRecentlyCreated=false")
 	}
 
-	// Laravel runSoftDelete 不改 exists（SoftDeletes.php:137-158）：
+	// runSoftDelete 不改 exists：
 	// 软删后 exists 保持 true（trashed 状态经 deleted_at 判断），wasRecentlyCreated=false
 	del := "update `articles` set `deleted_at` = ?, `updated_at` = ? where `id` = ?"
 	st.On(del, &fakeResult{Affected: 1})
@@ -1391,7 +1391,7 @@ func TestModelCastWrite(t *testing.T) {
 		t.Errorf("score = %#v", call.Args[5])
 	}
 	if call.Args[6] != "[]" {
-		t.Errorf("tags = %#v, want [] (空集合写 []，对齐 Laravel)", call.Args[6])
+		t.Errorf("tags = %#v, want [] (空集合写 [])", call.Args[6])
 	}
 }
 
@@ -1412,7 +1412,7 @@ func TestModelCastRead(t *testing.T) {
 	if err := conn.Table("cast_doc").Where("id", "=", 1).First(d); err != nil {
 		t.Fatal(err)
 	}
-	// date cast：截断到当天零点（对齐 Laravel asDate）
+	// date cast：截断到当天零点（asDate 语义）
 	if want := time.Date(2020, 5, 6, 0, 0, 0, 0, time.UTC); !d.Birthday.Equal(want) {
 		t.Errorf("birthday = %v, want %v", d.Birthday, want)
 	}
@@ -1436,7 +1436,7 @@ func TestModelCastRead(t *testing.T) {
 	}
 }
 
-// json/array 空值写 null/[]（对齐 Laravel），修正"零值跳过写入"偏差。
+// json/array 空值写 null/[]，修正"零值跳过写入"偏差。
 func TestModelCastEmptyValueSemantics(t *testing.T) {
 	conn, st := newFakeDB(t)
 	insert := "insert into `app_setting` (`config`, `name`) values (?, ?)"
@@ -1593,8 +1593,7 @@ func TestModelTimestampsFalseTag(t *testing.T) {
 
 var _ = errors.New
 
-
-// 模型建器 Update 自动触碰 updated_at（Laravel Eloquent Builder::addUpdatedAtColumn）。
+// 模型建器 Update 自动触碰 updated_at（builder 级补写 updated_at 列）。
 func TestModelBuilderUpdateTouchesUpdatedAt(t *testing.T) {
 	conn, st := newFakeDB(t)
 	upd := "update `posts` set `title` = ?, `updated_at` = ? where `id` = ? and `posts`.`deleted_at` is null"
@@ -1613,7 +1612,7 @@ func TestModelBuilderUpdateTouchesUpdatedAt(t *testing.T) {
 	}
 }
 
-// ---- 模型级 Update（Laravel Model::update = fill + save）----
+// ---- 模型级 Update（fill + save 组合）----
 
 func TestModelUpdateModel(t *testing.T) {
 	conn, st := newFakeDB(t)
@@ -1906,7 +1905,7 @@ func TestBuilderFirstOrCreateFamily(t *testing.T) {
 	}
 }
 
-// ---- incrementOrCreate（Laravel 13 Builder.php:786）----
+// ---- incrementOrCreate ----
 
 type CounterDoc struct {
 	ID        int64     `torm:"primary_key;column:id"`
@@ -2031,7 +2030,7 @@ func TestModelLoadAggregateFamily(t *testing.T) {
 	rel := HasMany{Model: CountPost{}, ForeignKey: "user_id"}
 
 	// LoadCount
-	cnt := "select (select count(*) from `count_posts` where `count_posts`.`user_id` = `count_users`.`id`) as `posts_count` from `count_users` where `id` = ? limit 1"
+	cnt := "select (select count(*) as `aggregate` from `count_posts` where `count_posts`.`user_id` = `count_users`.`id`) as `posts_count` from `count_users` where `id` = ? limit 1"
 	st.On(cnt, &fakeResult{Columns: []string{"posts_count"}, Rows: [][]driver.Value{{int64(3)}}})
 	if err := conn.LoadCount(u, "posts", rel); err != nil {
 		t.Fatal(err)
@@ -2041,7 +2040,7 @@ func TestModelLoadAggregateFamily(t *testing.T) {
 	}
 
 	// LoadSum
-	sum := "select (select sum(`votes`) from `count_posts` where `count_posts`.`user_id` = `count_users`.`id`) as `posts_sum_votes` from `count_users` where `id` = ? limit 1"
+	sum := "select (select sum(`votes`) as `aggregate` from `count_posts` where `count_posts`.`user_id` = `count_users`.`id`) as `posts_sum_votes` from `count_users` where `id` = ? limit 1"
 	st.On(sum, &fakeResult{Columns: []string{"posts_sum_votes"}, Rows: [][]driver.Value{{int64(42)}}})
 	if err := conn.LoadSum(u, "posts", rel, "votes"); err != nil {
 		t.Fatal(err)
@@ -2061,7 +2060,7 @@ func TestModelLoadAggregateFamily(t *testing.T) {
 	}
 
 	// LoadMax / LoadMin / LoadAvg
-	mx := "select (select max(`votes`) from `count_posts` where `count_posts`.`user_id` = `count_users`.`id`) as `posts_max_votes` from `count_users` where `id` = ? limit 1"
+	mx := "select (select max(`votes`) as `aggregate` from `count_posts` where `count_posts`.`user_id` = `count_users`.`id`) as `posts_max_votes` from `count_users` where `id` = ? limit 1"
 	st.On(mx, &fakeResult{Columns: []string{"posts_max_votes"}, Rows: [][]driver.Value{{int64(9)}}})
 	if err := conn.LoadMax(u, "posts", rel, "votes"); err != nil {
 		t.Fatal(err)
@@ -2069,7 +2068,7 @@ func TestModelLoadAggregateFamily(t *testing.T) {
 	st.LastCall(t, mx)
 
 	// 带约束闭包 + 自定义别名（WithAggregate 同款 rest 语义）
-	aliased := "select (select count(*) from `count_posts` where `count_posts`.`user_id` = `count_users`.`id` and `votes` > ?) as `hot_count` from `count_users` where `id` = ? limit 1"
+	aliased := "select (select count(*) as `aggregate` from `count_posts` where `count_posts`.`user_id` = `count_users`.`id` and `votes` > ?) as `hot_count` from `count_users` where `id` = ? limit 1"
 	st.On(aliased, &fakeResult{Columns: []string{"hot_count"}, Rows: [][]driver.Value{{int64(2)}}})
 	if err := conn.LoadCount(u, "posts", rel, func(nb *Builder) { nb.Where("votes", ">", 5) }, "hot_count"); err != nil {
 		t.Fatal(err)
@@ -2115,7 +2114,7 @@ func TestModelLoadMorphAndCount(t *testing.T) {
 	}
 
 	// LoadMorphCount
-	cnt := "select (select count(*) from `morph_cmts` where `morph_cmts`.`commentable_id` = `morph_hosts`.`id` and `commentable_type` = 'morph_hosts') as `comments_count` from `morph_hosts` where `id` = ? limit 1"
+	cnt := "select (select count(*) as `aggregate` from `morph_cmts` where `morph_cmts`.`commentable_id` = `morph_hosts`.`id` and `commentable_type` = ?) as `comments_count` from `morph_hosts` where `id` = ? limit 1"
 	st.On(cnt, &fakeResult{Columns: []string{"comments_count"}, Rows: [][]driver.Value{{int64(2)}}})
 	if err := conn.LoadMorphCount(host, "comments", rel); err != nil {
 		t.Fatal(err)
@@ -2380,7 +2379,7 @@ func TestBuilderHasCountThreshold(t *testing.T) {
 		t.Errorf("Has(rel, '<', 1) sql = %s\nwant %s", sql, want)
 	}
 
-	// Laravel canUseExistsForExistenceCheck 严格要求 count === 1（:1135-1138），
+	// 存在性检查严格要求 count === 1：
 	// 无绝对值归一：负数阈值原样进入 count 子查询比较
 	sql = conn.Model(CountUser{}).Has(rel, ">=", -5).ToSql()
 	if !strings.Contains(sql, ">= -5") {

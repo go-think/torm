@@ -10,7 +10,7 @@ import (
 	"github.com/go-think/torm/query"
 )
 
-// PostgresGrammar 对应 Illuminate\Database\Query\Grammars\PostgresGrammar。
+// PostgresGrammar 为 PostgreSQL 方言查询编译器。
 type PostgresGrammar struct {
 	QueryGrammar
 }
@@ -202,7 +202,9 @@ func (g *PostgresGrammar) compileJsonContainsKey(column string) string {
 		i = lastSegment
 	} else if m := jsonTrailingIndex.FindStringSubmatch(lastSegment); m != nil {
 		segments = append(segments, strings.TrimSuffix(lastSegment, m[0]))
-		i = m[1]
+		// m[0] 带方括号（如 "[0]"），必须剥离后再转整数——
+		// 旧实现 atoi("[0]") 逐字符累加产出无意义数字
+		i = strings.TrimSuffix(strings.TrimPrefix(m[0], "["), "]")
 	}
 
 	col := strings.ReplaceAll(g.Wrap(strings.Join(segments, "->")), "->>", "->")
@@ -252,7 +254,7 @@ func (g *PostgresGrammar) wrapJsonBooleanValue(value string) string {
 	return "'" + value + "'::jsonb"
 }
 
-// parseJsonPathArrayKeys 对应 Laravel PostgresGrammar::parseJsonPathArrayKeys：
+// parseJsonPathArrayKeys 解析 JSON 路径中的数组下标：
 // 把 "attr[0][1]" 拆为 ["attr", "0", "1"]（取括号内内容，不带方括号）。
 // 返回原始片段，引号由 wrapJsonPathAttributes 按 quote 参数统一添加。
 func (g *PostgresGrammar) parseJsonPathArrayKeys(segment string) []string {
@@ -269,7 +271,7 @@ func (g *PostgresGrammar) parseJsonPathArrayKeys(segment string) []string {
 		out = append(out, key)
 	}
 	for _, k := range keys {
-		// 对应 Laravel 的 ->diff('')：剔除空片段
+		// 剔除空片段
 		if k[1] != "" {
 			out = append(out, k[1])
 		}
@@ -277,11 +279,11 @@ func (g *PostgresGrammar) parseJsonPathArrayKeys(segment string) []string {
 	return out
 }
 
-// jsonArrayKeyPattern 对应 Laravel 的 preg_match_all('/\[([^\]]+)\]/', ...)。
+// jsonArrayKeyPattern 匹配 JSON 路径中的数组下标片段（[...]）。
 var jsonArrayKeyPattern = regexp.MustCompile(`\[([^\]]+)\]`)
 
-// wrapJsonPathAttributes 对应 Laravel PostgresGrammar::wrapJsonPathAttributes：
-// 展开数组下标后逐段加引号；整数下标保持裸数字（filter_var FILTER_VALIDATE_INT）。
+// wrapJsonPathAttributes 展开 JSON 路径的数组下标后逐段加引号；
+// 整数下标保持裸数字（不做引号包裹）。
 func (g *PostgresGrammar) wrapJsonPathAttributes(path []string, quote string) []string {
 	var attrs []string
 	for _, attribute := range path {
@@ -407,7 +409,7 @@ func (g *PostgresGrammar) compileUpsert(q *query.Query, rows []query.Row, unique
 	return sql + strings.Join(cols, ", "), bindings
 }
 
-// CompileDelete 对应 Laravel PostgresGrammar::compileDelete：
+// CompileDelete 编译 delete 语句：
 // 带 joins 或 limit 时改写为 delete ... where ctid in (select ctid ...)。
 func (g *PostgresGrammar) CompileDelete(q *query.Query) string {
 	if len(q.Joins) > 0 || q.Limit != nil {
@@ -416,8 +418,8 @@ func (g *PostgresGrammar) CompileDelete(q *query.Query) string {
 	return g.QueryGrammar.CompileDelete(q)
 }
 
-// compileDeleteWithJoinsOrLimit 对应 Laravel PostgresGrammar::compileDeleteWithJoinsOrLimit：
-// $query->select($alias.'.ctid') 后 compileSelect（joins/wheres/limit 保留在子查询内）。
+// compileDeleteWithJoinsOrLimit 带 joins 或 limit 的 delete 改写为 ctid 子查询：
+// select <alias>.ctid 后 compileSelect（joins/wheres/limit 保留在子查询内）。
 func (g *PostgresGrammar) compileDeleteWithJoinsOrLimit(q *query.Query) string {
 	table := g.WrapTable(q.From)
 
@@ -593,7 +595,7 @@ func (g *PostgresGrammar) compileUpdateWithJoinsOrLimit(q *query.Query, values m
 		alias = alias[i+1:]
 	}
 
-	// ctid 子查询（对应 Laravel compileUpdateWithJoinsOrLimit:649-660）：
+	// ctid 子查询：
 	// 复用原 query 仅替换列为 ctid，orders/limit/offset 保留在子查询内
 	// （与同文件 delete ctid 路径语义一致）
 	sub := *q

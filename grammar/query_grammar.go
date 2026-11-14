@@ -1,16 +1,18 @@
 package grammar
 
 import (
+	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-think/torm/query"
 )
 
 // dialectHooks 汇集方言差异点；nil 时使用 QueryGrammar 的基础实现。
-// 基础实现与 Laravel Query\Grammars\Grammar 的行为一致。
+// 基础实现即各数据库通用的标准 SQL 行为。
 type dialectHooks struct {
 	// 标识符 / JSON（多数已挂在 BaseGrammar 上）
 	compileIndexHintFn func(q *query.Query, hint *query.IndexHint) string
@@ -34,16 +36,16 @@ type dialectHooks struct {
 	compileJsonUpdateColFn   func(key string, value any) string
 
 	// 杂项
-	dateBasedWhereFn    func(kind string, q *query.Query, w *query.Where) string
-	compileLimitFn      func(q *query.Query, limit int64) string
-	compileOffsetFn     func(q *query.Query, offset int64) string
-	compileLockFn       func(q *query.Query, value any) string
-	compileRandomFn     func(seed any) string
-	compileColumnsFn    func(q *query.Query, columns []any) string
-	compileFromFn       func(q *query.Query, table any) string
-	compileDistinctOn   func(columns []any) string
-	wrapUnionFn         func(sql string) string
-	compileRowNumberFn  func(partition, orders string) string
+	dateBasedWhereFn     func(kind string, q *query.Query, w *query.Where) string
+	compileLimitFn       func(q *query.Query, limit int64) string
+	compileOffsetFn      func(q *query.Query, offset int64) string
+	compileLockFn        func(q *query.Query, value any) string
+	compileRandomFn      func(seed any) string
+	compileColumnsFn     func(q *query.Query, columns []any) string
+	compileFromFn        func(q *query.Query, table any) string
+	compileDistinctOn    func(columns []any) string
+	wrapUnionFn          func(sql string) string
+	compileRowNumberFn   func(partition, orders string) string
 	compileJoinLateralFn func(expr, joinType string) string
 	// supportsStraightJoinsFn：nil = 不支持（straight_join 抛错）
 	supportsStraightJoinsFn func() bool
@@ -70,7 +72,7 @@ type dialectHooks struct {
 	compileHavingBitwiseFn func(h *query.Where) string
 }
 
-// QueryGrammar 对应 Illuminate\Database\Query\Grammars\Grammar（共享编译逻辑）。
+// QueryGrammar 为各数据库方言共享的查询编译逻辑基类。
 type QueryGrammar struct {
 	BaseGrammar
 	dialectHooks
@@ -83,7 +85,7 @@ func (g *QueryGrammar) SetSelectComponents(components []string) {
 	g.selectComponentsOverride = components
 }
 
-// TruncateStatement：一条 truncate 语句及其绑定（Laravel compileTruncate 返回 map）。
+// TruncateStatement：一条 truncate 语句及其绑定（编译结果按表分组返回）。
 type TruncateStatement struct {
 	Sql      string
 	Bindings []any
@@ -128,6 +130,11 @@ func (g *QueryGrammar) CompileSelect(q *query.Query) string {
 	}
 
 	sql := strings.TrimSpace(g.concatenateNamed(g.compileComponents(q)))
+
+	// CTE 前置于 select（compileSelect 中 withes 段前置）
+	if len(q.Withes) > 0 {
+		sql = g.compileWithes(q) + " " + sql
+	}
 
 	if len(q.Unions) > 0 {
 		sql = g.wrapUnion(sql) + " " + g.compileUnions(q)
@@ -219,7 +226,30 @@ func (g *QueryGrammar) concatenateNamed(components []namedComponent) string {
 	return g.concatenate(sqls)
 }
 
-// compileGroupLimit 对应 Laravel compileGroupLimit（row_number 分组限额）。
+// compileWithes 编译 CTE 前缀
+// （with "t" (c1, c2) as (select ...), "r" as (...) / with recursive ...）。
+func (g *QueryGrammar) compileWithes(q *query.Query) string {
+	prefix := "with "
+	if q.WithRecursive {
+		prefix = "with recursive "
+	}
+	statements := make([]string, 0, len(q.Withes))
+	for _, w := range q.Withes {
+		sql := g.wrapValue(w.Name)
+		if len(w.Columns) > 0 {
+			cols := make([]string, 0, len(w.Columns))
+			for _, c := range w.Columns {
+				cols = append(cols, g.wrapValue(c))
+			}
+			sql += " (" + strings.Join(cols, ", ") + ")"
+		}
+		sql += " as (" + g.CompileSelect(w.Query) + ")"
+		statements = append(statements, sql)
+	}
+	return prefix + strings.Join(statements, ", ")
+}
+
+// compileGroupLimit 编译 row_number 分组限额。
 func (g *QueryGrammar) compileGroupLimit(q *query.Query) string {
 	limit := q.GroupLimit.Value
 	var offsetPtr *int64
@@ -253,8 +283,8 @@ func (g *QueryGrammar) compileGroupLimit(q *query.Query) string {
 		kept = append(kept, c)
 	}
 
-	table := g.Wrap("laravel_table")
-	row := g.Wrap("laravel_row")
+	table := g.Wrap("group_table")
+	row := g.Wrap("group_row")
 
 	sql := strings.TrimSpace(g.concatenateNamed(kept))
 
@@ -267,13 +297,13 @@ func (g *QueryGrammar) compileGroupLimit(q *query.Query) string {
 	return sql + " order by " + row
 }
 
-// compileRowNumber 对应 Laravel compileRowNumber。
+// compileRowNumber 编译 row_number() 窗口函数。
 func (g *QueryGrammar) compileRowNumber(partition, orders string) string {
 	if g.compileRowNumberFn != nil {
 		return g.compileRowNumberFn(partition, orders)
 	}
 	over := strings.TrimSpace("partition by " + g.Wrap(partition) + " " + orders)
-	return ", row_number() over (" + over + ") as " + g.Wrap("laravel_row")
+	return ", row_number() over (" + over + ") as " + g.Wrap("group_row")
 }
 
 func (g *QueryGrammar) compileAggregate(q *query.Query, agg *query.Aggregate) string {
@@ -319,7 +349,7 @@ func (g *QueryGrammar) compileJoins(q *query.Query, joins []*query.Join) string 
 			nested := g.compileJoins(q, join.Joins)
 			table = "(" + table + " " + nested + ")"
 		}
-		// lateral join（Laravel JoinLateralClause）
+		// lateral join 子句
 		if join.Lateral {
 			if g.compileJoinLateralFn == nil {
 				panic(ErrUnsupported{"This database engine does not support lateral joins."})
@@ -387,7 +417,7 @@ func (g *QueryGrammar) compileWhereByType(q *query.Query, w *query.Where) string
 		if g.whereLikeFn != nil {
 			return g.whereLikeFn(q, w)
 		}
-		// 基础方言对应 Laravel Query\Grammars\Grammar::whereLike：
+		// 基础方言的 whereLike 行为：
 		// 仅 caseSensitive 时抛错，否则按 like / not like 走基础比较。
 		return g.baseWhereLike(q, w)
 	case "NullSafeEquals":
@@ -487,7 +517,7 @@ func (g *QueryGrammar) whereBasic(q *query.Query, w *query.Where) string {
 	return g.Wrap(w.Column) + " " + operator + " " + value
 }
 
-// baseWhereLike 对应 Laravel 基础方言的 whereLike（caseSensitive 时抛错）。
+// baseWhereLike 基础方言的 whereLike（caseSensitive 时抛错）。
 func (g *QueryGrammar) baseWhereLike(q *query.Query, w *query.Where) string {
 	if w.CaseSensitive {
 		panic(ErrUnsupported{"This database engine does not support case sensitive like operations."})
@@ -737,7 +767,7 @@ func (g *QueryGrammar) compileOrders(q *query.Query, orders []*query.Order) stri
 	return "order by " + strings.Join(sqls, ", ")
 }
 
-// compileInOrderOf 对应 Laravel Grammar::compileInOrderOf：
+// compileInOrderOf 编译 order by field(col, ...) 等价形态：
 // case "col" = ? then 0 when ... else N end（按取值序列排序）。
 func (g *QueryGrammar) compileInOrderOf(order *query.Order) string {
 	column := g.Wrap(order.Column)
@@ -989,7 +1019,7 @@ func (g *QueryGrammar) compileUpdateWithJoins(q *query.Query, table, columns, wh
 	return "update " + table + " " + joins + " set " + columns + " " + where
 }
 
-// PrepareBindingsForUpdate 对应 Laravel 的绑定整理：join 绑定 + set 值 + 其余段绑定。
+// PrepareBindingsForUpdate 整理 update 绑定：join 绑定 + set 值 + 其余段绑定。
 func (g *QueryGrammar) PrepareBindingsForUpdate(bindings map[string][]any, values map[string]any) []any {
 	clean := make([]any, 0)
 	for _, v := range bindings["join"] {
@@ -1013,7 +1043,7 @@ func (g *QueryGrammar) PrepareBindingsForUpdate(bindings map[string][]any, value
 	return clean
 }
 
-// PrepareBindingsForDelete 对应 Laravel：除 select 外全部段。
+// PrepareBindingsForDelete 整理 delete 绑定：除 select 外全部段。
 func (g *QueryGrammar) PrepareBindingsForDelete(bindings map[string][]any) []any {
 	var out []any
 	for _, segment := range BindingSegments {
@@ -1082,7 +1112,7 @@ func (g *QueryGrammar) removeLeadingBoolean(value string) string {
 	return leadingBoolean.ReplaceAllString(value, "")
 }
 
-// SubstituteBindingsIntoRawSql 把绑定值内联进 SQL（对应 Laravel 同名方法）。
+// SubstituteBindingsIntoRawSql 把绑定值内联进 SQL。
 // 字符串字面量内跳过占位符，”/\' 转义成对跳过。
 func (g *QueryGrammar) SubstituteBindingsIntoRawSql(sql string, bindings []any) string {
 	var out strings.Builder
@@ -1140,6 +1170,12 @@ func (g *QueryGrammar) escapeBinding(value any) string {
 		return strconv.FormatUint(v, 10)
 	case float64:
 		return strconv.FormatFloat(v, 'f', -1, 64)
+	case time.Time:
+		// time.Time 按方言日期格式输出（旧实现 fmt.Sprint 输出 Go 时间字面量垃圾）
+		return "'" + g.GetDateFormatTime(v) + "'"
+	case []byte:
+		// 二进制绑定按 0x 十六进制字面量输出（旧实现输出 [104 101 ...] 切片格式）
+		return "0x" + hex.EncodeToString(v)
 	case string:
 		return "'" + strings.ReplaceAll(v, "'", "''") + "'"
 	default:
@@ -1147,7 +1183,32 @@ func (g *QueryGrammar) escapeBinding(value any) string {
 	}
 }
 
-// escapeOperator 对应 Laravel 的 str_replace('?', '??', $operator)（Postgres 运算符转义）。
+// GetDateFormatTime 把时间按方言 GetDateFormat 格式化。
+func (g *QueryGrammar) GetDateFormatTime(t time.Time) string {
+	layout := phpDateToGoLayoutStr(g.GetDateFormat())
+	return t.Format(layout)
+}
+
+func phpDateToGoLayoutStr(format string) string {
+	repl := map[byte]string{
+		'Y': "2006", 'y': "06",
+		'm': "01", 'n': "1",
+		'd': "02", 'j': "2",
+		'H': "15", 'G': "3", 'h': "03", 'g': "3",
+		'i': "04", 's': "05", 'v': "000", 'u': "000000",
+	}
+	var b strings.Builder
+	for i := 0; i < len(format); i++ {
+		if r, ok := repl[format[i]]; ok {
+			b.WriteString(r)
+		} else {
+			b.WriteByte(format[i])
+		}
+	}
+	return b.String()
+}
+
+// escapeOperator 把 '?' 替换为 '??'（Postgres 运算符转义）。
 func escapeOperator(operator string) string {
 	return strings.ReplaceAll(operator, "?", "??")
 }

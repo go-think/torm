@@ -2,6 +2,8 @@ package torm
 
 import (
 	"database/sql"
+	"errors"
+	"log"
 	"strconv"
 
 	"github.com/go-think/torm/events"
@@ -44,51 +46,82 @@ type txHook struct {
 // dispatchTxEvent 分发事务生命周期事件（无 dispatcher 时为 no-op）。
 func (c *Connection) dispatchTxEvent(name string) {
 	c.txMu.Lock()
-	d := c.dispatcher
 	level := c.level
-	name2 := c.name
 	c.txMu.Unlock()
+	c.dispatchTxEventWithLevel(name, level)
+}
+
+// dispatchTxEventWithLevel 以显式层级分发事务事件（锁外执行）。
+func (c *Connection) dispatchTxEventWithLevel(name string, level int) {
+	c.stateMu.Lock()
+	d := c.dispatcher
+	name2 := c.name
+	c.stateMu.Unlock()
 	if d != nil {
 		d.Dispatch(events.TransactionEvent{Name: name, TransactionLevel: level, ConnectionName: name2})
 	}
 }
 
 // dispatchTxEventLocked 在已持 txMu 锁的情况下分发事务事件（事件监听器不得
-// 调用事务 API）。
-func (c *Connection) dispatchTxEventLocked(name string) {
-	if c.dispatcher != nil {
-		c.dispatcher.Dispatch(events.TransactionEvent{
-			Name:            name,
-			TransactionLevel: c.level,
-			ConnectionName:  c.name,
+// 调用事务 API）。dispatcher/name 由 stateMu 保护：先在 stateMu 下拷贝快照，
+// 锁外分发（旧实现持 txMu 裸读 stateMu 保护的字段，构成数据竞争）。
+func (c *Connection) dispatchTxEventLocked(name string, level int) {
+	c.stateMu.Lock()
+	d := c.dispatcher
+	name2 := c.name
+	c.stateMu.Unlock()
+	if d != nil {
+		d.Dispatch(events.TransactionEvent{
+			Name:             name,
+			TransactionLevel: level,
+			ConnectionName:   name2,
 		})
 	}
 }
 
-// BeginTransaction 开启事务；嵌套时创建 savepoint（对齐 Laravel
-// ManagesTransactions）。level 0 的 BEGIN 遇断连错误重连后重试一次
+// BeginTransaction 开启事务；嵌套时创建 savepoint（嵌套事务管理）。
+// level 0 的 BEGIN 遇断连错误重连后重试一次
 // （handleBeginTransactionException）。
 func (c *Connection) BeginTransaction() error {
-	for _, fn := range c.beforeStartingTransaction {
+	c.txMu.Lock()
+	fns := make([]func(), len(c.beforeStartingTransaction))
+	copy(fns, c.beforeStartingTransaction)
+	c.txMu.Unlock()
+	for _, fn := range fns {
 		fn()
 	}
 	c.txMu.Lock()
 	defer c.txMu.Unlock()
 
 	if c.level == 0 {
-		tx, err := c.DB.Begin()
-		if err != nil {
-			if classifyError(err) == KindLostConnection {
-				if rerr := c.reconnect(); rerr != nil {
-					return err
-				}
-				tx, err = c.DB.Begin()
-				if err != nil {
-					return err
-				}
-			} else {
+		// c.DB 由 connMu 保护（重连热替换）；事务恒开在主（写）连接上
+		c.connMu.Lock()
+		db := c.DB
+		c.connMu.Unlock()
+		tx, err := db.Begin()
+		if err != nil && classifyError(err) == KindLostConnection {
+			// 断连重连必须先释放 txMu：reconnect 经 Manager.Reconnect 会
+			// 调 TransactionLevel()（取 txMu），持锁调用构成自死锁
+			c.txMu.Unlock()
+			rerr := c.reconnect()
+			c.txMu.Lock()
+			if rerr != nil {
 				return err
 			}
+			// 重入后复验：并发路径可能在解锁窗口内已开事务
+			if c.level != 0 || c.tx != nil {
+				return errors.New("torm: transaction state changed during reconnect")
+			}
+			c.connMu.Lock()
+			db = c.DB
+			c.connMu.Unlock()
+			tx, err = db.Begin()
+			if err != nil {
+				return err
+			}
+		}
+		if err != nil {
+			return err
 		}
 		c.tx = tx
 	} else if c.queryGrammarForTxSupportsSavepoints() {
@@ -97,10 +130,10 @@ func (c *Connection) BeginTransaction() error {
 			return err
 		}
 	}
-	// Laravel：beganTransaction 事件在 begin 成功后、计数递增后分发
-	// （ManagesTransactions.php:124-139）
+	// beganTransaction 事件在 begin 成功后、计数递增后分发
+	// （紧跟 level++ 之后）
 	c.level++
-	c.dispatchTxEventLocked(events.TransactionBeginning)
+	c.dispatchTxEventLocked(events.TransactionBeginning, c.level)
 	return nil
 }
 
@@ -116,30 +149,46 @@ func (c *Connection) queryGrammarForTxSupportsSavepoints() bool {
 
 // Commit 提交当前事务层；仅最外层提交到数据库。afterCommit 回调在释放事务
 // 锁之后执行：回调内允许再次调用 TransactionLevel/AfterCommit/Commit 而不会
-// 自死锁（对齐 Laravel commit() 在锁外通知 manager）。
+// 自死锁（commit() 在锁外通知 manager）。
 func (c *Connection) Commit() error {
 	var runHooks []func()
+	var runRollbackHooks []func()
 
 	c.txMu.Lock()
-	// Laravel：committing 事件仅最外层（transactionLevel===1）时、pdo commit 之前
-	// 分发（ManagesTransactions.php:205-208）
+	committedLevel := c.level
+	// committing 事件仅最外层（transactionLevel===1）时、pdo commit 之前
+	// 分发
 	if c.level == 1 {
-		c.dispatchTxEventLocked(events.TransactionCommitting)
+		c.dispatchTxEventLocked(events.TransactionCommitting, c.level)
 	}
 	if c.level == 1 && c.tx != nil {
 		if err := c.tx.Commit(); err != nil {
-			c.txMu.Unlock()
-			// Laravel handleCommitTransactionException：先无条件 transactions--
+			// handleCommitTransactionException：先无条件 transactions--
+			// 状态清理全部在锁内完成（解锁后写 txMu 保护字段构成数据竞争）
 			if classifyError(err) == KindLostConnection {
 				// 断连：事务已随连接丢失，计数清零（不重试 commit）
 				c.tx = nil
 				c.level = 0
 				c.afterCommitHooks = nil
 			} else if classifyError(err) == KindDeadlock {
-				// 并发错误：计数--、事务已死（tx 置 nil）后由外层 Transaction
-				// 重试循环重新 BEGIN（:232-251）
+				// 并发错误：事务已死（tx 置 nil）后由外层 Transaction 重试循环
+				// 重新 BEGIN（:232-251）。该层注册的 afterCommit 回调必须丢弃
+				// （否则会在重试成功后的提交、乃至之后任何无关提交时被误执行），
+				// afterRollBack 回调此刻触发——与 rollBackToLevel 的断连分支对称
 				c.tx = nil
 				c.level = 0
+				c.afterCommitHooks = nil
+				for _, h := range c.afterRollbackHooks {
+					runRollbackHooks = append(runRollbackHooks, h.fn)
+				}
+				c.afterRollbackHooks = nil
+			} else {
+				c.txMu.Unlock()
+				return err
+			}
+			c.txMu.Unlock()
+			for _, fn := range runRollbackHooks {
+				fn()
 			}
 			return err
 		}
@@ -166,16 +215,17 @@ func (c *Connection) Commit() error {
 	}
 	c.txMu.Unlock()
 
-	// Laravel：manager.commit 先执行 afterCommit 回调，再发 committed 事件
-	// （ManagesTransactions.php:215-219）
+	// manager.commit 先执行 afterCommit 回调，再发 committed 事件
 	for _, fn := range runHooks {
 		fn()
 	}
-	c.dispatchTxEvent(events.TransactionCommitted)
+	// committed 事件携带提交前的事务层（提交完成后 level 已归零，
+	// 事件载荷若读 c.level 恒为 0——名存实亡）
+	c.dispatchTxEventWithLevel(events.TransactionCommitted, committedLevel)
 	return nil
 }
 
-// RollBack 回滚到上一层事务；toLevel<0 或越界时为 no-op（对齐 Laravel）。
+// RollBack 回滚到上一层事务；toLevel<0 或越界时为 no-op。
 func (c *Connection) RollBack() error {
 	return c.rollBackToLevel(-1)
 }
@@ -199,6 +249,8 @@ func (c *Connection) rollBackToLevel(toLevel int) error {
 		c.txMu.Unlock()
 		return nil
 	}
+	// rolledBack 事件携带回滚前的事务层
+	rolledBackLevel := c.level
 
 	var err error
 	if toLevel == 0 {
@@ -211,7 +263,7 @@ func (c *Connection) rollBackToLevel(toLevel int) error {
 		_, err = c.tx.Exec(c.grammarForTx().CompileSavepointRollBack("trans" + strconv.Itoa(toLevel+1)))
 	}
 	if err != nil {
-		// Laravel handleRollBackException：断连时 transactions=0、按层级降序
+		// handleRollBackException：断连时 transactions=0、按层级降序
 		// 执行全部 afterRollBack 回调、丢弃 afterCommit 回调，然后重抛
 		if classifyError(err) == KindLostConnection {
 			c.tx = nil
@@ -255,12 +307,11 @@ func (c *Connection) rollBackToLevel(toLevel int) error {
 	c.level = toLevel
 	c.txMu.Unlock()
 
-	// Laravel：manager.rollback 先执行 afterRollBack 回调，再发 rollingBack
-	// （ManagesTransactions.php:283-289）
+	// manager.rollback 先执行 afterRollBack 回调，再发 rollingBack
 	for _, fn := range runRollbackHooks {
 		fn()
 	}
-	c.dispatchTxEvent(events.TransactionRolledBack)
+	c.dispatchTxEventWithLevel(events.TransactionRolledBack, rolledBackLevel)
 	return nil
 }
 
@@ -273,8 +324,8 @@ func (c *Connection) TransactionLevel() int {
 
 // Transaction 在事务中执行回调。最外层遇到死锁/锁等待时回滚并重试（最多
 // attempts 次，默认 1）；嵌套调用降级为 savepoint，任何错误都回滚到进入前的
-// 层级并把错误交还外层处理——嵌套层级不自行重试（对齐 Laravel
-// handleTransactionException：仅最外层事务参与重试）。
+// 层级并把错误交还外层处理——嵌套层级不自行重试
+// （handleTransactionException：仅最外层事务参与重试）。
 func (c *Connection) Transaction(fn func(*Connection) error, attempts ...int) error {
 	maxAttempts := 1
 	if len(attempts) > 0 && attempts[0] > 0 {
@@ -288,7 +339,7 @@ func (c *Connection) Transaction(fn func(*Connection) error, attempts ...int) er
 			return err
 		}
 
-		if err := fn(c); err != nil {
+		if err := c.runTxCallback(fn, startLevel); err != nil {
 			if rerr := c.rollBackToLevel(startLevel); rerr != nil {
 				return rerr
 			}
@@ -313,6 +364,23 @@ func (c *Connection) Transaction(fn func(*Connection) error, attempts ...int) er
 		}
 	}
 	return nil
+}
+
+// runTxCallback 执行事务回调；panic 时先回滚到入口层级再重抛（对齐
+// try/catch(Throwable) 的回滚语义——旧实现 panic 直接逃逸，事务不回滚、
+// 连接被 *sql.Tx 永久占用、hook 泄漏、level 卡死）。
+func (c *Connection) runTxCallback(fn func(*Connection) error, startLevel int) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// 回滚失败不吞：记日志后重抛原始 panic（level/tx 卡留可由
+			// 连接关闭兜底，原始 panic 栈优先保留）
+			if rerr := c.rollBackToLevel(startLevel); rerr != nil {
+				log.Printf("torm: rollback after panic failed: %v", rerr)
+			}
+			panic(r)
+		}
+	}()
+	return fn(c)
 }
 
 // AfterCommit 注册事务提交后的回调；注册时无活动事务则立即执行，嵌套事务中

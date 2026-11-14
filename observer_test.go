@@ -62,10 +62,10 @@ func TestObserverUpdateAndDelete(t *testing.T) {
 
 	var events []string
 	conn.Observe(&p, &Observer{
-		Updating: func(any) error { events = append(events, "updating"); return nil },
-		Updated:  func(any) error { events = append(events, "updated"); return nil },
-		Saving:   func(any) error { events = append(events, "saving"); return nil },
-		Saved:    func(any) error { events = append(events, "saved"); return nil },
+		Updating:      func(any) error { events = append(events, "updating"); return nil },
+		Updated:       func(any) error { events = append(events, "updated"); return nil },
+		Saving:        func(any) error { events = append(events, "saving"); return nil },
+		Saved:         func(any) error { events = append(events, "saved"); return nil },
 		ForceDeleting: func(any) error { events = append(events, "forceDeleting"); return nil },
 		ForceDeleted:  func(any) error { events = append(events, "forceDeleted"); return nil },
 	})
@@ -82,7 +82,7 @@ func TestObserverUpdateAndDelete(t *testing.T) {
 	if err := conn.ForceDelete(&p); err != nil {
 		t.Fatal(err)
 	}
-	// Laravel forceDelete：forceDeleting → 硬删 → forceDeleted（不触发 deleting/deleted）
+	// forceDelete：forceDeleting → 硬删 → forceDeleted（不触发 deleting/deleted）
 	if len(events) != 2 || events[0] != "forceDeleting" || events[1] != "forceDeleted" {
 		t.Errorf("force delete events = %v", events)
 	}
@@ -93,7 +93,7 @@ func TestObserverRetrieved(t *testing.T) {
 	conn, st := newFakeDB(t)
 	st.On("select * from `users`", &fakeResult{
 		Columns: []string{"id", "name"},
-		Rows:   [][]driver.Value{{int64(1), "A"}, {int64(2), "B"}},
+		Rows:    [][]driver.Value{{int64(1), "A"}, {int64(2), "B"}},
 	})
 
 	count := 0
@@ -144,7 +144,7 @@ func TestEventDispatcherRetrieved(t *testing.T) {
 	conn.SetEventDispatcher(bus)
 	st.On("select * from `users`", &fakeResult{
 		Columns: []string{"id", "name"},
-		Rows:   [][]driver.Value{{int64(1), "A"}},
+		Rows:    [][]driver.Value{{int64(1), "A"}},
 	})
 
 	count := 0

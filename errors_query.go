@@ -3,10 +3,15 @@ package torm
 import (
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
+
+	gomysql "github.com/go-sql-driver/mysql"
+	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
-// ErrorKind 错误分类（对应 Laravel QueryException 对错误码的解析）。
+// ErrorKind 错误分类（按驱动错误码/SQLSTATE 解析）。
 type ErrorKind int
 
 const (
@@ -16,7 +21,7 @@ const (
 	KindLostConnection
 )
 
-// Error 携带 SQL 与分类的查询错误（对应 Laravel QueryException）。
+// Error 携带 SQL 与分类的查询错误（查询异常包装）。
 type Error struct {
 	Kind     ErrorKind
 	Err      error
@@ -35,38 +40,54 @@ func (e *Error) Error() string {
 
 func (e *Error) Unwrap() error { return e.Err }
 
-// ConnectionName 返回发生错误的连接名（Laravel QueryException::getConnectionName）。
+// ConnectionName 返回发生错误的连接名。
 func (e *Error) ConnectionName() string { return e.ConnName }
 
-// GetSql 返回原始 SQL（Laravel getSql）。
+// GetSql 返回原始 SQL。
 func (e *Error) GetSql() string { return e.Sql }
 
-// GetBindings 返回绑定（Laravel getBindings）。
+// GetBindings 返回绑定。
 func (e *Error) GetBindings() []any { return e.Bindings }
 
-// RawSql 返回绑定插值后的 SQL（Laravel getRawSql：字符串加引号转义、nil→NULL）。
+// RawSql 返回绑定插值后的 SQL（getRawSql：字符串加引号转义、nil→NULL）。
 func (e *Error) RawSql() string {
 	return substituteBindingsIntoRawSql(e.Sql, e.Bindings)
 }
 
-// substituteBindingsIntoRawSql 把 ? 占位符替换为字面值。
+// substituteBindingsIntoRawSql 把 ? 占位符替换为字面值；PG 的 $n 编号占位符
+// 同样支持（lib/pq/pgx 风格 SQL 的 RawSql 插值，对应各方言 grammar
+// 的 substituteBindings 实现）。
 func substituteBindingsIntoRawSql(sql string, bindings []any) string {
-	var b strings.Builder
-	bi := 0
-	for i := 0; i < len(sql); i++ {
-		ch := sql[i]
-		if ch == '?' && bi < len(bindings) {
-			b.WriteString(quoteBinding(bindings[bi]))
-			bi++
-			continue
+	if strings.Contains(sql, "?") {
+		var b strings.Builder
+		bi := 0
+		for i := 0; i < len(sql); i++ {
+			ch := sql[i]
+			if ch == '?' && bi < len(bindings) {
+				b.WriteString(quoteBinding(bindings[bi]))
+				bi++
+				continue
+			}
+			b.WriteByte(ch)
 		}
-		b.WriteByte(ch)
+		return b.String()
 	}
-	return b.String()
+	if !numberedPlaceholderPattern.MatchString(sql) {
+		return sql
+	}
+	return numberedPlaceholderPattern.ReplaceAllStringFunc(sql, func(m string) string {
+		n, err := strconv.Atoi(m[1:])
+		if err != nil || n < 1 || n > len(bindings) {
+			return m
+		}
+		return quoteBinding(bindings[n-1])
+	})
 }
 
+var numberedPlaceholderPattern = regexp.MustCompile(`\$([0-9]+)`)
+
 // quoteBinding 字面值引用：nil→NULL、string/time→'..'（单引号双写）、bool→0/1、
-// 数值原样、其余用 fmt（近似 Laravel grammar 的 getBindingRepresentation）。
+// 数值原样、其余用 fmt（近似方言 grammar 的 getBindingRepresentation）。
 func quoteBinding(v any) string {
 	switch val := v.(type) {
 	case nil:
@@ -92,7 +113,7 @@ type sqlStateError interface {
 	SQLState() string
 }
 
-// lostConnectionPatterns 对齐 Laravel LostConnectionDetector 的消息模式
+// lostConnectionPatterns 断连判定的错误消息模式
 // （约 70 条，小写化匹配）。
 var lostConnectionPatterns = []string{
 	"server has gone away",
@@ -166,17 +187,60 @@ func matchesAny(lowerMsg string, patterns []string) bool {
 	return false
 }
 
-// classifyError 依据错误文本/错误码分类。
+// classifyError 依据驱动结构化错误码/SQLSTATE/错误文本分类。
+// 结构化通道优先（按驱动错误码判定；纯文本匹配易被 PG 消息内嵌的
+// 绑定值误判——如 "invalid input syntax ...: \"40001\""），文本匹配仅兜底。
 func classifyError(err error) ErrorKind {
 	if err == nil {
 		return KindGeneric
 	}
-	msg := strings.ToLower(err.Error())
 
-	// MySQL 错误码（go-sql-driver 的文本形式 "Error 1062: ..."）
+	// 1) MySQL 结构化错误码（go-sql-driver）
+	var me *gomysql.MySQLError
+	if errors.As(err, &me) {
+		switch me.Number {
+		case 1062:
+			return KindUniqueConstraint
+		case 1213, 1205:
+			return KindDeadlock
+		}
+	}
+
+	// 2) SQLite 结构化错误码（mattn/go-sqlite3）
+	var se *sqlite3.Error
+	if errors.As(err, &se) {
+		switch se.Code {
+		case sqlite3.ErrConstraint:
+			// 19 下的唯一约束细类（1555/2067）按文本二次判定
+			if strings.Contains(strings.ToLower(se.Error()), "unique") {
+				return KindUniqueConstraint
+			}
+		case sqlite3.ErrBusy, sqlite3.ErrLocked:
+			return KindDeadlock
+		}
+	}
+
+	// 3) SQLSTATE（lib/pq、pgx、mssqldb 等实现 SQLState 接口的驱动）
+	var ss sqlStateError
+	if errors.As(err, &ss) {
+		switch ss.SQLState() {
+		case "23505":
+			return KindUniqueConstraint
+		case "40001", "40P01":
+			return KindDeadlock
+		case "08000", "08003", "08006", "08001", "08004", "08007":
+			return KindLostConnection
+		}
+	}
+
+	// 4) 文本兜底
+	msg := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(msg, "1062") && strings.Contains(msg, "duplicate entry"),
-		strings.Contains(msg, "23505"), strings.Contains(msg, "unique constraint"):
+		strings.Contains(msg, "23505"), strings.Contains(msg, "unique constraint"),
+		// SQL Server（mssqldb 不实现 SQLState()，按消息文本判定）
+		strings.Contains(msg, "violation of unique key constraint"),
+		strings.Contains(msg, "cannot insert duplicate key row"):
 		return KindUniqueConstraint
 	case strings.Contains(msg, "1213") && strings.Contains(msg, "deadlock"),
 		strings.Contains(msg, "1205") && strings.Contains(msg, "lock wait timeout"),
@@ -195,18 +259,6 @@ func classifyError(err error) ErrorKind {
 	case matchesAny(msg, lostConnectionPatterns):
 		return KindLostConnection
 	}
-
-	var ss sqlStateError
-	if errors.As(err, &ss) {
-		switch ss.SQLState() {
-		case "23505":
-			return KindUniqueConstraint
-		case "40001", "40P01":
-			return KindDeadlock
-		case "08000", "08003", "08006":
-			return KindLostConnection
-		}
-	}
 	return KindGeneric
 }
 
@@ -215,8 +267,8 @@ func wrapQueryError(err error, sql string, bindings []any) error {
 	return newQueryError("", err, sql, bindings)
 }
 
-// newQueryError 把驱动错误包装为携带连接名的 *Error（对应 Laravel
-// QueryException 构造时传入的 $connectionName）；已是 *Error 的错误在缺失
+// newQueryError 把驱动错误包装为携带连接名的 *Error（构造时传入
+// 连接名 $connectionName）；已是 *Error 的错误在缺失
 // ConnName 时补填。
 func newQueryError(connName string, err error, sql string, bindings []any) error {
 	if err == nil {

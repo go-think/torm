@@ -18,8 +18,8 @@ func asAny(vals []driver.Value) []any {
 }
 
 // 执行级 golden：断言 Connection 实际收到的 SQL 与绑定。
-// 期望值逐条来自 laravel/framework DatabaseQueryBuilderTest 中
-// ->getConnection()->expects('insert/update/delete')->with(...) 的断言。
+// 期望值逐条为既有 golden 基线：
+// 断言 insert/update/delete 实际收到的 SQL 与绑定。
 
 func execBaseBuilder(t *testing.T, prefix ...string) (*Builder, *fakeStore) {
 	t.Helper()
@@ -53,7 +53,7 @@ func TestExecInsert(t *testing.T) {
 		t.Errorf("args = %#v", call.Args)
 	}
 
-	// 多行、列序确定性（对应 Laravel upsert 用例的列序）
+	// 多行、列序确定性（upsert 断言保持插入时的列序）
 	bm, stm := execMySQLBuilder(t)
 	sql := "insert into `users` (`email`, `name`) values (?, ?), (?, ?)"
 	stm.On(sql, &fakeResult{Affected: 2})
@@ -68,7 +68,7 @@ func TestExecInsert(t *testing.T) {
 		t.Errorf("args = %#v", call.Args)
 	}
 
-	// 表达式值不进绑定 + 列序保持（Laravel: insertGetIdMethodRemovesExpressions）
+	// 表达式值不进绑定 + 列序保持（insertGetId 移除表达式值）
 	b2, st2 := execBaseBuilder(t)
 	sql2 := `insert into "users" ("email", "bar") values (?, bar)`
 	st2.On(sql2, &fakeResult{Affected: 1, LastID: 1})
@@ -96,7 +96,7 @@ func TestExecInsertGetId(t *testing.T) {
 		t.Errorf("id = %d", id)
 	}
 
-	// MySQL 空值 insert（Laravel: insertGetIdWithEmptyValues）
+	// MySQL 空值 insert（insertGetId 空值列清单）
 	bm, stm := execMySQLBuilder(t)
 	sqlm := "insert into `users` () values ()"
 	stm.On(sqlm, &fakeResult{Affected: 1, LastID: 1})
@@ -197,7 +197,7 @@ func TestExecUpdate(t *testing.T) {
 		t.Errorf("args = %#v", call.Args)
 	}
 
-	// Raw 值不进绑定（Laravel: testUpdateMethodRespectsRaw）
+	// Raw 值不进绑定（update 保留原始表达式）
 	b2, st2 := execBaseBuilder(t)
 	sql2 := `update "users" set "email" = foo where "id" = ?`
 	st2.On(sql2, &fakeResult{Affected: 1})
@@ -307,7 +307,7 @@ func TestExecExists(t *testing.T) {
 // ---- P0/P1 修复回归（执行级，faketb 打桩）----
 
 // P0-6：聚合在 groups 为空时清除 orders 与 order 段绑定；无 unions/havings 时
-// 清除 columns 与 select 段绑定（Laravel Builder.php:4124-4184）。
+// 清除 columns 与 select 段绑定。
 func TestExecAggregateClearsOrders(t *testing.T) {
 	b, st := execBaseBuilder(t)
 	sql := `select count(*) as "aggregate" from "users" where "x" = ?`
@@ -515,7 +515,7 @@ func TestExecSqliteInsertOrIgnoreAndTruncate(t *testing.T) {
 		t.Errorf("args = %#v", call.Args)
 	}
 
-	// truncate：两条语句，先表后 sqlite_sequence（Laravel 顺序），绑定带前缀表名
+	// truncate：两条语句，先表后 sqlite_sequence（固定顺序），绑定带前缀表名
 	st.On(`delete from "users"`, &fakeResult{Affected: 0})
 	st.On(`delete from "sqlite_sequence" where name = ?`, &fakeResult{Affected: 0})
 	if err := b.Truncate(); err != nil {
@@ -663,7 +663,7 @@ func TestExecSqlServerMergeUpsert(t *testing.T) {
 	b := conn.Query()
 	b.grammar = grammar.NewSqlServerGrammar()
 
-	sql := "merge [users] using (values (?, ?)) [laravel_source] ([email], [name]) on [laravel_source].[email] = [users].[email] when matched then update set [name] = [laravel_source].[name] when not matched then insert ([email], [name]) values ([email], [name]);"
+	sql := "merge [users] using (values (?, ?)) [merge_source] ([email], [name]) on [merge_source].[email] = [users].[email] when matched then update set [name] = [merge_source].[name] when not matched then insert ([email], [name]) values ([email], [name]);"
 	st.On(sql, &fakeResult{Affected: 1})
 	if _, err := b.From("users").Upsert([]interface{}{map[string]interface{}{"email": "foo", "name": "bar"}}, []string{"email"}, []string{"name"}); err != nil {
 		t.Fatal(err)

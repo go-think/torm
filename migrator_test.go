@@ -74,7 +74,7 @@ func TestMigratorSkipsRan(t *testing.T) {
 	st.On("create table `migrations` (`id` int unsigned not null auto_increment primary key, `migration` varchar(255) not null, `batch` int not null)", &faketb.Result{})
 	st.On("select \"migration\" from \"migrations\"", &faketb.Result{
 		Columns: []string{"migration"},
-		Rows:   [][]driver.Value{{"2026_01_01_create_users"}},
+		Rows:    [][]driver.Value{{"2026_01_01_create_users"}},
 	})
 	st.On("select coalesce(max(\"batch\"), 0) as b from \"migrations\"", &faketb.Result{Columns: []string{"b"}, Rows: [][]driver.Value{{int64(1)}}})
 	st.On("insert into \"migrations\" (\"migration\", \"batch\") values (?, ?)", &faketb.Result{Affected: 1})
@@ -114,7 +114,7 @@ func TestMigratorRollbackLastBatch(t *testing.T) {
 	st.On("select coalesce(max(\"batch\"), 0) as b from \"migrations\"", &faketb.Result{Columns: []string{"b"}, Rows: [][]driver.Value{{int64(1)}}})
 	st.On("select \"migration\" from \"migrations\" where \"batch\" = ? order by \"id\"", &faketb.Result{
 		Columns: []string{"migration"},
-		Rows:   [][]driver.Value{{"2026_01_01_create_users"}, {"2026_01_02_create_posts"}},
+		Rows:    [][]driver.Value{{"2026_01_01_create_users"}, {"2026_01_02_create_posts"}},
 	})
 	dropUsers := "drop table `users`"
 	dropPosts := "drop table `posts`"

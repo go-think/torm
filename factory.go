@@ -4,10 +4,10 @@ import (
 	"fmt"
 )
 
-// ---- Factory / Seeder（对应 Laravel 的工厂与种子，Factories/Factory.php）----
+// ---- Factory / Seeder（模型工厂与种子）----
 //
 // Factory 以链式值语义组合：State/Sequence/For/Count/AfterMaking/AfterCreating
-// 各返回新工厂，原工厂不变（对齐 Laravel 工厂克隆语义）。
+// 各返回新工厂，原工厂不变（工厂克隆语义）。
 
 // Factory 模型工厂：Definition 按 1 起始的序号生成模型。
 // T 为模型指针类型（如 *Post）以支持 Create 走完整生命周期。
@@ -23,21 +23,21 @@ type Factory[T any] struct {
 	count         int                  // Count：默认生成数量
 }
 
-// State 注册命名状态变更器（对应 Laravel state）；
+// State 注册命名状态变更器（state）；
 // name 仅作标识，make/create 时按注册顺序应用。
 func (f Factory[T]) State(name string, mutator func(T)) Factory[T] {
 	f.states = append(append([]func(T){}, f.states...), mutator)
 	return f
 }
 
-// Sequence 注册轮换序列（对应 Laravel sequence）：第 i 个模型应用
+// Sequence 注册轮换序列（sequence）：第 i 个模型应用
 // sequence[(i-1) % len]。
 func (f Factory[T]) Sequence(mutators ...func(seq int, m T)) Factory[T] {
 	f.sequence = append(append([]func(seq int, m T){}, f.sequence...), mutators...)
 	return f
 }
 
-// SequenceAttrs 属性 map 形态的轮换序列（对应 Laravel sequence(['a' => 1], ['a' => 2])）。
+// SequenceAttrs 属性 map 形态的轮换序列（每个 map 为一轮属性）。
 func (f Factory[T]) SequenceAttrs(attrs ...map[string]any) Factory[T] {
 	maps := attrs
 	mutators := make([]func(seq int, m T), 0, len(maps))
@@ -53,7 +53,7 @@ func (f Factory[T]) SequenceAttrs(attrs ...map[string]any) Factory[T] {
 }
 
 // For 注册 belongsTo 父模型：make/create 时把 parent 主键写入外键列
-// （外键缺省 = singular(parent 表名)_id，对应 Laravel for）。
+// （外键缺省 = singular(parent 表名)_id）。
 func (f Factory[T]) For(parent any, foreignKey ...string) Factory[T] {
 	fk := ""
 	if len(foreignKey) > 0 && foreignKey[0] != "" {
@@ -67,20 +67,20 @@ func (f Factory[T]) For(parent any, foreignKey ...string) Factory[T] {
 	return f
 }
 
-// AfterMaking 注册 make 生命周期钩子（对应 Laravel afterMaking）。
+// AfterMaking 注册 make 生命周期钩子（afterMaking）。
 func (f Factory[T]) AfterMaking(fn func(T)) Factory[T] {
 	f.afterMaking = append(append([]func(T){}, f.afterMaking...), fn)
 	return f
 }
 
-// AfterCreating 注册落库成功后的钩子（对应 Laravel afterCreating；
+// AfterCreating 注册落库成功后的钩子（afterCreating；
 // 此时主键已回填）。
 func (f Factory[T]) AfterCreating(fn func(T)) Factory[T] {
 	f.afterCreating = append(append([]func(T){}, f.afterCreating...), fn)
 	return f
 }
 
-// Count 设置默认生成数量（对应 Laravel count；配合 MakeMany/CreateMany）。
+// Count 设置默认生成数量（配合 MakeMany/CreateMany）。
 func (f Factory[T]) Count(n int) Factory[T] {
 	f.count = n
 	return f
@@ -116,7 +116,7 @@ func (f Factory[T]) makeOne(seq int) T {
 	return item
 }
 
-// Make 生成 count 个模型实例（不落库，对应 Laravel make）。
+// Make 生成 count 个模型实例（不落库，make 语义）。
 // 工厂带 Count(n) 时可用 MakeMany 按默认数量生成。
 func (f Factory[T]) Make(count int) []T {
 	n := f.resolveCount(count)
@@ -136,7 +136,7 @@ func (f Factory[T]) MakeMany() []T {
 	return f.Make(n)
 }
 
-// MakeOne 生成单个模型实例（对应 Laravel makeOne）。
+// MakeOne 生成单个模型实例（makeOne 语义）。
 func (f Factory[T]) MakeOne() T {
 	return f.makeOne(1)
 }
@@ -167,7 +167,7 @@ func (f Factory[T]) CreateMany(conn *Connection) ([]T, error) {
 	return f.Create(conn, n)
 }
 
-// CreateOne 生成单个模型并落库（对应 Laravel createOne）。
+// CreateOne 生成单个模型并落库（createOne 语义）。
 func (f Factory[T]) CreateOne(conn *Connection) (T, error) {
 	out, err := f.Create(conn, 1)
 	if err != nil {
@@ -177,7 +177,7 @@ func (f Factory[T]) CreateOne(conn *Connection) (T, error) {
 	return out[0], nil
 }
 
-// FactoryHas 最小可用的 has 关系工厂组合（对应 Laravel has）：
+// FactoryHas 最小可用的 has 关系工厂组合（has 语义）：
 // 先用 parentFactory 创建父模型，再以 parent 主键填充 childFactory 模型的
 // foreignKey 外键列创建 count 个子模型；返回 (父模型, 子模型集合)。
 func FactoryHas[P any, C any](conn *Connection, parentFactory Factory[P], childFactory Factory[C], foreignKey string, count int) (P, []C, error) {
@@ -213,7 +213,7 @@ func FactoryHas[P any, C any](conn *Connection, parentFactory Factory[P], childF
 // SeederFunc 种子函数。
 type SeederFunc func(*Connection) error
 
-// Seed 依次执行种子；单个种子失败即中止（对应 Laravel db:seed）。
+// Seed 依次执行种子；单个种子失败即中止。
 func Seed(conn *Connection, seeders ...SeederFunc) error {
 	for i, seeder := range seeders {
 		if err := seeder(conn); err != nil {

@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// Postgres 方言 golden 测试（SQL 期望移植自 Laravel 13 PostgresGrammar 输出）。
+// Postgres 方言 golden 测试（SQL 期望取自既有 golden 基线）。
 
 func pgG() *PostgresGrammar { return NewPostgresGrammar() }
 

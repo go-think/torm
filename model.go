@@ -18,11 +18,14 @@ import (
 	"github.com/go-think/torm/utils"
 )
 
-// Model 是内嵌属性集合（兼容旧用法）。
+// Model 是内嵌属性集合（兼容旧用法）。内嵌后除 id/created_at/updated_at 列外
+// 还携带 ModelStateAttr：original/changes/exists 状态随实例存储，
+// 长驻进程无需手动 ForgetModel（模型自持 original 状态随实例存活）。
 type Model struct {
 	field.IDAttr
 	field.CreatedAtAttr
 	field.UpdatedAtAttr
+	field.ModelStateAttr
 }
 
 // SoftDeletes 是软删除内嵌属性（兼容旧用法）。
@@ -30,22 +33,25 @@ type SoftDeletes struct {
 	field.DeletedAtAttr
 }
 
-// modelInfo 模型元数据（对应 Laravel Model 的 $table/$primaryKey/$timestamps 等）。
+// modelInfo 模型元数据（表名/主键/时间戳开关等）。
 type modelInfo struct {
 	table          string
 	primaryKey     string
 	hasTimestamps  bool
+	createdAtField string // 空串 = 未声明，使用全局默认列名
+	updatedAtField string
 	softDeletes    bool
 	deletedAtField string
 }
 
 // typeMeta 按模型类型缓存的元数据 + 质量赋值/隐藏字段状态
-// （对应 Laravel 模型的 $fillable/$guarded/$hidden 属性）。
+// （可填充/守卫/隐藏字段列表属性）。
 type typeMeta struct {
-	info     modelInfo
-	fillable []string
-	guarded  []string
-	hidden   []string
+	info           modelInfo
+	fillable       []string
+	guarded        []string
+	hidden         []string
+	stateFieldPath []int // 内嵌状态挂载字段（tormstate tag）的索引路径；nil = 走全局状态表
 }
 
 var (
@@ -82,9 +88,55 @@ func metaFor(model interface{}) *typeMeta {
 	return m
 }
 
+// 全局时间戳/软删列名默认值（created_at/updated_at/deleted_at 列名
+// 常量；SetTimestampColumns/SetDeletedAtColumn 可改写）。
+var (
+	timestampMu          sync.Mutex
+	globalCreatedAtField = "created_at"
+	globalUpdatedAtField = "updated_at"
+	globalDeletedAtField = "deleted_at"
+)
+
+// SetTimestampColumns 设置全局 created_at/updated_at 列名默认值
+// （覆写全局 created_at/updated_at 列名常量；空串保持默认）。
+// 单模型可用 tag `torm:"created=col"` / `torm:"updated=col"` / `torm:"deleted=col"` 覆盖。
+func SetTimestampColumns(created, updated string) {
+	timestampMu.Lock()
+	defer timestampMu.Unlock()
+	if created != "" {
+		globalCreatedAtField = created
+	}
+	if updated != "" {
+		globalUpdatedAtField = updated
+	}
+}
+
+// SetDeletedAtColumn 设置全局软删列名默认值（软删时间戳列）。
+func SetDeletedAtColumn(column string) {
+	timestampMu.Lock()
+	defer timestampMu.Unlock()
+	if column != "" {
+		globalDeletedAtField = column
+	}
+}
+
+func globalTimestampColumns() (string, string, string) {
+	timestampMu.Lock()
+	defer timestampMu.Unlock()
+	return globalCreatedAtField, globalUpdatedAtField, globalDeletedAtField
+}
+
 // buildTypeMeta 反射解析模型类型：表名/主键/软删/时间戳开关 + fillable/guarded/hidden tag。
 func buildTypeMeta(t reflect.Type) *typeMeta {
-	m := &typeMeta{info: modelInfo{primaryKey: "id"}}
+	defCreated, defUpdated, defDeleted := globalTimestampColumns()
+	m := &typeMeta{
+		info: modelInfo{
+			primaryKey:     "id",
+			createdAtField: defCreated,
+			updatedAtField: defUpdated,
+			deletedAtField: defDeleted,
+		},
+	}
 
 	probe := reflect.New(t).Interface()
 	if tn, ok := probe.(TableName); ok {
@@ -93,17 +145,38 @@ func buildTypeMeta(t reflect.Type) *typeMeta {
 		m.info.table = utils.SnakeCase(t.Name())
 	}
 
+	// 状态挂载字段（field.ModelStateAttr，tormstate tag）随实例存储状态
+	m.stateFieldPath = findStateFieldPath(t)
+
 	schema, err := NewSchema(probe)
 	if err != nil {
 		return m
 	}
 	for _, f := range schema.Fields {
 		switch f.Name {
-		case "created_at", "updated_at":
+		case m.info.createdAtField, m.info.updatedAtField:
 			m.info.hasTimestamps = true
-		case "deleted_at":
+		case m.info.deletedAtField:
 			m.info.softDeletes = true
-			m.info.deletedAtField = f.Name
+		}
+		// tag 覆盖列名：`torm:"created"` / `torm:"created=made_at"`（updated/deleted 同理）
+		for attrKey, target := range map[string]*string{
+			"created": &m.info.createdAtField,
+			"updated": &m.info.updatedAtField,
+			"deleted": &m.info.deletedAtField,
+		} {
+			if v, ok := f.GetAttr(attrKey); ok {
+				v = strings.TrimSpace(v)
+				if v == "" {
+					v = f.Name
+				}
+				*target = v
+				if attrKey == "deleted" {
+					m.info.softDeletes = true
+				} else {
+					m.info.hasTimestamps = true
+				}
+			}
 		}
 		// struct tag torm:"timestamps=false"（可挂任意字段，配 "-" 忽略该字段本身）
 		if v, ok := f.GetAttr("timestamps"); ok && strings.EqualFold(strings.TrimSpace(v), "false") {
@@ -122,11 +195,54 @@ func buildTypeMeta(t reflect.Type) *typeMeta {
 			m.info.primaryKey = f.Name
 		}
 	}
+	if m.info.softDeletes {
+		m.info.deletedAtField = resolveColumn(m.info.deletedAtField, defDeleted)
+	} else {
+		m.info.deletedAtField = ""
+	}
+	m.info.createdAtField = resolveColumn(m.info.createdAtField, defCreated)
+	m.info.updatedAtField = resolveColumn(m.info.updatedAtField, defUpdated)
 	return m
 }
 
+// resolveColumn 列名兜底：未在字段遍历中实际命中时退回全局默认
+// （避免 custom tag 改名后残留探测值）。
+func resolveColumn(detected, def string) string {
+	if detected == "" {
+		return def
+	}
+	return detected
+}
+
+// findStateFieldPath 定位内嵌状态挂载字段（tormstate tag）的索引路径；
+// 不存在时返回 nil（走全局状态表）。扁平化后的探测直接扫匿名结构体字段。
+func findStateFieldPath(t reflect.Type) []int {
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if sf.PkgPath != "" && !sf.Anonymous {
+			continue
+		}
+		if sf.Tag.Get("tormstate") != "" {
+			return []int{i}
+		}
+		// 递归进内嵌结构体（与 NewSchema 的扁平化保持一致）
+		if sf.Anonymous && sf.Tag.Get("torm") == "" {
+			ft := sf.Type
+			if ft.Kind() == reflect.Ptr {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				if sub := findStateFieldPath(ft); sub != nil {
+					return append([]int{i}, sub...)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // tagNames 解析 fillable/guarded/hidden tag：空值 = 字段名本身，
-// 否则逗号分隔的列名列表（对应 Laravel 的数组属性）。
+// 否则逗号分隔的列名列表（数组属性形态）。
 func tagNames(f *Field, key string) []string {
 	v, _ := f.GetAttr(key)
 	v = strings.TrimSpace(v)
@@ -173,13 +289,13 @@ var nowFunc = time.Now
 
 // ---- 模型状态表：original 快照 / 变更集 / exists 标记 ----
 //
-// 对应 Laravel 的 original/isDirty/syncOriginal/getChanges/exists。
+// 提供 original 快照/isDirty 判脏/syncOriginal 固化/getChanges 变更集/exists 标记。
 // torm 模型是普通结构体，没有基类可挂 $original；这里以模型指针为键在连接层
 // 之外维护一张全局状态表（互斥锁保护）：水合（fireRetrieved）与写入成功
 // （Create/Save/软删）之后固化 original，Save 时对比得到 dirty 列。
 //
 // 并发与生命周期取舍：快照键持有模型强引用，进程内不自动回收（与
-// Laravel 每请求重建对象不同）；同指针重复水合/保存会覆盖旧快照，
+// 每请求重建对象的方式不同）；同指针重复水合/保存会覆盖旧快照，
 // ForgetModel 可显式释放。所有访问经 modelStateMu 串行化。
 type modelState struct {
 	original           map[string]any
@@ -194,8 +310,12 @@ var (
 	modelStates = map[any]*modelState{}
 )
 
-// stateOf 只读获取模型状态（不创建）。
+// stateOf 只读获取模型状态（不创建）。内嵌了状态挂载点（field.ModelStateAttr）
+// 的模型直接读实例字段；其余走全局状态表。
 func stateOf(model any) *modelState {
+	if s := embeddedStateOf(model); s != nil {
+		return s
+	}
 	modelStateMu.Lock()
 	defer modelStateMu.Unlock()
 	return modelStates[model]
@@ -203,6 +323,13 @@ func stateOf(model any) *modelState {
 
 // setModelState 原子地获取或创建状态并应用 fn。
 func setModelState(model any, fn func(s *modelState)) {
+	if p := embeddedStatePtr(model); p != nil {
+		if *p == nil {
+			*p = &modelState{}
+		}
+		fn(*p)
+		return
+	}
 	modelStateMu.Lock()
 	defer modelStateMu.Unlock()
 	s, ok := modelStates[model]
@@ -213,15 +340,96 @@ func setModelState(model any, fn func(s *modelState)) {
 	fn(s)
 }
 
-// ForgetModel 释放模型的状态快照（对应 Laravel unset 生命周期；
-// 状态表以模型指针为键持强引用，长生命周期进程可显式调用防泄漏）。
+// resetModelState 清空模型状态指针（实例复制后切断新旧实例的状态共享）。
+func resetModelState(model any) {
+	if f := embeddedStateField(model); f.IsValid() {
+		f.Set(reflect.Zero(f.Type()))
+		return
+	}
+	ForgetModel(model)
+}
+
+// embeddedStateField 取内嵌状态挂载点（State any 字段）的可寻址 Value；
+// 未内嵌或不可寻址返回零 Value。
+func embeddedStateField(model any) reflect.Value {
+	meta := typeMetaOf(model)
+	if meta == nil || meta.stateFieldPath == nil {
+		return reflect.Value{}
+	}
+	rv := reflect.ValueOf(model)
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return reflect.Value{}
+	}
+	for _, k := range meta.stateFieldPath {
+		rv = reflect.Indirect(rv).Field(k)
+	}
+	if !rv.IsValid() || !rv.CanAddr() {
+		return reflect.Value{}
+	}
+	return rv
+}
+
+// embeddedStatePtr 经挂载字段地址读写 *modelState（nil 初始化经 rv.Set 写回
+// 模型字段——旧实现 Interface() 拷贝指针值，写不到字段，状态双通道是死代码）。
+func embeddedStatePtr(model any) **modelState {
+	f := embeddedStateField(model)
+	if !f.IsValid() {
+		return nil
+	}
+	if f.IsNil() {
+		f.Set(reflect.ValueOf(&modelState{}))
+	}
+	sp, ok := f.Interface().(*modelState)
+	if !ok {
+		return nil
+	}
+	return &sp
+}
+
+// embeddedStateOf 读内嵌状态（无挂载点或未初始化返回 nil）。
+func embeddedStateOf(model any) *modelState {
+	f := embeddedStateField(model)
+	if !f.IsValid() || f.IsNil() {
+		return nil
+	}
+	s, _ := f.Interface().(*modelState)
+	return s
+}
+
+// typeMetaOf 取模型类型元数据（nil 模型安全）。
+func typeMetaOf(model any) *typeMeta {
+	if model == nil {
+		return nil
+	}
+	t := reflect.TypeOf(model)
+	if t == nil {
+		return nil
+	}
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return nil
+	}
+	typeMetaMu.RLock()
+	m, ok := typeMetas[t]
+	typeMetaMu.RUnlock()
+	if ok {
+		return m
+	}
+	return metaFor(model)
+}
+
+// ForgetModel 释放模型在全局状态表中的快照（对象弃用时的清理路径）。
+// 内嵌 field.ModelStateAttr 的模型状态随实例走 GC，无需调用；
+// 未内嵌的模型状态表以指针为键持强引用，长驻进程建议调用或改用内嵌基座。
 func ForgetModel(model any) {
 	modelStateMu.Lock()
 	defer modelStateMu.Unlock()
 	delete(modelStates, model)
 }
 
-// syncOriginal 以模型当前属性整体刷新快照（对应 Laravel syncOriginal）。
+// syncOriginal 以模型当前属性整体刷新快照。
 // 快照存 comparable 值（cast 字段为写入侧表示），保证脏对比两侧口径一致。
 func syncOriginal(model any) {
 	snap := buildOriginalSnapshot(model)
@@ -247,7 +455,7 @@ func buildOriginalSnapshot(model any) map[string]any {
 	return snap
 }
 
-// syncOriginalAttributes 局部刷新快照的指定列（对应 Laravel syncOriginalAttributes）。
+// syncOriginalAttributes 局部刷新快照的指定列。
 // 模型尚无快照时退化为整体同步（此时所有列的当前值即"已持久化"状态）。
 func syncOriginalAttributes(model any, names ...string) {
 	if stateOf(model) == nil {
@@ -275,12 +483,12 @@ func syncOriginalAttributes(model any, names ...string) {
 	}
 }
 
-// recordChanges 记录最近一次写操作的变更集（对应 Laravel syncChanges）。
+// recordChanges 记录最近一次写操作的变更集。
 func recordChanges(model any, changes map[string]any) {
 	setModelState(model, func(s *modelState) { s.changes = changes })
 }
 
-// ---- 脏跟踪导出 API（对应 Laravel HasAttributes 的 dirty/clean 族）----
+// ---- 脏跟踪导出 API（dirty/clean 族）----
 
 // IsDirty 判断模型（或指定列）相对 original 是否有未持久化的变更。
 func IsDirty(model any, keys ...string) bool {
@@ -295,19 +503,19 @@ func IsDirty(model any, keys ...string) bool {
 	return false
 }
 
-// IsClean 是 IsDirty 的否定（对应 Laravel isClean）。
+// IsClean 是 IsDirty 的否定。
 func IsClean(model any, keys ...string) bool {
 	return !IsDirty(model, keys...)
 }
 
-// GetDirty 返回相对 original 的脏列（对应 Laravel getDirty）。
+// GetDirty 返回相对 original 的脏列。
 func GetDirty(model any) map[string]any {
 	return dirtyAttributes(model)
 }
 
-// GetOriginal 返回列的 original 值；无快照时退回当前值（对应 Laravel getOriginal）。
-// 不传 key 时返回整个 original map 的副本（对应 HasAttributes.php:2084 的
-// 无 $key 全量形态）；无快照时退回当前属性全量快照。
+// GetOriginal 返回列的 original 值；无快照时退回当前值。
+// 不传 key 时返回整个 original map 的副本
+// （无 key 全量形态）；无快照时退回当前属性全量快照。
 func GetOriginal(model any, keys ...string) any {
 	if len(keys) == 0 {
 		if s := stateOf(model); s != nil && s.original != nil {
@@ -337,7 +545,7 @@ func GetOriginal(model any, keys ...string) any {
 	return nil
 }
 
-// GetChanges 返回最近一次成功更新写库的变更集（对应 Laravel getChanges）。
+// GetChanges 返回最近一次成功更新写库的变更集。
 func GetChanges(model any) map[string]any {
 	s := stateOf(model)
 	if s == nil || s.changes == nil {
@@ -350,7 +558,7 @@ func GetChanges(model any) map[string]any {
 	return out
 }
 
-// WasChanged 判断最近一次更新是否有（指定列的）实际写库变更（对应 Laravel wasChanged）。
+// WasChanged 判断最近一次更新是否有（指定列的）实际写库变更。
 func WasChanged(model any, keys ...string) bool {
 	s := stateOf(model)
 	if s == nil || len(s.changes) == 0 {
@@ -367,10 +575,10 @@ func WasChanged(model any, keys ...string) bool {
 	return false
 }
 
-// SyncOriginal 把当前属性整体固化为 original（对应 Laravel syncOriginal）。
+// SyncOriginal 把当前属性整体固化为 original。
 func SyncOriginal(model any) { syncOriginal(model) }
 
-// SyncChanges 依据 original 重算变更集（对应 Laravel syncChanges）。
+// SyncChanges 依据 original 重算变更集。
 func SyncChanges(model any) {
 	if s := stateOf(model); s == nil || s.original == nil {
 		recordChanges(model, nil)
@@ -379,7 +587,7 @@ func SyncChanges(model any) {
 	recordChanges(model, dirtyAttributes(model))
 }
 
-// DiscardChanges 把属性回滚到 original（对应 Laravel discardChanges）；
+// DiscardChanges 把属性回滚到 original；
 // 无快照的新模型清零全部字段。json 快照为序列化字符串，回滚时反序列化还原。
 func DiscardChanges(model any) error {
 	schema, err := NewSchema(model)
@@ -420,7 +628,7 @@ func DiscardChanges(model any) error {
 	return nil
 }
 
-// ---- exists / wasRecentlyCreated（对应 Laravel $exists/$wasRecentlyCreated）----
+// ---- exists / wasRecentlyCreated（持久化/最近创建标记）----
 
 // Exists 判断模型是否对应一条已持久化的记录（水合或写入成功后为 true）。
 func Exists(model any) bool {
@@ -436,7 +644,7 @@ func WasRecentlyCreated(model any) bool {
 
 // setExists 内部：更新 exists / wasRecentlyCreated 标记。
 // setExistsKeepRecent 仅置 exists，不动 wasRecentlyCreated
-// （Laravel restore() 不触碰该标志）。
+// （恢复路径不触碰该标志）。
 func setExistsKeepRecent(model any) {
 	setModelState(model, func(s *modelState) {
 		s.exists = true
@@ -450,7 +658,7 @@ func setExists(model any, exists, recent bool) {
 	})
 }
 
-// ---- timestamps 开关（对应 Laravel HasTimestamps::withoutTimestamps）----
+// ---- timestamps 开关（withoutTimestamps 作用域）----
 
 var (
 	tsIgnoreMu sync.Mutex
@@ -465,8 +673,8 @@ func TimestampsIgnored() bool {
 }
 
 // WithoutTimestamps 在 fn 执行期间禁用时间戳写入（Save/Create/软删均不写
-// created_at/updated_at；支持嵌套）。注意：作用域计数是进程级的，与 Laravel
-// 静态开关一致，作用域内不要并发执行其它模型的写入。
+// created_at/updated_at；支持嵌套）。注意：作用域计数是进程级的静态
+// 开关，作用域内不要并发执行其它模型的写入。
 func WithoutTimestamps(fn func()) {
 	tsIgnoreMu.Lock()
 	tsIgnoreN++
@@ -520,8 +728,9 @@ func valuesEqual(a, b any) bool {
 	return reflect.DeepEqual(a, b)
 }
 
-// dirtyAttributes 计算相对 original 的脏列（对应 Laravel getDirty）：
-// 无快照时除主键/nil 指针外全部视为脏（与 Attributes() 的写入口径一致）。
+// dirtyAttributes 计算相对 original 的脏列：
+// 主键变更包含在内（判脏不排除主键，setKeysForSaveQuery
+// 用 original 主键定位行）；无快照时除 nil 指针外全部视为脏。
 func dirtyAttributes(model any) map[string]any {
 	schema, err := NewSchema(model)
 	if err != nil {
@@ -534,12 +743,17 @@ func dirtyAttributes(model any) map[string]any {
 	hasOriginal := original != nil
 	dirty := make(map[string]any)
 	for _, f := range schema.Fields {
-		if f.Ignored || f.Primary {
+		if f.Ignored {
 			continue
 		}
 		cur := comparableFieldValue(f)
 		if !hasOriginal {
 			if f.Value.Kind() == reflect.Ptr && f.Value.IsNil() {
+				continue
+			}
+			// 无快照的新模型：主键由 Attributes() 的 incrementing 语义处理
+			// （空自增主键不参与 insert），这里跳过零值主键避免全零主键进 insert
+			if f.Primary && f.IsBlank {
 				continue
 			}
 			dirty[f.Name] = cur
@@ -552,7 +766,7 @@ func dirtyAttributes(model any) map[string]any {
 	return dirty
 }
 
-// isAttributeDirty 判断单列是否相对 original 发生变化（对应 Laravel isDirty($key)）。
+// isAttributeDirty 判断单列是否相对 original 发生变化。
 func isAttributeDirty(model any, name string) bool {
 	schema, err := NewSchema(model)
 	if err != nil {
@@ -577,7 +791,7 @@ func isAttributeDirty(model any, name string) bool {
 	return false
 }
 
-// isModelTrashed 判断软删模型当前是否处于已删除状态（对应 Laravel trashed()）。
+// isModelTrashed 判断软删模型当前是否处于已删除状态。
 func isModelTrashed(model any, info *modelInfo) bool {
 	if !info.softDeletes {
 		return false
@@ -615,10 +829,11 @@ func setFieldTime(f *Field, t time.Time) {
 }
 
 // applyCreateTimestamps 在 creating 事件之后、insert 之前固化时间戳
-// （对齐 Laravel updateTimestamps 的 create 分支：created_at/updated_at
-// 仅在未被设置时写 now，保留用户显式赋值）。
+// （创建分支：created_at/updated_at
+// 仅在未被设置时写 now，保留用户显式赋值；列名取模型元数据）。
 func applyCreateTimestamps(model interface{}) {
-	if TimestampsIgnored() || !inspectModel(model).hasTimestamps {
+	info := inspectModel(model)
+	if TimestampsIgnored() || !info.hasTimestamps {
 		return
 	}
 	schema, err := NewSchema(model)
@@ -626,7 +841,7 @@ func applyCreateTimestamps(model interface{}) {
 		return
 	}
 	for _, f := range schema.Fields {
-		if (f.Name != "created_at" && f.Name != "updated_at") || !f.Value.CanSet() {
+		if (f.Name != info.createdAtField && f.Name != info.updatedAtField) || !f.Value.CanSet() {
 			continue
 		}
 		if f.Value.IsZero() {
@@ -636,10 +851,11 @@ func applyCreateTimestamps(model interface{}) {
 }
 
 // touchUpdatedAt 仅在 updated_at 未被用户修改时刷新为 now
-// （对齐 Laravel updateTimestamps 的 update 分支：!isDirty(updatedAt) 才 set）；
+// （更新分支：updated_at 未脏时才写 now）；
 // WithoutTimestamps 作用域内不触碰。
 func touchUpdatedAt(model interface{}) {
-	if TimestampsIgnored() || !inspectModel(model).hasTimestamps {
+	info := inspectModel(model)
+	if TimestampsIgnored() || !info.hasTimestamps {
 		return
 	}
 	schema, err := NewSchema(model)
@@ -652,11 +868,11 @@ func touchUpdatedAt(model interface{}) {
 	}
 	hasOriginal := original != nil
 	for _, f := range schema.Fields {
-		if f.Name != "updated_at" || !f.Value.CanSet() {
+		if f.Name != info.updatedAtField || !f.Value.CanSet() {
 			continue
 		}
 		if hasOriginal {
-			if old, ok := original["updated_at"]; ok && valuesEqual(old, comparableFieldValue(f)) {
+			if old, ok := original[info.updatedAtField]; ok && valuesEqual(old, comparableFieldValue(f)) {
 				setFieldTime(f, nowFunc())
 			}
 			return
@@ -678,7 +894,7 @@ func (c *Connection) Model(model interface{}) *Builder {
 	return b
 }
 
-// newModelQuery 模型内部路径使用的查询建器：等价 Laravel newModelQuery——
+// newModelQuery 模型内部路径使用的查询建器——
 // 不注册全局 scope（软删行也参与 save/软删/restore 的 UPDATE）。
 func (c *Connection) newModelQuery(model interface{}) *Builder {
 	b := c.Model(model)
@@ -686,7 +902,7 @@ func (c *Connection) newModelQuery(model interface{}) *Builder {
 	return b
 }
 
-// Create Save a new model to the database（对应 Laravel save()+performInsert：
+// Create Save a new model to the database（保存新模型，事件顺序：
 // saving → creating → 时间戳 → insert → created → saved）。
 func (c *Connection) Create(model interface{}) error {
 	if err := c.fireModelEvent(observerFor(model), EventSaving, model); err != nil {
@@ -695,7 +911,7 @@ func (c *Connection) Create(model interface{}) error {
 	return c.performCreate(model)
 }
 
-// performCreate 对应 Laravel performInsert：creating → 唯一 ID/时间戳 →
+// performCreate 执行插入：creating → 唯一 ID/时间戳 →
 // INSERT → created → saved（saving 已由调用方触发，避免重复）。
 func (c *Connection) performCreate(model interface{}) error {
 	schema, err := NewSchema(model)
@@ -708,27 +924,37 @@ func (c *Connection) performCreate(model interface{}) error {
 		return err
 	}
 
-	// creating 事件之后生成唯一 ID（对应 Laravel addUniqueIdentifiers），
+	// creating 事件之后生成唯一 ID，
 	// 再固化时间戳，观察者对属性的修改会进入 SQL
 	if err := applyUniqueIDs(schema); err != nil {
 		return err
 	}
 	applyCreateTimestamps(model)
+	info := inspectModel(model)
 	attributes := schema.Attributes()
 	if TimestampsIgnored() {
-		// WithoutTimestamps 作用域：不写 created_at/updated_at（对齐 Laravel
-		// usesTimestamps=false：列整体不参与 insert）
-		delete(attributes, "created_at")
-		delete(attributes, "updated_at")
+		// WithoutTimestamps 作用域：不写 created_at/updated_at
+		// 时间戳关闭：列整体不参与 insert；列名取模型元数据
+		delete(attributes, info.createdAtField)
+		delete(attributes, info.updatedAtField)
 	}
 
-	insertId, _, err := c.Model(model).Insert(attributes)
+	// 自增主键走 insertGetId：PG/SQLServer 消费 returning/output 行回填
+	// （insertGetId 分支语义：仅自增主键
+	// 且主键列名作为 sequence 传入——非 "id" 主键列必须显式 returning）；
+	// 非自增主键（uuid/ulid 已生成、string 主键、无主键）走普通 insert
+	var insertId int64
+	if schema.PrimaryField != nil && schema.PrimaryField.IsBlank && primaryKeyIncrementing(schema.PrimaryField) {
+		insertId, err = c.Model(model).InsertGetId(attributes, info.primaryKey)
+	} else {
+		_, _, err = c.Model(model).Insert(attributes)
+	}
 	if err != nil {
 		return err
 	}
 
 	// 自增回填仅在主键仍为空时生效：UUID/ULID 主键已在 insert 前生成，
-	// 不能被 LastInsertId 覆盖（对应 Laravel incrementing 判定）
+	// 不能被 LastInsertId 覆盖（自增主键判定）
 	if schema.PrimaryField == nil || schema.PrimaryField.IsBlank {
 		if err := schema.SetId(insertId); err != nil {
 			return err
@@ -740,13 +966,18 @@ func (c *Connection) performCreate(model interface{}) error {
 	if err := c.fireModelEvent(ob, EventCreated, model); err != nil {
 		return err
 	}
-	return c.fireModelEvent(ob, EventSaved, model)
+	if err := c.fireModelEvent(ob, EventSaved, model); err != nil {
+		return err
+	}
+	// touches 在 created/saved 事件之后（保存收尾顺序：
+	// 先 saved 事件后 touchOwners，touch 失败不吞事件）
+	return c.TouchOwners(model)
 }
 
-// Save Save the model to the database（对应 Laravel save()/performUpdate）：
-// saving → 干净模型 short-circuit（仅 saved，不发 SQL 不触发 updating/updated，
-// Model.php:1435-1436）；存在记录（exists）→ updating → 时间戳 → 脏列 UPDATE →
-// updated；否则 → creating → 时间戳 → INSERT（对齐 Laravel 以 exists 而非主键
+// Save Save the model to the database（保存/更新）：
+// saving → 干净模型 short-circuit（仅 saved，不发 SQL 不触发 updating/updated）；
+// 存在记录（exists）→ updating → 时间戳 → 脏列 UPDATE →
+// updated；否则 → creating → 时间戳 → INSERT（以 exists 而非主键
 // 是否为空决定插入/更新）。
 func (c *Connection) Save(model interface{}) error {
 	schema, err := NewSchema(model)
@@ -761,13 +992,18 @@ func (c *Connection) Save(model interface{}) error {
 		return err
 	}
 
-	// Laravel 先判 isDirty：干净的水合模型不发 SQL、不触发 updating/updated，
+	// 先判 isDirty：干净的水合模型不发 SQL、不触发 updating/updated，
 	// 但 saved 事件仍触发（finishSave）。
 	dirty := dirtyAttributes(model)
 	isExisting := Exists(model)
 
 	if isExisting && len(dirty) == 0 {
-		return c.fireModelEvent(ob, EventSaved, model)
+		// 干净保存短路：与 performCreate/更新路径一致补 touches
+		// （保存收尾对 clean-save 同样 touchOwners）
+		if err := c.fireModelEvent(ob, EventSaved, model); err != nil {
+			return err
+		}
+		return c.TouchOwners(model)
 	}
 
 	if isExisting {
@@ -787,14 +1023,20 @@ func (c *Connection) Save(model interface{}) error {
 			return nil
 		}
 
+		// 定位行用 original 主键（更新定位语义：
+		// getDirty 含主键，WHERE 必须取变更前的值，否则改主键后 UPDATE 命中 0 行）
+		keyValue := modelOriginalPrimaryKey(model, info)
+		if keyValue == nil {
+			keyValue = schema.PrimaryField.Value.Addr().Interface()
+		}
 		_, err = c.newModelQuery(model).
-			Where(info.primaryKey, schema.PrimaryField.Value.Addr().Interface()).
+			Where(info.primaryKey, keyValue).
 			Update(dirty)
 		if err != nil {
 			return err
 		}
 
-		// 对齐 Laravel performUpdate：updated 事件前固化变更集，观察者可读 GetChanges
+		// performUpdate 语义：updated 事件前固化变更集，观察者可读 GetChanges
 		recordChanges(model, dirty)
 
 		if err := c.fireModelEvent(ob, EventUpdated, model); err != nil {
@@ -804,15 +1046,29 @@ func (c *Connection) Save(model interface{}) error {
 			return err
 		}
 		syncOriginal(model)
-		return nil
+		// touches：声明 touches tag 的模型在 save/update 后触碰父级时间戳
+		// （保存收尾的 touchOwners）
+		return c.TouchOwners(model)
 	}
 
-	// 未持久化：走 performInsert（Laravel save() 分支到 performInsert，手动
+	// 未持久化：走 performInsert（save() 未持久化分支，手动
 	// 设置主键的新模型同样插入；saving 已在本方法开头触发过一次）。
 	return c.performCreate(model)
 }
 
-// Destroy 按主键硬删除模型行（对应 Laravel delete() 的硬删分支）；
+// modelOriginalPrimaryKey 取 original 快照中的主键值（无快照/无主键返回 nil）。
+func modelOriginalPrimaryKey(model any, info *modelInfo) any {
+	s := stateOf(model)
+	if s == nil || s.original == nil {
+		return nil
+	}
+	if v, ok := s.original[info.primaryKey]; ok {
+		return v
+	}
+	return nil
+}
+
+// Destroy 按主键硬删除模型行（delete 的硬删分支）；
 // 主键为空时返回错误，绝不执行整表 DELETE。
 func (c *Connection) Destroy(model interface{}) error {
 	info := inspectModel(model)
@@ -820,12 +1076,12 @@ func (c *Connection) Destroy(model interface{}) error {
 	if err != nil {
 		return err
 	}
-	// Laravel Model::delete：主键检查在 exists 判断之前（:1741-1750）
+	// 主键检查在 exists 判断之前
 	if schema.PrimaryField == nil || schema.PrimaryField.IsBlank {
 		return errors.New("torm: cannot destroy model without primary key")
 	}
 	if !Exists(model) {
-		// Laravel Model::delete: !exists → return
+		// 模型不存在时直接返回（!exists → return）
 		return nil
 	}
 	ob := observerFor(model)
@@ -841,7 +1097,7 @@ func (c *Connection) Destroy(model interface{}) error {
 	return c.fireModelEvent(ob, EventDeleted, model)
 }
 
-// DestroyByIDs 按主键批量删除（对应 Laravel 静态 destroy：逐个加载模型并
+// DestroyByIDs 按主键批量删除（静态 destroy 语义：逐个加载模型并
 // 走完整删除生命周期，软删模型执行软删）。返回成功删除的个数。
 func (c *Connection) DestroyByIDs(model interface{}, ids ...interface{}) (int, error) {
 	if len(ids) == 0 {
@@ -884,11 +1140,11 @@ func newModelInstance(model interface{}) interface{} {
 }
 
 // DeleteModel 删除模型：软删除模型置 deleted_at（同步 updated_at），
-// 否则硬删除（命名避开 Connection.Delete 的原生 SQL 方法；对应 Laravel 模型 delete()
-// 与 SoftDeletes::runSoftDelete：deleting → UPDATE → trashed → deleted）。
+// 否则硬删除（命名避开 Connection.Delete 的原生 SQL 方法；模型删除
+// 与软删：deleting → UPDATE → trashed → deleted）。
 func (c *Connection) DeleteModel(model interface{}) error {
 	info := inspectModel(model)
-	// 非软删模型走硬删（对应 Laravel performDeleteOnModel 默认分支）
+	// 非软删模型走硬删（默认分支）
 	if !info.softDeletes {
 		return c.Destroy(model)
 	}
@@ -900,7 +1156,7 @@ func (c *Connection) DeleteModel(model interface{}) error {
 		return errors.New("cannot delete model without primary key")
 	}
 	if !Exists(model) {
-		// Laravel Model::delete: 模型不存在（未持久化或已删除）时静默返回
+		// 模型不存在（未持久化或已删除）时静默返回
 		return nil
 	}
 	ob := observerFor(model)
@@ -910,7 +1166,7 @@ func (c *Connection) DeleteModel(model interface{}) error {
 	now := nowFunc()
 	columns := map[string]interface{}{info.deletedAtField: now}
 	if info.hasTimestamps && !TimestampsIgnored() {
-		columns["updated_at"] = now
+		columns[info.updatedAtField] = now
 	}
 	if err := setModelAttrs(model, columns); err != nil {
 		return err
@@ -920,14 +1176,21 @@ func (c *Connection) DeleteModel(model interface{}) error {
 		Update(columns); err != nil {
 		return err
 	}
-	syncOriginalAttributes(model, info.deletedAtField, "updated_at")
-	// Laravel runSoftDelete 不改 exists（保持 true，SoftDeletes.php:137-158）；
+	// runSoftDelete 语义：软删变更记入 changes（GetChanges/WasChanged
+	// 在 deleted/trashed 观察者里可读），并局部刷新 original
+	recordChanges(model, columns)
+	syncOriginalAttributes(model, info.deletedAtField, info.updatedAtField)
+	// 软删不改 exists（保持 true）；
 	// 仅硬删路径（performDeleteOnModel forceDeleting 分支）置 exists=false。
 	// 软删后 save() 仍走 UPDATE，不会产生重复行。
 	if err := c.fireModelEvent(ob, EventTrashed, model); err != nil {
 		return err
 	}
-	return c.fireModelEvent(ob, EventDeleted, model)
+	if err := c.fireModelEvent(ob, EventDeleted, model); err != nil {
+		return err
+	}
+	// 软删同样触碰父级（软删路径同样 touchOwners）
+	return c.TouchOwners(model)
 }
 
 // ForceDelete 绕过软删除硬删除；主键为空时返回错误，绝不执行整表 DELETE。
@@ -941,7 +1204,7 @@ func (c *Connection) ForceDelete(model interface{}) error {
 		return errors.New("torm: cannot force delete model without primary key")
 	}
 	ob := observerFor(model)
-	// Laravel forceDelete（SoftDeletes.php:51-66）：forceDeleting（可取消）→
+	// forceDelete 事件顺序：forceDeleting（可取消）→
 	// delete()（触发 deleting/deleted，!exists 时静默返回）→ forceDeleted
 	// 仅当删除真发生；硬删经 newModelQuery（软删行也参与）
 	if err := c.fireModelEvent(ob, EventForceDeleting, model); err != nil {
@@ -966,7 +1229,7 @@ func (c *Connection) ForceDelete(model interface{}) error {
 	return c.fireModelEvent(ob, EventForceDeleted, model)
 }
 
-// Restore 恢复软删除的模型（对应 Laravel SoftDeletes::restore：
+// Restore 恢复软删除的模型（事件顺序：
 // Restoring → deleted_at 置空 + updated_at 刷新（经完整 save 生命周期）→ Restored）。
 func (c *Connection) Restore(model interface{}) error {
 	info := inspectModel(model)
@@ -987,7 +1250,7 @@ func (c *Connection) Restore(model interface{}) error {
 	if err := setModelAttrs(model, map[string]interface{}{info.deletedAtField: nil}); err != nil {
 		return err
 	}
-	// Laravel restore(): exists=true before save so Save performs an UPDATE
+	// 先置 exists=true，使 Save 走 UPDATE 路径
 	// （软删已把 exists 置 false）
 	setExistsKeepRecent(model)
 	if err := c.Save(model); err != nil {
@@ -1024,14 +1287,14 @@ func mergeAttributeMaps(attributes map[string]interface{}, values []map[string]i
 }
 
 // FirstOrCreate 按 attributes 查找；未命中则合并 attributes+values 创建模型
-// （对应 Laravel firstOrCreate(attributes, values)）。
+// （firstOrCreate(attributes, values) 语义：赋值走 fill 守卫语义）。
 func (c *Connection) FirstOrCreate(model interface{}, attributes map[string]interface{}, values ...map[string]interface{}) error {
 	b := c.whereModelAttributes(model, attributes)
 	if err := b.First(model); err != nil {
 		return err
 	}
 	if isEmptyDest(model) {
-		if err := setModelAttrs(model, mergeAttributeMaps(attributes, values)); err != nil {
+		if err := fillModelAttrs(model, mergeAttributeMaps(attributes, values)); err != nil {
 			return err
 		}
 		return c.Create(model)
@@ -1040,22 +1303,22 @@ func (c *Connection) FirstOrCreate(model interface{}, attributes map[string]inte
 }
 
 // FirstOrNew 按 attributes 查找；未命中仅以 attributes+values 构造不落库
-// （对应 Laravel firstOrNew(attributes, values)）。
+// （firstOrNew(attributes, values) 语义）。
 func (c *Connection) FirstOrNew(model interface{}, attributes map[string]interface{}, values ...map[string]interface{}) error {
 	b := c.whereModelAttributes(model, attributes)
 	if err := b.First(model); err != nil {
 		return err
 	}
 	if isEmptyDest(model) {
-		return setModelAttrs(model, mergeAttributeMaps(attributes, values))
+		return fillModelAttrs(model, mergeAttributeMaps(attributes, values))
 	}
 	return nil
 }
 
 // CreateOrFirst 先尝试创建，唯一约束冲突时回退按 attributes 查询
-// （对应 Laravel createOrFirst 的并发安全语义）。
+// （createOrFirst 的并发安全语义）。
 func (c *Connection) CreateOrFirst(model interface{}, attributes map[string]interface{}, values ...map[string]interface{}) error {
-	if err := setModelAttrs(model, mergeAttributeMaps(attributes, values)); err != nil {
+	if err := fillModelAttrs(model, mergeAttributeMaps(attributes, values)); err != nil {
 		return err
 	}
 	err := c.Create(model)
@@ -1066,7 +1329,7 @@ func (c *Connection) CreateOrFirst(model interface{}, attributes map[string]inte
 	if !errors.As(err, &te) || te.Kind != KindUniqueConstraint {
 		return err
 	}
-	// Laravel Builder.php:755：回退查询 useWritePdo()——读写分离 + 主从延迟
+	// 回退查询 useWritePdo()——读写分离 + 主从延迟
 	// 场景必须走写连接才能读到刚冲突的行
 	b := c.whereModelAttributes(model, attributes).UseWritePdo()
 	fresh := newModelInstance(model)
@@ -1082,7 +1345,7 @@ func (c *Connection) CreateOrFirst(model interface{}, attributes map[string]inte
 }
 
 // RestoreOrCreate 软删模型版 firstOrCreate：withTrashed 查找，命中且已软删
-// 则恢复（对应 Laravel SoftDeletingScope::restoreOrCreate 宏）。
+// 则恢复（restoreOrCreate 语义）。
 func (c *Connection) RestoreOrCreate(model interface{}, attributes map[string]interface{}, values ...map[string]interface{}) error {
 	b := c.whereModelAttributes(model, attributes)
 	b.WithTrashed()
@@ -1090,7 +1353,7 @@ func (c *Connection) RestoreOrCreate(model interface{}, attributes map[string]in
 		return err
 	}
 	if isEmptyDest(model) {
-		if err := setModelAttrs(model, mergeAttributeMaps(attributes, values)); err != nil {
+		if err := fillModelAttrs(model, mergeAttributeMaps(attributes, values)); err != nil {
 			return err
 		}
 		if err := c.Create(model); err != nil {
@@ -1101,9 +1364,9 @@ func (c *Connection) RestoreOrCreate(model interface{}, attributes map[string]in
 }
 
 // CreateOrRestore 软删模型版 createOrFirst：先创建，唯一约束冲突时
-// withTrashed 查回已存在行并恢复（对应 Laravel SoftDeletingScope::createOrRestore 宏）。
+// withTrashed 查回已存在行并恢复（createOrRestore 语义）。
 func (c *Connection) CreateOrRestore(model interface{}, attributes map[string]interface{}, values ...map[string]interface{}) error {
-	if err := setModelAttrs(model, mergeAttributeMaps(attributes, values)); err != nil {
+	if err := fillModelAttrs(model, mergeAttributeMaps(attributes, values)); err != nil {
 		return err
 	}
 	err := c.Create(model)
@@ -1127,42 +1390,53 @@ func (c *Connection) CreateOrRestore(model interface{}, attributes map[string]in
 }
 
 // copyModelInto 把 src 的扫描结果复制进 dst（同类型模型指针），并同步 dst 的快照。
+// 复制会连带内嵌状态指针：先切断共享（避免 src/dst 状态别名），
+// 再迁移 src 的 exists/wasRecentlyCreated 标记，original 随 syncOriginal 固化。
 func copyModelInto(dst, src interface{}) {
 	dv := reflect.ValueOf(dst).Elem()
 	sv := reflect.ValueOf(src).Elem()
 	dv.Set(sv)
+	resetModelState(dst)
+	if ss := stateOf(src); ss != nil {
+		exists, recent := ss.exists, ss.wasRecentlyCreated
+		setModelState(dst, func(s *modelState) { s.exists = exists; s.wasRecentlyCreated = recent })
+	}
 	syncOriginal(dst)
 }
 
 // UpdateOrCreate 按 attributes 查找；命中则更新 values，未命中则创建
-// （对应 Laravel updateOrCreate(attributes, values)）。
+// （updateOrCreate(attributes, values) 语义：赋值走 fill 守卫语义）。
 func (c *Connection) UpdateOrCreate(model interface{}, attributes, values map[string]interface{}) error {
 	b := c.whereModelAttributes(model, attributes)
 	if err := b.First(model); err != nil {
 		return err
 	}
 	if isEmptyDest(model) {
-		if err := setModelAttrs(model, mergeAttributeMaps(attributes, []map[string]interface{}{values})); err != nil {
+		if err := fillModelAttrs(model, mergeAttributeMaps(attributes, []map[string]interface{}{values})); err != nil {
 			return err
 		}
 		return c.Create(model)
 	}
-	if err := setModelAttrs(model, values); err != nil {
+	if err := fillModelAttrs(model, values); err != nil {
 		return err
 	}
 	return c.Save(model)
 }
 
-// ---- 质量赋值守卫（对应 Laravel GuardsAttributes）----
+// ---- 质量赋值守卫（fillable/guarded）----
 //
 // 声明方式（任选其一，按类型缓存）：
 //   - 字段 tag：`torm:"fillable"` / `torm:"guarded"` / `torm:"guarded:*"`；
-//   - 代码注册：SetFillable / SetGuarded（keys 为空 = 全部）。
+//   - 代码注册：SetFillable / SetGuarded（keys 为空 = 全部）；
+//   - 全局：Unguard(fn)（全局静态解守卫）。
 //
-// 语义对齐 Laravel：fillable 列表非空时仅列表内字段可填；否则按 guarded
-// 排除；guarded == ["*"] 且无 fillable 时 TotallyGuarded。
+// 本库契约（有测试固化，TestModelMassAssignmentGuards）：默认无守卫 = 全部可填；
+// 声明了守卫（guarded tag / SetGuarded）后，触碰受保护字段抛 *MassAssignmentError
+// 且不写入任何字段（比"静默跳过"更严格）。
+// 需要"未声明守卫 = 全守卫"方向的代码可调用
+// SetDefaultUnguarded(false)。
 
-// MassAssignmentError 对应 Laravel 的 MassAssignmentException：
+// MassAssignmentError 质量赋值异常：
 // Fill 时试图写入被守卫的字段。
 type MassAssignmentError struct {
 	Key string
@@ -1170,6 +1444,54 @@ type MassAssignmentError struct {
 
 func (e *MassAssignmentError) Error() string {
 	return "torm: mass assignment blocked on field [" + e.Key + "]"
+}
+
+var (
+	unguardMu        sync.Mutex
+	unguardedN       int
+	defaultUnguarded = true // 默认方向：未声明守卫的模型全部可填（本库契约）
+)
+
+// Unguard 全局解除守卫（fn 执行期间可填任意字段）。
+func Unguard(fn func()) {
+	unguardMu.Lock()
+	unguardedN++
+	unguardMu.Unlock()
+	defer func() {
+		// clamp 到 ≥0：作用域内误调 Reguard 不能把计数打成负数
+		// （负数会让下一次 Unguard 静默失效）
+		unguardMu.Lock()
+		if unguardedN > 0 {
+			unguardedN--
+		}
+		unguardMu.Unlock()
+	}()
+	fn()
+}
+
+// Reguard 恢复守卫状态（嵌套计数归零后生效）。
+func Reguard() {
+	unguardMu.Lock()
+	if unguardedN > 0 {
+		unguardedN--
+	}
+	unguardMu.Unlock()
+}
+
+// SetDefaultUnguarded 修改"未声明守卫模型"的默认方向：
+// true = 默认全可填（本库契约，默认值）；false = 全守卫方向
+// （未声明守卫的模型完全守卫，Fill 抛错）。仅影响"既无 fillable 也无
+// guarded tag/注册"的模型类型。
+func SetDefaultUnguarded(v bool) {
+	unguardMu.Lock()
+	defaultUnguarded = v
+	unguardMu.Unlock()
+}
+
+func isUnguarded() bool {
+	unguardMu.Lock()
+	defer unguardMu.Unlock()
+	return unguardedN > 0
 }
 
 // SetFillable 设置模型类型的可填充列（keys 为空 = 清空列表）。
@@ -1191,7 +1513,7 @@ func SetGuarded(model any, keys ...string) {
 	typeMetaMu.Unlock()
 }
 
-// IsGuarded 判断列是否被守卫（对应 Laravel isGuarded）。
+// IsGuarded 判断列是否被守卫（"*" 匹配全部）。
 func IsGuarded(model any, key string) bool {
 	m := metaFor(model)
 	typeMetaMu.RLock()
@@ -1204,14 +1526,28 @@ func IsGuarded(model any, key string) bool {
 	return false
 }
 
-// IsFillable 判断列是否可被 Fill 赋值（对应 Laravel isFillable）。
+// IsFillable 判断列是否可被 Fill 赋值。
+// 支持前缀通配（fillable tag "col_*"，模式匹配）。
 func IsFillable(model any, key string) bool {
+	if isUnguarded() {
+		return true
+	}
 	m := metaFor(model)
 	typeMetaMu.RLock()
-	fillable := m.fillable
+	fillable, guarded := m.fillable, m.guarded
 	typeMetaMu.RUnlock()
+	// 未声明任何守卫的模型类型：遵循默认方向
+	if len(fillable) == 0 && len(guarded) == 0 {
+		unguardMu.Lock()
+		d := defaultUnguarded
+		unguardMu.Unlock()
+		return d
+	}
 	for _, f := range fillable {
 		if f == key {
+			return true
+		}
+		if strings.HasSuffix(f, "*") && strings.HasPrefix(key, strings.TrimSuffix(f, "*")) {
 			return true
 		}
 	}
@@ -1229,6 +1565,12 @@ func TotallyGuarded(model any) bool {
 	if len(m.fillable) > 0 {
 		return false
 	}
+	if len(m.guarded) == 0 {
+		unguardMu.Lock()
+		d := defaultUnguarded
+		unguardMu.Unlock()
+		return !d
+	}
 	for _, g := range m.guarded {
 		if g == "*" {
 			return true
@@ -1237,8 +1579,14 @@ func TotallyGuarded(model any) bool {
 	return false
 }
 
-// Fill 按守卫规则批量赋值（对应 Laravel fill）：遇到不可填字段返回
-// *MassAssignmentException 语义的 *MassAssignmentError，已过滤字段不写入。
+// fillModelAttrs 守卫感知赋值（FirstOrCreate/UpdateOrCreate 等走
+// fill 的路径统一入口）：不可填字段抛 *MassAssignmentError 且不写入任何字段。
+func fillModelAttrs(model any, attrs map[string]any) error {
+	return Fill(model, attrs)
+}
+
+// Fill 按守卫规则批量赋值：遇到不可填字段返回
+// *MassAssignmentError，已过滤字段不写入（原子性，见守卫契约说明）。
 func Fill(model any, attrs map[string]any) error {
 	allowed := make(map[string]any, len(attrs))
 	for _, k := range sortedColumnNames(attrs) {
@@ -1250,12 +1598,12 @@ func Fill(model any, attrs map[string]any) error {
 	return setModelAttrs(model, allowed)
 }
 
-// ForceFill 绕过守卫批量赋值（对应 Laravel forceFill）。
+// ForceFill 绕过守卫批量赋值。
 func ForceFill(model any, attrs map[string]any) error {
 	return setModelAttrs(model, attrs)
 }
 
-// ---- 隐藏字段（对应 Laravel HidesAttributes）----
+// ---- 隐藏字段（hidden 注册表）----
 //
 // torm 模型是普通结构体，暂无统一的 Map/ToJSON 输出路径，这里维护
 // 每类型的 hidden 注册表（tag `torm:"hidden"` 声明，MakeHidden/MakeVisible
@@ -1269,7 +1617,7 @@ func GetHidden(model any) []string {
 	return append([]string(nil), m.hidden...)
 }
 
-// MakeHidden 追加隐藏列（对应 Laravel makeHidden）。
+// MakeHidden 追加隐藏列。
 func MakeHidden(model any, keys ...string) {
 	m := metaFor(model)
 	typeMetaMu.Lock()
@@ -1281,7 +1629,7 @@ func MakeHidden(model any, keys ...string) {
 	}
 }
 
-// MakeVisible 解除隐藏列（对应 Laravel makeVisible）。
+// MakeVisible 解除隐藏列。
 func MakeVisible(model any, keys ...string) {
 	m := metaFor(model)
 	typeMetaMu.Lock()
@@ -1312,13 +1660,13 @@ func containsString(list []string, key string) bool {
 	return false
 }
 
-// ---- Quietly / OrFail 族（对应 Laravel saveQuietly/saveOrFail 等）----
+// ---- Quietly / OrFail 族（静默保存 / 失败即 panic）----
 //
 // Quietly = 抑制观察者钩子与事件分发；OrFail = 失败时以 *FailError 包装
-// 原始 error panic（对齐 Laravel orFail 的 FailException 语义，可 recover
+// 原始 error panic（失败即 panic 语义，可 recover
 // 后经 Unwrap 取回原始错误）。
 
-// FailError 对应 Laravel 的 FailException：OrFail 族失败时的 panic 载荷。
+// FailError 是 OrFail 族失败时的 panic 载荷。
 type FailError struct {
 	Op  string
 	Err error
@@ -1340,37 +1688,44 @@ func eventsQuiet() bool {
 }
 
 // withoutEvents 在 fn 执行期间抑制本连接的事件分发与全部模型观察者
-// （对应 Laravel Model::withoutEvents）。抑制计数是进程级的（同步执行、
-// 作用域极短），作用域内其它 goroutine 的事件也会被抑制——与 Laravel
-// 静态 withoutEvents 的取舍一致。
+// （等价全局 withoutEvents 开关）。抑制计数是进程级的（同步执行、
+// 作用域极短），作用域内其它 goroutine 的事件也会被抑制——与静态
+// 全局开关的取舍一致。
+//
+// dispatcher 的读写统一走 stateMu（与 SetEventDispatcher 一致），quietMu 只保护
+// 计数器本身；旧实现用 quietMu 保护 dispatcher 与 stateMu 形成数据竞争。
 func (c *Connection) withoutEvents(fn func() error) error {
 	quietMu.Lock()
 	quietDepth++
+	quietMu.Unlock()
+	c.stateMu.Lock()
 	saved := c.dispatcher
 	c.dispatcher = nil
-	quietMu.Unlock()
+	c.stateMu.Unlock()
 	defer func() {
 		quietMu.Lock()
 		quietDepth--
 		quietMu.Unlock()
+		c.stateMu.Lock()
 		c.dispatcher = saved
+		c.stateMu.Unlock()
 	}()
 	return fn()
 }
 
-// orFail 包装 Laravel orFail 语义：err 非 nil 时以 *FailError panic。
+// orFail 包装失败即 panic 的语义：err 非 nil 时以 *FailError panic。
 func orFail(op string, err error) {
 	if err != nil {
 		panic(&FailError{Op: op, Err: err})
 	}
 }
 
-// SaveQuietly 保存模型但不触发任何事件（对应 Laravel saveQuietly）。
+// SaveQuietly 保存模型但不触发任何事件。
 func (c *Connection) SaveQuietly(model any) error {
 	return c.withoutEvents(func() error { return c.Save(model) })
 }
 
-// UpdateModel 模型级批量赋值更新（对应 Laravel Model::update = fill + save）：
+// UpdateModel 模型级批量赋值更新（fill + save）：
 // Fill 走守卫规则，Save 的干净保存语义（无脏列不发 SQL）自动生效。
 // 命名避开 Connection.Update（原生 SQL 方法），与 DestroyByIDs 先例一致。
 func (c *Connection) UpdateModel(model any, attrs map[string]any) error {
@@ -1380,14 +1735,14 @@ func (c *Connection) UpdateModel(model any, attrs map[string]any) error {
 	return c.Save(model)
 }
 
-// Push 保存模型及其全部已加载关系（递归，对应 Laravel push）：
+// Push 保存模型及其全部已加载关系（递归）：
 // 关系取 LoadedRelation 缓存（Load/LoadMany 显式加载的结果），
-// 逐个递归 Push；已访问模型跳过（对应 Laravel withoutRecursion 防环）。
+// 逐个递归 Push；已访问模型跳过（防环）。
 func (c *Connection) Push(model any) error {
 	return c.push(model, map[uintptr]bool{})
 }
 
-// PushQuietly 保存模型与已加载关系但不触发任何事件（对应 Laravel pushQuietly）。
+// PushQuietly 保存模型与已加载关系但不触发任何事件。
 func (c *Connection) PushQuietly(model any) error {
 	return c.withoutEvents(func() error { return c.Push(model) })
 }
@@ -1435,23 +1790,23 @@ func loadedRelationNames(model any) []string {
 	return names
 }
 
-// SaveOrFail 事务内保存模型，失败 panic *FailError（对应 Laravel saveOrFail）。
+// SaveOrFail 事务内保存模型，失败 panic *FailError。
 func (c *Connection) SaveOrFail(model any) error {
 	orFail("save", c.Transaction(func(tx *Connection) error { return tx.Save(model) }))
 	return nil
 }
 
-// UpdateQuietly 批量赋值后静默保存。
+// UpdateQuietly 批量赋值后静默保存（与 UpdateModel 一致走守卫 Fill）。
 func (c *Connection) UpdateQuietly(model any, attrs map[string]any) error {
 	return c.withoutEvents(func() error {
-		if err := setModelAttrs(model, attrs); err != nil {
+		if err := Fill(model, attrs); err != nil {
 			return err
 		}
 		return c.Save(model)
 	})
 }
 
-// CreateQuietly 创建模型但不触发任何事件（对应 Laravel createQuietly）。
+// CreateQuietly 创建模型但不触发任何事件。
 func (c *Connection) CreateQuietly(model any) error {
 	return c.withoutEvents(func() error { return c.Create(model) })
 }
@@ -1475,18 +1830,18 @@ func (c *Connection) CreateManyQuietly(model any, rows []map[string]any) error {
 	})
 }
 
-// DeleteQuietly 删除模型但不触发任何事件（对应 Laravel deleteQuietly）。
+// DeleteQuietly 删除模型但不触发任何事件。
 func (c *Connection) DeleteQuietly(model any) error {
 	return c.withoutEvents(func() error { return c.DeleteModel(model) })
 }
 
-// DeleteOrFail 删除模型，失败 panic *FailError（对应 Laravel deleteOrFail）。
+// DeleteOrFail 删除模型，失败 panic *FailError。
 func (c *Connection) DeleteOrFail(model any) error {
 	orFail("delete", c.DeleteModel(model))
 	return nil
 }
 
-// RestoreQuietly 恢复软删模型但不触发任何事件（对应 Laravel restoreQuietly）。
+// RestoreQuietly 恢复软删模型但不触发任何事件。
 func (c *Connection) RestoreQuietly(model any) error {
 	return c.withoutEvents(func() error { return c.Restore(model) })
 }
@@ -1496,7 +1851,7 @@ func (c *Connection) ForceDeleteQuietly(model any) error {
 	return c.withoutEvents(func() error { return c.ForceDelete(model) })
 }
 
-// Touch 以 now 刷新 updated_at 后走完整 save 生命周期（对应 Laravel touch）。
+// Touch 以 now 刷新 updated_at 后走完整 save 生命周期。
 func (c *Connection) Touch(model any) error {
 	return c.touch(model)
 }
@@ -1507,6 +1862,11 @@ func (c *Connection) TouchQuietly(model any) error {
 }
 
 func (c *Connection) touch(model any) error {
+	// 时间戳关闭的模型不触碰也不发事件
+	info := inspectModel(model)
+	if !info.hasTimestamps {
+		return nil
+	}
 	schema, err := NewSchema(model)
 	if err != nil {
 		return err
@@ -1515,7 +1875,7 @@ func (c *Connection) touch(model any) error {
 		return errors.New("torm: cannot touch model without primary key")
 	}
 	for _, f := range schema.Fields {
-		if f.Name == "updated_at" && f.Value.CanSet() {
+		if f.Name == info.updatedAtField && f.Value.CanSet() {
 			setFieldTime(f, nowFunc())
 			break
 		}
@@ -1523,12 +1883,12 @@ func (c *Connection) touch(model any) error {
 	return c.Save(model)
 }
 
-// ---- fresh / refresh（对应 Laravel Model.php:2089-2135）----
+// ---- fresh / refresh ----
 //
 // 两者都用 newQueryWithoutScopes 语义（不带软删等全局 scope）按主键重查，
 // 走写连接（useWritePdo）。
 
-// Fresh 按主键重查一个全新实例（对应 Laravel fresh）：原模型保持不变；
+// Fresh 按主键重查一个全新实例（fresh 语义）：原模型保持不变；
 // 模型未持久化或行未命中返回 nil。
 func (c *Connection) Fresh(model any) (any, error) {
 	if !Exists(model) {
@@ -1554,7 +1914,7 @@ func (c *Connection) Fresh(model any) (any, error) {
 	return inst, nil
 }
 
-// Refresh 重查并刷新原模型属性（对应 Laravel refresh）：按主键重查
+// Refresh 重查并刷新原模型属性（refresh 语义）：按主键重查
 // （不带软删 scope，已软删模型同样可刷新），把查得属性整体覆盖进原模型
 // 并同步 original 快照；行已消失返回 *ErrNotFound（firstOrFail 语义）。
 func (c *Connection) Refresh(model any) error {
@@ -1582,12 +1942,12 @@ func (c *Connection) Refresh(model any) error {
 	return nil
 }
 
-// ---- 模型实例级关系聚合（对应 Laravel Model.php:900-1050 loadAggregate 族）----
+// ---- 模型实例级关系聚合（loadAggregate 族）----
 //
 // 单模型按主键查询 (select fn(col) from target where keys...) as 别名，
 // 把聚合值写回模型同名属性字段（如 posts_count；字段缺失时静默跳过）。
 
-// LoadAggregate 通用关系聚合加载（对应 Laravel loadAggregate）：
+// LoadAggregate 通用关系聚合加载：
 // function/column 组合如 ("count","*") / ("sum","votes")；rest 支持
 // 约束闭包、嵌套 Relation 与 string 别名（与 Builder.WithAggregate 一致）。
 func (c *Connection) LoadAggregate(model any, name string, rel Relation, function, column string, rest ...any) error {
@@ -1612,7 +1972,7 @@ func (c *Connection) LoadAggregate(model any, name string, rel Relation, functio
 	}
 	for _, k := range sortedColumnNames(rows[0]) {
 		v := rows[0][k]
-		// bool 属性回填：exists 聚合经驱动返回整型 0/1（对应 Laravel 的布尔 cast）
+		// bool 属性回填：exists 聚合经驱动返回整型 0/1（布尔 cast）
 		if f := schemaField(schema, k); f != nil && f.Value.Kind() == reflect.Bool {
 			if n, ok := toIncrementAmount(v); ok {
 				v = n != 0
@@ -1624,7 +1984,7 @@ func (c *Connection) LoadAggregate(model any, name string, rel Relation, functio
 	return nil
 }
 
-// LoadCount 加载关系计数到模型 {relation}_count 属性（对应 Laravel loadCount）。
+// LoadCount 加载关系计数到模型 {relation}_count 属性。
 func (c *Connection) LoadCount(model any, name string, rel Relation, rest ...any) error {
 	return c.LoadAggregate(model, name, rel, "count", "*", rest...)
 }
@@ -1656,7 +2016,7 @@ func (c *Connection) LoadExists(model any, name string, rel Relation, rest ...an
 
 // ---- 模型实例级多态加载（提升自 builder 内部 loadMorph）----
 
-// LoadMorph 加载单模型的多态关系（对应 Laravel loadMorph 的实例级入口）：
+// LoadMorph 加载单模型的多态关系（实例级入口）：
 // MorphMany/MorphOne 经 builder 内部 loadMorph 查回子模型并填充同名关系
 // 字段，同时写入 LoadedRelation 缓存；其它关系类型走 Load 通道。
 func (c *Connection) LoadMorph(model any, name string, rel Relation) error {
@@ -1700,15 +2060,15 @@ func (c *Connection) LoadMorph(model any, name string, rel Relation) error {
 }
 
 // LoadMorphCount 加载多态关系计数到模型 {relation}_count 属性
-// （对应 Laravel loadMorphCount 的实例级入口）。
+// （loadMorphCount 的实例级入口）。
 func (c *Connection) LoadMorphCount(model any, name string, rel Relation) error {
 	return c.LoadAggregate(model, name, rel, "count", "*")
 }
 
-// ---- 模型级自增/自减（对应 Laravel Model.php:1090-1286）----
+// ---- 模型级自增/自减 ----
 //
 // 走原子 UPDATE（`col` = `col` + N 表达式）触发 updating/updated 事件
-// （对齐 Laravel：increment 复用 update 生命周期），并把新值同步回模型属性；
+// （increment 复用 update 生命周期），并把新值同步回模型属性；
 // extra 附加列一并更新；带时间戳的模型同时触碰 updated_at
 // （WithoutTimestamps 作用域内除外）。
 
@@ -1771,16 +2131,22 @@ func (c *Connection) incrementOrDecrement(model any, column string, args []any, 
 	if sign < 0 {
 		amt = -amount
 	}
+	// 无符号整型列减为负：DB 写入前预检（无符号溢出显式报错）
+	delta := float64(amount)
+	if sign < 0 {
+		delta = -delta
+	}
+	if err := checkNumericDelta(model, column, delta); err != nil {
+		return err
+	}
 	if _, err := b.Increment(column, amt, extra); err != nil {
 		return err
 	}
 
 	// 同步模型内存值与快照，记录变更集（updated 观察者可读）
-	delta := float64(amount)
-	if sign < 0 {
-		delta = -delta
+	if err := adjustNumericField(model, column, delta); err != nil {
+		return err
 	}
-	adjustNumericField(model, column, delta)
 	touched := []string{column}
 	for k, v := range extra {
 		if k == column {
@@ -1805,13 +2171,13 @@ func (c *Connection) incrementOrDecrement(model any, column string, args []any, 
 	return c.fireModelEvent(ob, EventUpdated, model)
 }
 
-// IncrementEach 一条 UPDATE 内自增多列（对应 Laravel incrementEach）；
+// IncrementEach 一条 UPDATE 内自增多列；
 // extra 为附加列。金额为负值时转为自减。
 func (c *Connection) IncrementEach(model any, columns map[string]int64, extra ...map[string]any) error {
 	return c.incrementEach(model, columns, extra, 1)
 }
 
-// DecrementEach 一条 UPDATE 内自减多列（对应 Laravel decrementEach）。
+// DecrementEach 一条 UPDATE 内自减多列。
 func (c *Connection) DecrementEach(model any, columns map[string]int64, extra ...map[string]any) error {
 	return c.incrementEach(model, columns, extra, -1)
 }
@@ -1854,6 +2220,12 @@ func (c *Connection) incrementEach(model any, columns map[string]int64, extraArg
 			s = -s
 			amt = -amt
 		}
+		// 无符号整型列减为负：DB 写入前预检
+		if s < 0 {
+			if err := checkNumericDelta(model, col, -float64(amt)); err != nil {
+				return err
+			}
+		}
 		wrapped := c.Model(model).GetGrammar().Wrap(col)
 		op := " + "
 		if s < 0 {
@@ -1880,7 +2252,9 @@ func (c *Connection) incrementEach(model any, columns map[string]int64, extraArg
 		if sign < 0 {
 			delta = -delta
 		}
-		adjustNumericField(model, col, delta)
+		if err := adjustNumericField(model, col, delta); err != nil {
+			return err
+		}
 		touched = append(touched, col)
 		changes[col] = comparableFieldValue(schemaField(schema, col))
 	}
@@ -1895,16 +2269,17 @@ func (c *Connection) incrementEach(model any, columns map[string]int64, extraArg
 	return c.fireModelEvent(ob, EventUpdated, model)
 }
 
-// adjustNumericField 把模型数值列的内存值加上 delta（对应 Laravel increment
-// 后的属性同步；nil 指针视为 0）。
-func adjustNumericField(model any, column string, delta float64) {
+// adjustNumericField 把模型数值列的内存值加上 delta（自增自减
+// 后的属性同步；nil 指针视为 0）。无符号整型结果为负时返回错误而非 panic
+// （旧实现负 float→uint Convert 会 panic，且发生在 DB UPDATE 已提交之后）。
+func adjustNumericField(model any, column string, delta float64) error {
 	schema, err := NewSchema(model)
 	if err != nil {
-		return
+		return err
 	}
 	f := schemaField(schema, column)
 	if f == nil {
-		return
+		return nil
 	}
 	v := f.Value
 	if v.Kind() == reflect.Ptr {
@@ -1915,19 +2290,52 @@ func adjustNumericField(model any, column string, delta float64) {
 		v = v.Elem()
 	}
 	var cur float64
+	unsigned := false
 	switch v.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		cur = float64(v.Int())
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		cur = float64(v.Uint())
+		unsigned = true
 	case reflect.Float32, reflect.Float64:
 		cur = v.Float()
 	default:
-		return
+		return nil
 	}
-	next := reflect.ValueOf(cur + delta).Convert(v.Type())
-	v.Set(next)
+	next := cur + delta
+	if unsigned && next < 0 {
+		return ErrInvalid{Msg: fmt.Sprintf("torm: decrement would make unsigned column %q negative (%v - %v)", column, cur, -delta)}
+	}
+	v.Set(reflect.ValueOf(next).Convert(v.Type()))
 	f.IsBlank = utils.IsBlank(f.Value)
+	return nil
+}
+
+// checkNumericDelta 预检（DB 写入前调用）：无符号整型列减为负直接报错，
+// 避免数据库侧报错后内存同步阶段再出问题。
+func checkNumericDelta(model any, column string, delta float64) error {
+	schema, err := NewSchema(model)
+	if err != nil {
+		return err
+	}
+	f := schemaField(schema, column)
+	if f == nil {
+		return nil
+	}
+	v := f.Value
+	if v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return nil
+		}
+		v = v.Elem()
+	}
+	switch v.Kind() {
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if float64(v.Uint())+delta < 0 {
+			return ErrInvalid{Msg: fmt.Sprintf("torm: decrement would make unsigned column %q negative", column)}
+		}
+	}
+	return nil
 }
 
 // schemaField 按列名取字段（无则 nil）。
@@ -1940,13 +2348,13 @@ func schemaField(schema *Schema, name string) *Field {
 	return nil
 }
 
-// ---- 唯一 ID（对应 Laravel HasUniqueIds）----
+// ---- 唯一 ID ----
 //
 // `torm:"unique_id"`（缺省 uuid）/ `torm:"unique_id:ulid"` / `cast:uuid` /
 // `cast:ulid` 声明；Create 时在 creating 事件之后、insert 之前生成并写入字段，
 // 已显式赋值的字段不覆盖；主键为 unique_id 时跳过自增回填。
 
-// applyUniqueIDs 为声明了 unique_id 的空字段生成 ID（对应 Laravel addUniqueIdentifiers）。
+// applyUniqueIDs 为声明了 unique_id 的空字段生成 ID。
 // 直接在调用方的 schema 上操作，保证 IsBlank/Value 对 Attributes() 即时可见。
 func applyUniqueIDs(schema *Schema) error {
 	for _, f := range schema.Fields {
@@ -1965,6 +2373,20 @@ func applyUniqueIDs(schema *Schema) error {
 		}
 	}
 	return nil
+}
+
+// primaryKeyIncrementing 主键是否为数据库自增形态（整数族；
+// string 主键无 LastInsertId/returning 语义）。
+func primaryKeyIncrementing(f *Field) bool {
+	if f == nil {
+		return false
+	}
+	switch f.Value.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return true
+	}
+	return false
 }
 
 // newUUID 生成 RFC 4122 v4 UUID（crypto/rand）。

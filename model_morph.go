@@ -1,6 +1,8 @@
 package torm
 
 import (
+	"github.com/go-think/torm/query"
+
 	"fmt"
 	"reflect"
 	"strings"
@@ -9,10 +11,10 @@ import (
 	"github.com/go-think/torm/utils"
 )
 
-// ---- 多态关系（对应 Laravel morphMany/morphOne/morphTo）----
+// ---- 多态关系 ----
 
 // MorphMany 多态一对多：目标表持有 type 列（commentable_type）与 id 列（commentable_id）。
-// MorphKey 为类型列取值，缺省 = 父表名（Go 侧约定；Laravel 默认为 FQCN）。
+// MorphKey 为类型列取值，缺省 = 父表名（Go 侧约定，非 FQCN 形态）。
 type MorphMany struct {
 	MorphName   string // 多态名（决定默认列名 morphName_type / morphName_id）
 	MorphKey    string
@@ -131,7 +133,7 @@ func morphManyOrOneResults(rel any, parent any, c *Connection, constraints []fun
 	if v == nil || utilsIsBlankValue(v) {
 		return nil, nil
 	}
-	nb := NewBuilder(c, c.GetQueryGrammar()).From(relationTargetTable(rel.(Relation))).
+	nb := relationTargetBuilder(c, rel.(Relation)).
 		Where(typeColumn, "=", morphKey).
 		WhereIn(idColumn, []any{v})
 	for _, cons := range constraints {
@@ -233,10 +235,13 @@ func (r MorphTo) GetResults(parent any, c *Connection, constraints ...func(*Buil
 	if ownerKey == "" {
 		ownerKey = "id"
 	}
-	nb := NewBuilder(c, c.GetQueryGrammar()).From(inspectModel(model).table)
-	// 软删变体：nb 无 modelInfo，软删 scope 不生效，用显式 where 表达 only
+	// 模型建器：owner 的软删等全局 scope 随执行生效（默认排除软删 owner，
+	// 与 eager loadMorphTo 行为一致——旧实现单查路径不过滤软删，同一条
+	// morphTo 关联 Load 与 With 结果不一致）
+	nb := c.Model(model)
 	if info := inspectModel(model); info.softDeletes && r.OnlyTrashed {
-		nb.WhereNotNull(info.deletedAtField)
+		// onlyTrashed：切换 scope 模式为仅已删（对齐 morphTo onlyTrashed）
+		nb = nb.OnlyTrashed()
 	}
 	nb.WhereIn(ownerKey, []any{idVal})
 	for _, cons := range constraints {
@@ -290,7 +295,7 @@ func morphToColumns(rel MorphTo, parent any) (string, string) {
 
 // loadMorph 多态一对多/一对一预加载：
 // select * from target where type_col = ? and id_col in (父键集合)，按 id_col 分组回填。
-func (b *Builder) loadMorph(parents reflect.Value, pr pendingRelation, parentTable string, single bool) {
+func (b *Builder) loadMorph(parents reflect.Value, pr pendingRelation, parentTable string, single bool) error {
 	var morphKey, typeColumn, idColumn string
 	var targetModel any
 	switch r := pr.rel.(type) {
@@ -336,15 +341,30 @@ func (b *Builder) loadMorph(parents reflect.Value, pr pendingRelation, parentTab
 		}
 	}
 	if len(keys) == 0 {
-		return
+		return nil
 	}
 
-	nb := NewBuilder(b.Connection, b.grammar).From(relationTargetTable(pr.rel))
+	nb := relationBuilderWithModel(b.Connection, b.grammar, pr.rel)
 	nb.Where(typeColumn, "=", morphKey)
 	nb.WhereIn(idColumn, keys)
+	// 约束/limit 生效（旧实现 pr.constraints/pr.limit 在 morph 路径被静默丢弃）
+	for _, c := range pr.constraints {
+		if c != nil {
+			c(nb)
+		}
+	}
+	if pr.limit != nil && nb.Query.Limit == nil && nb.Query.GroupLimit == nil {
+		nb.Limit(uint64(*pr.limit))
+		if nb.Query.GroupLimit == nil && nb.Query.Limit != nil && targetType.Kind() != reflect.Struct {
+			// 单行 morph（MorphOne/one-of-many）之外的多态一对多：
+			// limit 需 per-parent 语义，接入 GroupLimit
+			nb.Query.GroupLimit = &query.GroupLimit{Column: idColumn, Value: *nb.Query.Limit}
+			nb.Query.Limit = nil
+		}
+	}
 	related := reflect.New(reflect.SliceOf(targetType))
 	if err := nb.Get(related.Interface()); err != nil {
-		return
+		return err
 	}
 
 	fieldName := utils.StudlyCase(pr.name)
@@ -393,14 +413,15 @@ func (b *Builder) loadMorph(parents reflect.Value, pr pendingRelation, parentTab
 		}
 		field.Set(out)
 	}
+	return nil
 }
 
 // loadMorphTo 反向多态预加载：按类型列分组，逐类型 whereIn(id) 查询。
 // 字段类型建议为 interface{}（填充具体模型指针）。
-func (b *Builder) loadMorphTo(parents reflect.Value, pr pendingRelation) {
+func (b *Builder) loadMorphTo(parents reflect.Value, pr pendingRelation) error {
 	rel, ok := pr.rel.(MorphTo)
 	if !ok {
-		return
+		return nil
 	}
 	typeColumn, idColumn := morphColumns(pr.name, rel.TypeColumn, rel.IDColumn)
 
@@ -448,7 +469,9 @@ func (b *Builder) loadMorphTo(parents reflect.Value, pr pendingRelation) {
 		trashMode = "with"
 	}
 	for typeVal, bk := range buckets {
-		nb := NewBuilder(b.Connection, b.grammar).From(inspectModel(bk.model).table)
+		// 模型建器：owner 的软删等全局 scope 默认生效（旧实现裸表建器 +
+		// 显式 where 变体，与单查路径行为不一致）
+		nb := b.Connection.Model(bk.model)
 		// constrain：全类型通用约束（对应 MorphTo::constrain）
 		for _, c := range pr.constrainAll {
 			if c != nil {
@@ -470,22 +493,20 @@ func (b *Builder) loadMorphTo(parents reflect.Value, pr pendingRelation) {
 		for _, spec := range pr.morphWithCount[typeVal] {
 			nb.WithCount(spec.Name, spec.Relation)
 		}
-		// 软删目标模型默认排除已删除行；变体按 morphTrashMode 覆盖。
-		// （nb 无 modelInfo，软删 scope 不生效，用显式 where 表达变体）
+		// 软删目标模型默认排除已删除行；变体经软删 scope 模式切换表达
+		// （WithTrashed 去约束 / OnlyTrashed 仅已删）
 		if info := inspectModel(bk.model); info.softDeletes {
 			switch {
 			case trashMode == "with" || rel.WithTrashed:
-				// with：不加过滤
+				nb = nb.WithTrashed()
 			case trashMode == "only" || rel.OnlyTrashed:
-				nb.WhereNotNull(info.deletedAtField)
-			default:
-				nb.WhereNull(info.deletedAtField)
+				nb = nb.OnlyTrashed()
 			}
 		}
 		nb.WhereIn(ownerKey, bk.keyVals)
 		related := reflect.New(reflect.SliceOf(reflect.TypeOf(bk.model).Elem()))
 		if err := nb.Get(related.Interface()); err != nil {
-			continue
+			return err
 		}
 
 		byID := map[string]reflect.Value{}
@@ -528,9 +549,10 @@ func (b *Builder) loadMorphTo(parents reflect.Value, pr pendingRelation) {
 			_ = typeVal
 		}
 	}
+	return nil
 }
 
-// MorphWith morphTo 预加载按类型附加约束（对应 Laravel morphWith）：
+// MorphWith morphTo 预加载按类型附加约束：
 // perType 键为类型串（type 列取值），值为该类型 owner 查询的约束闭包。
 func (b *Builder) MorphWith(name string, rel MorphTo, perType map[string]func(*Builder)) *Builder {
 	m := map[string][]func(*Builder){}
@@ -564,7 +586,7 @@ func (b *Builder) MorphToConstrain(name string, rel MorphTo, constraints ...func
 
 // MorphToWithCount morphTo 预加载按类型的计数聚合（对应 MorphTo::morphWithCount）：
 // perType 键为类型串，值为该类型 owner 查询要加载的计数规格
-// （Laravel 形态 morphWithCount([Post::class => ['comments']])；Go 侧需显式
+// （morphWithCount([Post::class => ['comments']]) 形态；Go 侧需显式
 // 携带关系描述符，见 MorphCountSpec）。
 func (b *Builder) MorphToWithCount(name string, rel MorphTo, perType map[string][]MorphCountSpec) *Builder {
 	return b.setPendingRelation(pendingRelation{name: name, rel: rel, morphWithCount: perType})
@@ -600,7 +622,7 @@ func morphStringField(structVal reflect.Value, col string) string {
 // morphStringsJoin 调试辅助。
 func morphStringsJoin(parts []string) string { return strings.Join(parts, ",") }
 
-// MorphToMany 多态多对多（对应 Laravel morphToMany）：
+// MorphToMany 多态多对多：
 // pivot 表（缺省 = morphName 的复数，如 taggable → taggables）持有
 // morphName_type / morphName_id 与目标表外键（目标单数_id）。
 type MorphToMany struct {
@@ -625,6 +647,11 @@ func (r MorphToMany) GetResults(parent any, c *Connection, constraints ...func(*
 		return nil, nil
 	}
 	q := buildMorphToManyQuery(c.GetQueryGrammar(), r, parentTable, "", []any{v})
+	// 约束闭包/目标模型软删 scope 生效（与 BTM/through 单父路径口径一致）
+	if frag, tail, fbinds, ok := (&Builder{Connection: c, grammar: c.GetQueryGrammar(), Bindings: getDefaultBindings()}).joinConstraintFragment(r, constraints, nil); ok {
+		q.sql += " and (" + frag + ")" + tail
+		q.bindings = append(q.bindings, fbinds...)
+	}
 	rows, err := c.SelectMaps(q.sql, q.bindings)
 	if err != nil {
 		return nil, err
@@ -632,7 +659,7 @@ func (r MorphToMany) GetResults(parent any, c *Connection, constraints ...func(*
 	return modelAnySlice(rowsToModels(rows, reflect.TypeOf(r.RelatedModel))), nil
 }
 
-// MorphedByMany 反向多态多对多（对应 Laravel morphedByMany）：
+// MorphedByMany 反向多态多对多：
 // 与 morphToMany 共用同一 pivot 表，仅语义方向相反。
 type MorphedByMany = MorphToMany
 
@@ -656,10 +683,8 @@ func buildMorphToManyQuery(g grammar.Grammar, rel MorphToMany, parentTable, relN
 	if rk == "" {
 		rk = "id"
 	}
-	morphKey := rel.MorphKey
-	if morphKey == "" {
-		morphKey = parentTable
-	}
+	// morphKey 与写侧/WhereHas 同口径解析（显式 > morph map 别名 > 父表名）
+	morphKey := morphKeyForTable(rel.MorphKey, parentTable)
 	fpk := rel.ForeignPivotKey
 	if fpk == "" {
 		fpk = idColumn
@@ -692,10 +717,10 @@ func buildMorphToManyQuery(g grammar.Grammar, rel MorphToMany, parentTable, relN
 // select t.*, pivot.morph_id as pivot_morph_id from t inner join pivot
 //
 //	on t.rk = pivot.rp where pivot.type_col = ? and pivot.morph_id in (...)
-func (b *Builder) loadMorphToMany(parents reflect.Value, pr pendingRelation, parentTable string) {
+func (b *Builder) loadMorphToMany(parents reflect.Value, pr pendingRelation, parentTable string) error {
 	rel, ok := pr.rel.(MorphToMany)
 	if !ok {
-		return
+		return nil
 	}
 	keys := make([]interface{}, 0, parents.Len())
 	keySeen := map[string]bool{}
@@ -711,13 +736,18 @@ func (b *Builder) loadMorphToMany(parents reflect.Value, pr pendingRelation, par
 		}
 	}
 	if len(keys) == 0 {
-		return
+		return nil
 	}
 
 	q := buildMorphToManyQuery(b.grammar, rel, parentTable, pr.name, keys)
+	// 约束闭包/limit/目标模型软删 scope 生效（与 BTM 预加载同路径）
+	if frag, tail, fbinds, ok := b.joinConstraintFragment(rel, pr.constraints, pr.limit); ok {
+		q.sql += " and (" + frag + ")" + tail
+		q.bindings = append(q.bindings, fbinds...)
+	}
 	rows, err := b.Connection.SelectMaps(q.sql, q.bindings)
 	if err != nil {
-		return
+		return err
 	}
 
 	targetType := reflect.TypeOf(rel.RelatedModel)
@@ -767,6 +797,9 @@ func (b *Builder) loadMorphToMany(parents reflect.Value, pr pendingRelation, par
 		}
 		field.Set(out)
 	}
+	// pivot 列回填（`torm:"pivot:<关系名>"` 载体字段）
+	fillPivotFields(parents, pr.name, rows, q.pivotCol, "id")
+	return nil
 }
 
 // pluralize 极简英文复数（覆盖 -y → -ies 与缺省 +s；多态表名约定场景足够）。

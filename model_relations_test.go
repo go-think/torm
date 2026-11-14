@@ -106,7 +106,7 @@ func TestWhereHasGolden(t *testing.T) {
 
 func TestWithCountGolden(t *testing.T) {
 	b := baseBuilder(t).Select("*").From("users").WithCount("posts", HasMany{Model: PostWithUser{}})
-	want := `select *, (select count(*) from "posts" where "posts"."user_id" = "users"."id") as "posts_count" from "users"`
+	want := `select *, (select count(*) as "aggregate" from "posts" where "posts"."user_id" = "users"."id") as "posts_count" from "users"`
 	if got := b.ToSql(); got != want {
 		t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
 	}
@@ -238,9 +238,9 @@ func TestHasManyThroughEagerLoad(t *testing.T) {
 		Columns: []string{"id", "name"},
 		Rows:    [][]driver.Value{{int64(1), "A"}},
 	})
-	joinSQL := "select `comments`.*, `posts`.`user_id` as `laravel_through_key` from `comments` inner join `posts` on `posts`.`id` = `comments`.`post_id` where `posts`.`user_id` in (?)"
+	joinSQL := "select `comments`.*, `posts`.`user_id` as `through_key` from `comments` inner join `posts` on `posts`.`id` = `comments`.`post_id` where `posts`.`user_id` in (?)"
 	st.On(joinSQL, &fakeResult{
-		Columns: []string{"id", "body", "post_id", "laravel_through_key"},
+		Columns: []string{"id", "body", "post_id", "through_key"},
 		Rows: [][]driver.Value{
 			{int64(100), "c1", int64(5), int64(1)},
 			{int64(101), "c2", int64(6), int64(1)},
@@ -291,9 +291,9 @@ func TestWithLimitAutoGroupLimit(t *testing.T) {
 		Rows:    [][]driver.Value{{int64(1), "A"}, {int64(2), "B"}},
 	})
 	// 约束闭包的 limit 自动经 groupLimit 编译（row_number 分组限额）
-	groupSQL := "select * from (select `posts`.*, row_number() over (partition by `user_id` order by `created_at` desc) as `laravel_row` from `posts` where `user_id` in (?, ?)) as `laravel_table` where `laravel_row` <= 2 order by `laravel_row`"
+	groupSQL := "select * from (select `posts`.*, row_number() over (partition by `user_id` order by `created_at` desc) as `group_row` from `posts` where `user_id` in (?, ?)) as `group_table` where `group_row` <= 2 order by `group_row`"
 	st.On(groupSQL, &fakeResult{
-		Columns: []string{"id", "title", "user_id", "created_at", "laravel_row"},
+		Columns: []string{"id", "title", "user_id", "created_at", "group_row"},
 		Rows: [][]driver.Value{
 			{int64(10), "p1", int64(1), "2026-01-02", int64(1)},
 			{int64(12), "p3", int64(1), "2026-01-01", int64(2)},
@@ -474,7 +474,7 @@ func TestWithCountConstraintsGolden(t *testing.T) {
 	b := baseBuilder(t).Select("*").From("users").WithCount("posts", HasMany{Model: PostOrdered{}}, func(nb *Builder) {
 		nb.Where("status", "=", "published")
 	})
-	want := `select *, (select count(*) from "posts" where "posts"."user_id" = "users"."id" and "status" = ?) as "posts_count" from "users"`
+	want := `select *, (select count(*) as "aggregate" from "posts" where "posts"."user_id" = "users"."id" and "status" = ?) as "posts_count" from "users"`
 	if got := b.ToSql(); got != want {
 		t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
 	}
@@ -487,14 +487,14 @@ func TestWithCountMultipleAndNestedGolden(t *testing.T) {
 	b := baseBuilder(t).Select("*").From("users").
 		WithCount("posts", HasMany{Model: PostOrdered{}}).
 		WithCount("comments", HasMany{Model: ThroughComment{}})
-	want := `select *, (select count(*) from "posts" where "posts"."user_id" = "users"."id") as "posts_count", (select count(*) from "comments" where "comments"."user_id" = "users"."id") as "comments_count" from "users"`
+	want := `select *, (select count(*) as "aggregate" from "posts" where "posts"."user_id" = "users"."id") as "posts_count", (select count(*) as "aggregate" from "comments" where "comments"."user_id" = "users"."id") as "comments_count" from "users"`
 	if got := b.ToSql(); got != want {
 		t.Errorf("sql =\n  %s\nwant\n  %s", got, want)
 	}
 
 	n := baseBuilder(t).Select("*").From("users").WithCount("posts.comments",
 		HasMany{Model: PostOrdered{}}, HasMany{Model: ThroughComment{}})
-	wantN := `select *, (select count(*) from "posts" where "posts"."user_id" = "users"."id" and exists (select * from "comments" where "comments"."post_id" = "posts"."id")) as "posts_comments_count" from "users"`
+	wantN := `select *, (select count(*) as "aggregate" from "posts" where "posts"."user_id" = "users"."id" and exists (select * from "comments" where "comments"."post_id" = "posts"."id")) as "posts_comments_count" from "users"`
 	if got := n.ToSql(); got != wantN {
 		t.Errorf("nested sql =\n  %s\nwant\n  %s", got, wantN)
 	}
@@ -502,20 +502,20 @@ func TestWithCountMultipleAndNestedGolden(t *testing.T) {
 
 func TestWithAggregateFamilyGolden(t *testing.T) {
 	mk := baseBuilder(t).Select("*").From("users").WithMax("posts", HasMany{Model: PostOrdered{}}, "id")
-	wantMk := `select *, (select max("id") from "posts" where "posts"."user_id" = "users"."id") as "posts_max_id" from "users"`
+	wantMk := `select *, (select max("id") as "aggregate" from "posts" where "posts"."user_id" = "users"."id") as "posts_max_id" from "users"`
 	if got := mk.ToSql(); got != wantMk {
 		t.Errorf("max sql =\n  %s\nwant\n  %s", got, wantMk)
 	}
 	mn := baseBuilder(t).Select("*").From("users").WithMin("posts", HasMany{Model: PostOrdered{}}, "score")
-	if got := mn.ToSql(); got != `select *, (select min("score") from "posts" where "posts"."user_id" = "users"."id") as "posts_min_score" from "users"` {
+	if got := mn.ToSql(); got != `select *, (select min("score") as "aggregate" from "posts" where "posts"."user_id" = "users"."id") as "posts_min_score" from "users"` {
 		t.Errorf("min sql =\n  %s", got)
 	}
 	sm := baseBuilder(t).Select("*").From("users").WithSum("posts", HasMany{Model: PostOrdered{}}, "score")
-	if got := sm.ToSql(); got != `select *, (select sum("score") from "posts" where "posts"."user_id" = "users"."id") as "posts_sum_score" from "users"` {
+	if got := sm.ToSql(); got != `select *, (select sum("score") as "aggregate" from "posts" where "posts"."user_id" = "users"."id") as "posts_sum_score" from "users"` {
 		t.Errorf("sum sql =\n  %s", got)
 	}
 	av := baseBuilder(t).Select("*").From("users").WithAvg("posts", HasMany{Model: PostOrdered{}}, "score")
-	if got := av.ToSql(); got != `select *, (select avg("score") from "posts" where "posts"."user_id" = "users"."id") as "posts_avg_score" from "users"` {
+	if got := av.ToSql(); got != `select *, (select avg("score") as "aggregate" from "posts" where "posts"."user_id" = "users"."id") as "posts_avg_score" from "users"` {
 		t.Errorf("avg sql =\n  %s", got)
 	}
 	ex := baseBuilder(t).Select("*").From("users").WithExists("posts", HasMany{Model: PostOrdered{}})
@@ -525,7 +525,7 @@ func TestWithAggregateFamilyGolden(t *testing.T) {
 	}
 	// 自定义 alias
 	ca := baseBuilder(t).Select("*").From("users").WithMax("posts", HasMany{Model: PostOrdered{}}, "id", "best_post")
-	if got := ca.ToSql(); got != `select *, (select max("id") from "posts" where "posts"."user_id" = "users"."id") as "best_post" from "users"` {
+	if got := ca.ToSql(); got != `select *, (select max("id") as "aggregate" from "posts" where "posts"."user_id" = "users"."id") as "best_post" from "users"` {
 		t.Errorf("custom alias sql =\n  %s", got)
 	}
 }
@@ -883,9 +883,10 @@ func TestBelongsToManyWherePivotInGolden(t *testing.T) {
 
 func TestAttachAndDetach(t *testing.T) {
 	conn, st := newFakeDB(t)
-	insertSQL := "insert into `role_user` (`user_id`, `role_id`) values (?, ?)"
+	insertSQL := "insert into `role_user` (`user_id`, `role_id`) values (?, ?), (?, ?)"
 	st.On(insertSQL, &fakeResult{Affected: 1})
 	st.On("insert into `role_user` (`user_id`, `role_id`, `status`) values (?, ?, ?)", &fakeResult{Affected: 1})
+	st.On("insert into `role_user` (`user_id`, `role_id`, `status`) values (?, ?, ?), (?, ?, ?)", &fakeResult{Affected: 1})
 	deleteSQL := "delete from `role_user` where `user_id` = ? and `role_id` in (?)"
 	st.On(deleteSQL, &fakeResult{Affected: 1})
 
@@ -901,7 +902,13 @@ func TestAttachAndDetach(t *testing.T) {
 		if call.Args[0] != int64(1) {
 			t.Errorf("attach args = %#v", call.Args)
 		}
-		seen[call.Args[1].(int64)] = true
+		// 单条多值 INSERT：每行 (user_id, role_id)，逐对收集
+		for i := 0; i+1 < len(call.Args); i += 2 {
+			if call.Args[i] != int64(1) {
+				t.Errorf("attach args = %#v", call.Args)
+			}
+			seen[call.Args[i+1].(int64)] = true
+		}
 	}
 	if !seen[7] || !seen[8] {
 		t.Errorf("attached ids missing: %v", seen)
@@ -948,7 +955,7 @@ func TestAttachWithTimestamps(t *testing.T) {
 
 func TestSyncPivot(t *testing.T) {
 	conn, st := newFakeDB(t)
-	selectSQL := "select `role_id` from `role_user` where `user_id` = ?"
+	selectSQL := "select * from `role_user` where `user_id` = ?"
 	st.On(selectSQL, &fakeResult{
 		Columns: []string{"role_id"},
 		Rows:    [][]driver.Value{{int64(2)}, {int64(3)}},
@@ -994,7 +1001,7 @@ func TestSyncPivot(t *testing.T) {
 
 func TestTogglePivot(t *testing.T) {
 	conn, st := newFakeDB(t)
-	selectSQL := "select `role_id` from `role_user` where `user_id` = ?"
+	selectSQL := "select * from `role_user` where `user_id` = ?"
 	st.On(selectSQL, &fakeResult{
 		Columns: []string{"role_id"},
 		Rows:    [][]driver.Value{{int64(2)}},
@@ -1049,9 +1056,9 @@ func TestHasManyThroughSoftDeletedThrough(t *testing.T) {
 		Rows:    [][]driver.Value{{int64(1), "A"}},
 	})
 	// 中间模型带 deleted_at → join 条件追加 whereNull
-	joinSQL := "select `comments`.*, `posts`.`user_id` as `laravel_through_key` from `comments` inner join `posts` on `posts`.`id` = `comments`.`post_id` where `posts`.`user_id` in (?) and `posts`.`deleted_at` is null"
+	joinSQL := "select `comments`.*, `posts`.`user_id` as `through_key` from `comments` inner join `posts` on `posts`.`id` = `comments`.`post_id` where `posts`.`user_id` in (?) and `posts`.`deleted_at` is null"
 	st.On(joinSQL, &fakeResult{
-		Columns: []string{"id", "body", "post_id", "laravel_through_key"},
+		Columns: []string{"id", "body", "post_id", "through_key"},
 		Rows:    [][]driver.Value{},
 	})
 
@@ -1065,9 +1072,9 @@ func TestHasManyThroughSoftDeletedThrough(t *testing.T) {
 	st.LastCall(t, joinSQL)
 
 	// WithTrashedParents 跳过软删过滤
-	joinSQL2 := "select `comments`.*, `posts`.`user_id` as `laravel_through_key` from `comments` inner join `posts` on `posts`.`id` = `comments`.`post_id` where `posts`.`user_id` in (?)"
+	joinSQL2 := "select `comments`.*, `posts`.`user_id` as `through_key` from `comments` inner join `posts` on `posts`.`id` = `comments`.`post_id` where `posts`.`user_id` in (?)"
 	st.On(joinSQL2, &fakeResult{
-		Columns: []string{"id", "body", "post_id", "laravel_through_key"},
+		Columns: []string{"id", "body", "post_id", "through_key"},
 		Rows:    [][]driver.Value{},
 	})
 	if err := conn.Table("users").With("comments", HasManyThrough{
@@ -1092,9 +1099,9 @@ func (u *UserWithOneThrough) TableName() string { return "users" }
 
 func TestHasOneThroughGetResults(t *testing.T) {
 	conn, st := newFakeDB(t)
-	joinSQL := "select `comments`.*, `posts`.`user_id` as `laravel_through_key` from `comments` inner join `posts` on `posts`.`id` = `comments`.`post_id` where `posts`.`user_id` in (?)"
+	joinSQL := "select `comments`.*, `posts`.`user_id` as `through_key` from `comments` inner join `posts` on `posts`.`id` = `comments`.`post_id` where `posts`.`user_id` in (?)"
 	st.On(joinSQL, &fakeResult{
-		Columns: []string{"id", "body", "post_id", "laravel_through_key"},
+		Columns: []string{"id", "body", "post_id", "through_key"},
 		Rows: [][]driver.Value{
 			{int64(100), "c1", int64(5), int64(1)},
 			{int64(101), "c2", int64(6), int64(1)},
@@ -1127,9 +1134,9 @@ func TestHasOneThroughEagerLoad(t *testing.T) {
 		Columns: []string{"id", "name"},
 		Rows:    [][]driver.Value{{int64(1), "A"}, {int64(2), "B"}},
 	})
-	joinSQL := "select `comments`.*, `posts`.`user_id` as `laravel_through_key` from `comments` inner join `posts` on `posts`.`id` = `comments`.`post_id` where `posts`.`user_id` in (?, ?)"
+	joinSQL := "select `comments`.*, `posts`.`user_id` as `through_key` from `comments` inner join `posts` on `posts`.`id` = `comments`.`post_id` where `posts`.`user_id` in (?, ?)"
 	st.On(joinSQL, &fakeResult{
-		Columns: []string{"id", "body", "post_id", "laravel_through_key"},
+		Columns: []string{"id", "body", "post_id", "through_key"},
 		Rows: [][]driver.Value{
 			{int64(100), "c1", int64(5), int64(1)},
 			{int64(101), "c2", int64(6), int64(1)},
@@ -1227,10 +1234,10 @@ func TestHasOneLatestOfManyEagerLoad(t *testing.T) {
 		Columns: []string{"id", "name"},
 		Rows:    [][]driver.Value{{int64(1), "A"}},
 	})
-	// one-of-many 预加载经 GroupLimit（row_number 分组取极值，对齐 Laravel）
-	groupSQL := "select * from (select *, row_number() over (partition by `user_id` order by `created_at` desc, `id` desc) as `laravel_row` from `posts` where `user_id` in (?)) as `laravel_table` where `laravel_row` <= 1 order by `laravel_row`"
+	// one-of-many 预加载经 GroupLimit（row_number 分组取极值）
+	groupSQL := "select * from (select *, row_number() over (partition by `user_id` order by `created_at` desc, `id` desc) as `group_row` from `posts` where `user_id` in (?)) as `group_table` where `group_row` <= 1 order by `group_row`"
 	st.On(groupSQL, &fakeResult{
-		Columns: []string{"id", "title", "user_id", "created_at", "laravel_row"},
+		Columns: []string{"id", "title", "user_id", "created_at", "group_row"},
 		Rows:    [][]driver.Value{{int64(12), "p3", int64(1), "2026-01-03", int64(1)}},
 	})
 
@@ -1635,7 +1642,7 @@ func TestBelongsToManyWherePivotVariantsGolden(t *testing.T) {
 
 func TestSyncWithPivotValues(t *testing.T) {
 	conn, st := newFakeDB(t)
-	selectSQL := "select `role_id` from `role_user` where `user_id` = ?"
+	selectSQL := "select * from `role_user` where `user_id` = ?"
 	st.On(selectSQL, &fakeResult{
 		Columns: []string{"role_id"},
 		Rows:    [][]driver.Value{{int64(2)}},
@@ -1672,7 +1679,7 @@ func TestSyncWithPivotValues(t *testing.T) {
 
 func TestPivotOrFailFamily(t *testing.T) {
 	conn, st := newFakeDB(t)
-	selectSQL := "select `role_id` from `role_user` where `user_id` = ?"
+	selectSQL := "select * from `role_user` where `user_id` = ?"
 	attachSQL := "insert into `role_user` (`user_id`, `role_id`) values (?, ?)"
 	detachSQL := "delete from `role_user` where `user_id` = ? and `role_id` in (?)"
 	updateSQL := "update `role_user` set `status` = ? where `user_id` = ? and `role_id` = ?"
@@ -1759,7 +1766,7 @@ func TestConnectionSaveOrIgnore(t *testing.T) {
 	}
 	st.LastCall(t, insertIgnore)
 
-	// 已持久化模型：报错（Laravel LogicException）
+	// 已持久化模型：报错（逻辑错误）
 	if _, err := conn.SaveOrIgnore(p); err == nil {
 		t.Error("existing model should error")
 	}
@@ -1874,8 +1881,10 @@ func TestOfManyOrdersTieBreak(t *testing.T) {
 // ★ withPivotValue（BelongsToMany.php:494）：attach/sync 每行附加固定 pivot 值
 func TestBelongsToManyWithPivotValue(t *testing.T) {
 	conn, st := newFakeDB(t)
-	insertSQL := "insert into `role_user` (`user_id`, `role_id`, `status`) values (?, ?, ?)"
+	insertSQL := "insert into `role_user` (`user_id`, `role_id`, `status`) values (?, ?, ?), (?, ?, ?)"
 	st.On(insertSQL, &fakeResult{Affected: 1})
+	insertOne := "insert into `role_user` (`user_id`, `role_id`, `status`) values (?, ?, ?)"
+	st.On(insertOne, &fakeResult{Affected: 1})
 	insertAll := "insert into `role_user` (`user_id`, `role_id`, `note`, `status`) values (?, ?, ?, ?)"
 	st.On(insertAll, &fakeResult{Affected: 1})
 
@@ -1896,15 +1905,16 @@ func TestBelongsToManyWithPivotValue(t *testing.T) {
 			n++
 		}
 	}
-	if n != 2 {
-		t.Errorf("attach rows = %d", n)
+	// attach 批量形态：一次调用携带两行（合并为单条多值 INSERT）
+	if n != 1 {
+		t.Errorf("attach calls = %d", n)
 	}
 
 	// 显式 pivotAttrs 优先于固定值
 	if err := conn.Attach(user, rel, []any{int64(9)}, map[string]any{"status": "off"}); err != nil {
 		t.Fatal(err)
 	}
-	ac := st.LastCall(t, insertSQL)
+	ac := st.LastCall(t, insertOne)
 	if ac.Args[2] != "off" {
 		t.Errorf("explicit attrs should override pivot value, got %#v", ac.Args)
 	}

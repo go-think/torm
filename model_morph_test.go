@@ -157,7 +157,7 @@ func TestMorphToManyEagerLoad(t *testing.T) {
 	st.On(joinSQL, &fakeResult{
 		Columns: []string{"id", "name", "pivot_taggable_id"},
 		Rows: [][]driver.Value{
-			{int64(7), "laravel", int64(1)},
+			{int64(7), "go-orm", int64(1)},
 			{int64(8), "go", int64(1)},
 		},
 	})
@@ -172,7 +172,7 @@ func TestMorphToManyEagerLoad(t *testing.T) {
 	if len(posts) != 1 || len(posts[0].Tags) != 2 {
 		t.Fatalf("posts tags = %+v", posts)
 	}
-	if posts[0].Tags[0].Name != "laravel" || posts[0].Tags[1].Name != "go" {
+	if posts[0].Tags[0].Name != "go-orm" || posts[0].Tags[1].Name != "go" {
 		t.Errorf("tags = %+v", posts[0].Tags)
 	}
 	st.LastCall(t, joinSQL)
@@ -188,7 +188,7 @@ func TestMorphToManyVideoDirection(t *testing.T) {
 	joinSQL := "select `tags`.*, `taggables`.`taggable_id` as `pivot_taggable_id` from `tags` inner join `taggables` on `tags`.`id` = `taggables`.`tag_id` where `taggables`.`taggable_type` = ? and `taggables`.`taggable_id` in (?)"
 	st.On(joinSQL, &fakeResult{
 		Columns: []string{"id", "name", "pivot_taggable_id"},
-		Rows:    [][]driver.Value{{int64(7), "laravel", int64(3)}},
+		Rows:    [][]driver.Value{{int64(7), "go-orm", int64(3)}},
 	})
 
 	var videos []MorphVideoWithTags
@@ -198,7 +198,7 @@ func TestMorphToManyVideoDirection(t *testing.T) {
 	}).Get(&videos); err != nil {
 		t.Fatal(err)
 	}
-	if len(videos) != 1 || len(videos[0].Tags) != 1 || videos[0].Tags[0].Name != "laravel" {
+	if len(videos) != 1 || len(videos[0].Tags) != 1 || videos[0].Tags[0].Name != "go-orm" {
 		t.Fatalf("videos tags = %+v", videos)
 	}
 	call := st.LastCall(t, joinSQL)
@@ -339,7 +339,7 @@ func TestMorphToWithTrashedVariant(t *testing.T) {
 		Rows:    [][]driver.Value{{int64(1), "videos", int64(7)}},
 	})
 	// 默认：软删 owner 模型追加 deleted_at is null（约束先于 whereIn 编译）
-	defaultSQL := "select * from `videos` where `deleted_at` is null and `id` in (?)"
+	defaultSQL := "select * from `videos` where `id` in (?) and `videos`.`deleted_at` is null"
 	st.On(defaultSQL, &fakeResult{
 		Columns: []string{"id", "name", "deleted_at"},
 		Rows:    [][]driver.Value{},
@@ -443,7 +443,7 @@ func TestMorphToManyGetResults(t *testing.T) {
 	joinSQL := "select `tags`.*, `taggables`.`taggable_id` as `pivot_taggable_id` from `tags` inner join `taggables` on `tags`.`id` = `taggables`.`tag_id` where `taggables`.`taggable_type` = ? and `taggables`.`taggable_id` in (?)"
 	st.On(joinSQL, &fakeResult{
 		Columns: []string{"id", "name", "pivot_taggable_id"},
-		Rows:    [][]driver.Value{{int64(7), "laravel", int64(1)}},
+		Rows:    [][]driver.Value{{int64(7), "go-orm", int64(1)}},
 	})
 
 	post := &MorphPostWithTags{ID: 1}
@@ -454,7 +454,7 @@ func TestMorphToManyGetResults(t *testing.T) {
 	if len(results) != 1 {
 		t.Fatalf("results = %d", len(results))
 	}
-	if tag, ok := results[0].(*MorphTag); !ok || tag.Name != "laravel" {
+	if tag, ok := results[0].(*MorphTag); !ok || tag.Name != "go-orm" {
 		t.Errorf("result = %#v", results[0])
 	}
 }
@@ -468,7 +468,7 @@ func TestMorphToWithoutTrashedOnlyTrashedPreload(t *testing.T) {
 		Columns: []string{"id", "subject_type", "subject_id"},
 		Rows:    [][]driver.Value{{int64(1), "videos", int64(7)}},
 	})
-	baseSQL := "select * from `videos` where `deleted_at` is null and `id` in (?)"
+	baseSQL := "select * from `videos` where `id` in (?) and `videos`.`deleted_at` is null"
 	st.On(baseSQL, &fakeResult{
 		Columns: []string{"id", "name", "deleted_at"},
 		Rows:    [][]driver.Value{{int64(7), "v7", nil}},
@@ -505,7 +505,7 @@ func TestMorphToWithoutTrashedOnlyTrashedPreload(t *testing.T) {
 		Columns: []string{"id", "subject_type", "subject_id"},
 		Rows:    [][]driver.Value{{int64(1), "videos", int64(7)}},
 	})
-	onlySQL := "select * from `videos` where `deleted_at` is not null and `id` in (?)"
+	onlySQL := "select * from `videos` where `id` in (?) and `videos`.`deleted_at` is not null"
 	st3.On(onlySQL, &fakeResult{
 		Columns: []string{"id", "name", "deleted_at"},
 		Rows:    [][]driver.Value{},
@@ -526,7 +526,7 @@ func TestMorphToConstrainPreload(t *testing.T) {
 		Rows:    [][]driver.Value{{int64(1), "videos", int64(7)}},
 	})
 	// constrain 全类型通用约束先于软删过滤与主键 in
-	sql := "select * from `videos` where `name` = ? and `deleted_at` is null and `id` in (?)"
+	sql := "select * from `videos` where `name` = ? and `id` in (?) and `videos`.`deleted_at` is null"
 	st.On(sql, &fakeResult{
 		Columns: []string{"id", "name", "deleted_at"},
 		Rows:    [][]driver.Value{},
@@ -551,7 +551,7 @@ func TestMorphToWithCountPreload(t *testing.T) {
 		Rows:    [][]driver.Value{{int64(1), "videos", int64(7)}},
 	})
 	// morphWithCount：owner 查询带 comments_count 聚合（对应 morphWithCount([Video::class => ['comments']])）
-	sql := "select *, (select count(*) from `comments` where `comments`.`video_id` = `videos`.`id`) as `comments_count` from `videos` where `deleted_at` is null and `id` in (?)"
+	sql := "select *, (select count(*) as `aggregate` from `comments` where `comments`.`video_id` = `videos`.`id`) as `comments_count` from `videos` where `id` in (?) and `videos`.`deleted_at` is null"
 	st.On(sql, &fakeResult{
 		Columns: []string{"id", "name", "deleted_at", "comments_count"},
 		Rows:    [][]driver.Value{{int64(7), "v7", nil, int64(3)}},
@@ -583,7 +583,7 @@ func (p *MorphPostWithCount) TableName() string { return "posts" }
 func TestMorphToGetResultsVariants(t *testing.T) {
 	// 描述符级 onlyTrashed：GetResults 显式 whereNotNull
 	conn, st := newFakeDB(t)
-	sql := "select * from `videos` where `deleted_at` is not null and `id` in (?)"
+	sql := "select * from `videos` where `id` in (?) and `videos`.`deleted_at` is not null"
 	st.On(sql, &fakeResult{
 		Columns: []string{"id", "name", "deleted_at"},
 		Rows:    [][]driver.Value{},

@@ -12,7 +12,7 @@ func TestBlueprintCreateIndexNameLong(t *testing.T) {
 		"aaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbb", "cccccccccccccccccc", "dddddddddddddddddd",
 	}
 	name := b.CreateIndexName("index", cols)
-	// Laravel createIndexName 不做长度截断（Blueprint.php:1826-1839）：
+	// createIndexName 不做长度截断：
 	// 全小写、'-'/'.' → '_'，长名原样保留
 	want := "users_aaaaaaaaaaaaaaaaaa_bbbbbbbbbbbbbbbbbb_cccccccccccccccccc_dddddddddddddddddd_index"
 	if name != want {

@@ -4,9 +4,9 @@ import (
 	"testing"
 )
 
-// SQLite 内省编译 golden 测试（SQL 期望移植自 Laravel 13 SQLiteGrammar.php
-// compileTables/compileViews/compileColumns/compileIndexes/compileForeignKeys/
-// compileDropAllTables/compileDropAllViews/compileRebuild）。
+// SQLite 内省编译 golden 测试（覆盖 compileTables/compileViews/compileColumns/
+// compileIndexes/compileForeignKeys/compileDropAllTables/compileDropAllViews/
+// compileRebuild）。
 
 func TestSchemaSQLiteIntrospectCompileTables(t *testing.T) {
 	g := NewSqliteQueryGrammar()

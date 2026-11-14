@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// MySQL 方言 golden 测试（SQL 期望移植自 Laravel 13 MySqlGrammar 输出）。
+// MySQL 方言 golden 测试（SQL 期望取自既有 golden 基线）。
 
 func mysqlG() *MySqlGrammar { return NewMySqlGrammar() }
 
@@ -268,8 +268,8 @@ func TestSchemaMySQLLongIndexNameTruncated(t *testing.T) {
 		"aaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbb", "cccccccccccccccccc", "dddddddddddddddddd",
 	}
 	name := b.CreateIndexName("index", cols)
-	// Laravel 不截断：索引名长度保持原样（是否超限由 DB 报错）
-	if len(name) != len("users_") + len(strings.Join(cols, "_")) + len("_index") {
+	// 不截断：索引名长度保持原样（是否超限由 DB 报错）
+	if len(name) != len("users_")+len(strings.Join(cols, "_"))+len("_index") {
 		t.Errorf("index name len = %d, name = %q", len(name), name)
 	}
 }

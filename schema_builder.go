@@ -9,7 +9,7 @@ import (
 	"github.com/go-think/torm/grammar"
 )
 
-// 本文件对齐 Illuminate\Database\Schema\Builder（含 MySqlBuilder/PostgresBuilder 子类语义）。
+// 本文件实现 Schema 构建器（表/列 DDL 与内省，含各方言子类语义）。
 //
 // 待 grammar 侧提供（schema_builder 暂以本地编译函数顶替，见 compile*SQL 系列）：
 //   - SchemaGrammar 新增编译方法：CompileColumns / CompileIndexes /
@@ -24,7 +24,7 @@ import (
 //   - Connection 保留原始 Config（当前 Config.SearchPath 经连接器注入 DSN 后
 //     丢失，schema_builder 只能从 DSN 参数解析 search_path 默认 schema）
 
-// SchemaColumn 内省结果：表列元数据（对应 Laravel getColumns 行结构）。
+// SchemaColumn 内省结果：表列元数据（getColumns 返回的行结构）。
 type SchemaColumn struct {
 	Name          string
 	TypeName      string // 基础类型名（如 varchar / int4）
@@ -81,7 +81,7 @@ type SchemaType struct {
 	Implicit bool
 }
 
-// SchemaBuilder 对应 Laravel 的 Schema 门面（挂在具名连接上）。
+// SchemaBuilder 为 Schema 构建器门面（挂在具名连接上）。
 type SchemaBuilder struct {
 	conn   *Connection
 	prefix string
@@ -93,7 +93,7 @@ func (c *Connection) Schema() *SchemaBuilder {
 }
 
 // GetSchemaGrammar 按驱动返回 DDL 编译器。
-// 对应 Laravel 各驱动的 getConnection → getSchemaGrammar 方言分发。
+// 对应各驱动的 getConnection → getSchemaGrammar 方言分发。
 func (c *Connection) GetSchemaGrammar() grammar.SchemaGrammar {
 	g := c.newSchemaGrammar()
 	// D7 版本分支：仅 MySQL/MariaDB 消费版本信息（rename column 回退、
@@ -125,7 +125,7 @@ func (c *Connection) newSchemaGrammar() grammar.SchemaGrammar {
 		mg := grammar.NewMariaDbGrammar()
 		mg.SetIsMaria(true)
 		return mg
-	case "sqlite":
+	case "sqlite", "sqlite3":
 		return grammar.NewSqliteQueryGrammar()
 	case "sqlserver":
 		return grammar.NewSqlServerGrammar()
@@ -134,9 +134,9 @@ func (c *Connection) newSchemaGrammar() grammar.SchemaGrammar {
 	}
 }
 
-// ---- 表构建（Table / Create，对应 Laravel Schema::table / Schema::create） ----
+// ---- 表构建（Table / Create：alter / create 两种模式） ----
 
-// Table 修改表（对应 Laravel Schema::table：Blueprint 处于 alter 模式）。
+// Table 修改表（Blueprint 处于 alter 模式）。
 func (s *SchemaBuilder) Table(table string, fn func(t *grammar.Blueprint)) error {
 	g := s.conn.GetSchemaGrammar()
 	g.SetTablePrefix(s.prefix)
@@ -150,7 +150,7 @@ func (s *SchemaBuilder) Table(table string, fn func(t *grammar.Blueprint)) error
 	return nil
 }
 
-// Create 新建表（对应 Laravel Schema::create：Blueprint 处于 create 模式）。
+// Create 新建表（Blueprint 处于 create 模式）。
 func (s *SchemaBuilder) Create(table string, fn func(t *grammar.Blueprint)) error {
 	g := s.conn.GetSchemaGrammar()
 	g.SetTablePrefix(s.prefix)
@@ -189,6 +189,21 @@ func (s *SchemaBuilder) DropIfExists(table string) error {
 	return s.conn.Statement(g.CompileDropIfExists(table))
 }
 
+// Statement 在连接上执行原生 SQL（Builder::statement 语义）。
+// 供 SQL 文件迁移等无 Blueprint 场景使用；多语句文件要求驱动支持单次
+// Exec 执行多语句（MySQL 需 DSN multiStatements=true，SQLite 原生支持）。
+// Statement 执行原生 SQL（SQL 文件迁移的执行通道）。
+// **无参数时绕过预编译、直走连接级 Exec**：SQLite（mattn）与 MySQL
+// （multiStatements=true）只在连接级 Execer 路径处理多语句脚本，
+// 预编译路径只执行首条且余下语句被静默丢弃（已实证）。
+func (s *SchemaBuilder) Statement(query string, args ...any) error {
+	if len(args) == 0 {
+		_, err := s.conn.Unprepared(query)
+		return err
+	}
+	return s.conn.Statement(query, args...)
+}
+
 // HasTable 表是否存在（引用支持 schema.table 拆分）。
 func (s *SchemaBuilder) HasTable(table string) (bool, error) {
 	schema, tbl, err := s.parseSchemaAndTable(table)
@@ -210,9 +225,8 @@ func (s *SchemaBuilder) HasTable(table string) (bool, error) {
 // CreateDatabase 创建数据库。
 func (s *SchemaBuilder) CreateDatabase(name string) error {
 	if s.dialect() == dialectSqlite {
-		// SQLiteBuilder::createDatabase（SQLiteBuilder.php:17-24）：File::put($name, '')
-		// —— SQLite 的"建库"即创建空数据库文件（os.Create 与 Laravel 的 File
-		// 门面对应，截断语义一致）。
+		// SQLiteBuilder::createDatabase（SQLiteBuilder.php:17-24）：
+		// SQLite 的"建库"即创建空数据库文件（os.Create 截断语义一致）。
 		f, err := os.Create(name)
 		if err != nil {
 			return err
@@ -241,41 +255,71 @@ func (s *SchemaBuilder) DropDatabaseIfExists(name string) error {
 
 // ---- 列 / 表级 DDL ----
 
-// DropColumns 删除列（对应 Builder.php:560 dropColumns）。SQL Server 走
-// Blueprint → CompileDropColumn（含默认约束前置块，对齐 Laravel dropColumns
-// 经 Blueprint 编译的路径）；其余方言维持本地合并编译。
+// DropColumns 删除列（对应 Builder.php:560 dropColumns）。统一走各方言
+// grammar 的 CompileDropColumn（Blueprint 编译路径）：
+// SQLite 产出合法的 alter table x drop column y
+// （>= 3.35，避免缺 COLUMN 关键字的方言非法 SQL）；SQL Server 含默认约束
+// 前置块；方言不支持时返回明确错误（RuntimeException 对应物）。
 func (s *SchemaBuilder) DropColumns(table string, columns ...string) error {
 	if len(columns) == 0 {
 		return nil
 	}
 	g := s.conn.GetSchemaGrammar()
 	g.SetTablePrefix(s.prefix)
-	if s.dialect() == dialectSqlserver {
-		b := grammar.NewBlueprint(s.prefix + table)
-		for _, stmt := range g.CompileDropColumn(b, columns) {
-			if err := s.conn.Statement(stmt); err != nil {
-				return err
-			}
-		}
-		return nil
+	stmts, err := compileSchemaSQL(func() []string {
+		return g.CompileDropColumn(grammar.NewBlueprint(table), columns)
+	})
+	if err != nil {
+		return err
 	}
-	sql := compileDropColumnsSQL(s.dialect(), g.WrapTableForSchema(s.prefix+table), columns)
-	return s.conn.Statement(sql)
+	for _, stmt := range stmts {
+		if err := s.conn.Statement(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Rename 重命名表（对应 Builder.php:610 rename）。
+// Rename 重命名表（对应 Builder.php:610 rename）。走各方言 grammar 的
+// CompileRename（MySQL rename table ... to ...、SQL Server sp_rename、
+// PG/SQLite alter table ... rename to ...），方言不支持时返回明确错误。
 func (s *SchemaBuilder) Rename(from, to string) error {
 	g := s.conn.GetSchemaGrammar()
 	g.SetTablePrefix(s.prefix)
-	sql := compileRenameSQL(s.dialect(), g.WrapTableForSchema(s.prefix+from), g.WrapTableForSchema(s.prefix+to))
-	return s.conn.Statement(sql)
+	stmts, err := compileSchemaSQL(func() []string {
+		return []string{g.CompileRename(grammar.NewBlueprint(from), to)}
+	})
+	if err != nil {
+		return err
+	}
+	for _, stmt := range stmts {
+		if err := s.conn.Statement(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// compileSchemaSQL 执行方言编译，把 ErrUnsupported panic 转为明确错误
+// （方言不支持时的 RuntimeException 语义，Go 侧以 error 返回）。
+func compileSchemaSQL(fn func() []string) (stmts []string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(grammar.ErrUnsupported); ok {
+				stmts, err = nil, fmt.Errorf("schema: %s", e.Msg)
+				return
+			}
+			panic(r)
+		}
+	}()
+	return fn(), nil
 }
 
 // DropAllTables 删除当前 schema 下全部表。
 // MySQL/PG：外键开关包裹 + 逐表 drop（对应 MySqlBuilder/PostgresBuilder）；
 // SQLite：writable_schema + sqlite_master delete + vacuum（SQLiteBuilder::dropAllTables，
-// Laravel 对文件库走 refreshDatabaseFile 清空文件，Go 侧统一走 writable_schema
-// 路径保证连接内一致；文件级清空 TODO 接线点：按 DSN 判定文件库后 os.Truncate）；
+// 统一走 writable_schema 路径保证连接内一致；文件级清空 TODO 接线点：
+// 按 DSN 判定文件库后 os.Truncate）；
 // SQL Server：先 drop 全部外键，再 sp_msforeachtable（SqlServerBuilder::dropAllTables）。
 func (s *SchemaBuilder) DropAllTables() error {
 	switch s.dialect() {
@@ -305,7 +349,7 @@ func (s *SchemaBuilder) DropAllTables() error {
 func (s *SchemaBuilder) dropAllTablesSqlite() error {
 	g := s.conn.GetSchemaGrammar().(*grammar.SQLiteGrammar)
 	g.SetTablePrefix(s.prefix)
-	// Laravel getCurrentSchemaListing 对 SQLite 固定返回 ['main']
+	// getCurrentSchemaListing 对 SQLite 固定返回 ['main']
 	schema := "main"
 	if err := s.conn.Statement("PRAGMA writable_schema = 1"); err != nil {
 		return err
@@ -373,7 +417,7 @@ func (s *SchemaBuilder) dropAllViewsSqlite() error {
 }
 
 // DropAllTypes 删除当前 schema 下全部用户自定义类型（仅 Postgres 支持，
-// 其余驱动对应 Laravel 基类的 LogicException）。
+// 其余驱动对应基类的 LogicException 语义）。
 func (s *SchemaBuilder) DropAllTypes() error {
 	d := s.dialect()
 	if d != dialectPostgres {
@@ -442,7 +486,7 @@ func (s *SchemaBuilder) HasColumns(table string, columns []string) (bool, error)
 }
 
 // GetColumnType 返回列的完整类型（对应 getColumnType 的 fullDefinition 分支）；
-// 列不存在时报错（对应 Laravel InvalidArgumentException）。
+// 列不存在时报错（InvalidArgumentException 语义）。
 func (s *SchemaBuilder) GetColumnType(table, column string) (string, error) {
 	cols, err := s.GetColumns(table)
 	if err != nil {
@@ -917,8 +961,8 @@ func (s *SchemaBuilder) WhenTableDoesntHaveIndex(table string, index any, fn fun
 
 // ---- 引用解析（Builder.php:752 parseSchemaAndTable） ----
 
-// parseSchemaAndTable 拆分 "schema.table" 引用；超过两段报错（对应 Laravel
-// 的 InvalidArgumentException）。无显式 schema 时返回空串，由调用方用
+// parseSchemaAndTable 拆分 "schema.table" 引用；超过两段报错
+// （InvalidArgumentException 语义）。无显式 schema 时返回空串，由调用方用
 // resolveSchema 回退到默认 schema。
 func (s *SchemaBuilder) parseSchemaAndTable(reference string) (schema, table string, err error) {
 	segments := strings.Split(reference, ".")
@@ -945,7 +989,7 @@ func (s *SchemaBuilder) resolveSchema(schema string) string {
 
 // currentSchemaName 默认 schema（对应 getCurrentSchemaName）：Postgres 取
 // search_path 首段（Config.SearchPath 经连接器注入 DSN；连接未保留原始 Config，
-// 故从 DSN 解析），SQLite 取附加库名 main（对应 Laravel $schema ?? 'main'），
+// 故从 DSN 解析），SQLite 取附加库名 main（无显式 schema 时缺省 'main'），
 // 其余方言取库名。
 func (s *SchemaBuilder) currentSchemaName() string {
 	if s.dialect() == dialectPostgres {
@@ -1059,7 +1103,7 @@ func schemaTableName(d schemaDialect) string {
 	return "table_schema"
 }
 
-// schemaWhereClause 对应 Laravel compileSchemaWhereClause：显式 schema 绑定
+// schemaWhereClause 对应 compileSchemaWhereClause：显式 schema 绑定
 // 参数；未指定时过滤系统 schema。
 func schemaWhereClause(d schemaDialect, column, schema string) (clause string, args []any) {
 	if schema != "" {
@@ -1082,25 +1126,6 @@ func compileCreateDatabaseSQL(d schemaDialect, name string) (string, []any) {
 // compileDropDatabaseIfExistsSQL 对应 Grammar::compileDropDatabaseIfExists。
 func compileDropDatabaseIfExistsSQL(d schemaDialect, name string) (string, []any) {
 	return "drop database if exists " + quoteIdentifier(d, name), nil
-}
-
-// compileDropColumnsSQL 对应 MySqlGrammar::compileDropColumn（多列合并为一条
-// alter 语句；PG 带 drop column 关键字）。
-func compileDropColumnsSQL(d schemaDialect, table string, columns []string) string {
-	var parts []string
-	for _, col := range columns {
-		if d == dialectPostgres {
-			parts = append(parts, "drop column "+quoteIdentifier(d, col))
-		} else {
-			parts = append(parts, "drop "+quoteIdentifier(d, col))
-		}
-	}
-	return "alter table " + table + " " + strings.Join(parts, ", ")
-}
-
-// compileRenameSQL 对应各方言 compileRename。
-func compileRenameSQL(d schemaDialect, from, to string) string {
-	return "alter table " + from + " rename to " + to
 }
 
 // compileForeignKeyConstraintsSQL 对应各方言

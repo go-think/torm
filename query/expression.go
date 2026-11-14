@@ -1,6 +1,6 @@
 package query
 
-// Expression 对应 Laravel 的 Query\Expression（DB::raw）。
+// Expression 表示原生 SQL 表达式片段（等价于 raw 表达式，值直接嵌入语句）。
 type Expression interface {
 	GetValue() interface{}
 }

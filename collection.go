@@ -11,9 +11,8 @@ import (
 	"github.com/go-think/torm/utils"
 )
 
-// ---- 集合层（对应 Illuminate\Support/Collection 与 Eloquent Collection）----
-// 方法名与语义逐条对照 Illuminate/Collections/Collection.php 与
-// Eloquent/Collection.php（Laravel 13）。
+// ---- 集合层（泛型集合）----
+// 方法名与语义沿用集合库通用方法约定。
 
 // Collection 泛型集合。
 type Collection[T any] []T
@@ -24,14 +23,14 @@ func Col[T any](items []T) Collection[T] { return items }
 // Slice 返回底层切片。
 func (c Collection[T]) Slice() []T { return c }
 
-// Len 元素个数（对应 Laravel count）。
+// Len 元素个数。
 func (c Collection[T]) Len() int { return len(c) }
 
-// IsEmpty / IsNotEmpty（对应 Laravel 同名方法）。
+// IsEmpty / IsNotEmpty。
 func (c Collection[T]) IsEmpty() bool    { return len(c) == 0 }
 func (c Collection[T]) IsNotEmpty() bool { return len(c) > 0 }
 
-// Each 遍历；回调返回 false 停止（对应 Laravel each 的 break 语义）。
+// Each 遍历；回调返回 false 停止（break 语义）。
 func (c Collection[T]) Each(fn func(item T, index int) bool) {
 	for i, item := range c {
 		if !fn(item, i) {
@@ -40,7 +39,7 @@ func (c Collection[T]) Each(fn func(item T, index int) bool) {
 	}
 }
 
-// Filter 过滤（对应 Laravel filter）。
+// Filter 过滤。
 func (c Collection[T]) Filter(pred func(T) bool) Collection[T] {
 	out := make(Collection[T], 0, len(c))
 	for _, item := range c {
@@ -51,7 +50,7 @@ func (c Collection[T]) Filter(pred func(T) bool) Collection[T] {
 	return out
 }
 
-// FilterBoth 带索引的过滤（对应 Laravel filter($value, $key) 双参形态）。
+// FilterBoth 带索引的过滤（回调同时接收元素与下标的双参形态）。
 func (c Collection[T]) FilterBoth(pred func(item T, index int) bool) Collection[T] {
 	out := make(Collection[T], 0, len(c))
 	for i, item := range c {
@@ -62,12 +61,12 @@ func (c Collection[T]) FilterBoth(pred func(item T, index int) bool) Collection[
 	return out
 }
 
-// Reject 过滤的逆操作（对应 Laravel reject）。
+// Reject 过滤的逆操作。
 func (c Collection[T]) Reject(pred func(T) bool) Collection[T] {
 	return c.Filter(func(item T) bool { return !pred(item) })
 }
 
-// Map 映射为新切片（对应 Laravel map）。
+// Map 映射为新切片。
 func (c Collection[T]) Map[U any](fn func(T) U) []U {
 	out := make([]U, 0, len(c))
 	for _, item := range c {
@@ -76,7 +75,7 @@ func (c Collection[T]) Map[U any](fn func(T) U) []U {
 	return out
 }
 
-// MapWithKeys 映射为 map（对应 Laravel mapWithKeys：回调返回 (key, value)）。
+// MapWithKeys 映射为 map（回调返回 (key, value)）。
 func (c Collection[T]) MapWithKeys[K comparable, V any](fn func(T) (K, V)) map[K]V {
 	out := make(map[K]V, len(c))
 	for _, item := range c {
@@ -86,7 +85,7 @@ func (c Collection[T]) MapWithKeys[K comparable, V any](fn func(T) (K, V)) map[K
 	return out
 }
 
-// Reduce 折叠（对应 Laravel reduce）。
+// Reduce 折叠。
 func (c Collection[T]) Reduce[U any](fn func(acc U, item T) U, initial U) U {
 	acc := initial
 	for _, item := range c {
@@ -106,7 +105,7 @@ func (c Collection[T]) First(pred func(T) bool) (T, bool) {
 	return zero, false
 }
 
-// FirstWhere 按字段条件取首个元素（对应 Laravel firstWhere）：
+// FirstWhere 按字段条件取首个元素：
 //
 //	FirstWhere("name", "A")            // 等于
 //	FirstWhere("age", ">", 18)         // 运算符形态（= != <> < <= > >=）
@@ -115,12 +114,12 @@ func (c Collection[T]) FirstWhere(field string, args ...any) (T, bool) {
 	return c.First(match)
 }
 
-// Find 按主键值查找（对应 Eloquent Collection::find）；Go 侧按 pluck 字段比对。
+// Find 按主键值查找；Go 侧按 pluck 字段比对。
 func (c Collection[T]) Find(id any) (T, bool) {
 	return c.FirstWhere("id", id)
 }
 
-// FindOrFail 按主键查找，找不到返回错误（对应 Eloquent findOrFail）。
+// FindOrFail 按主键查找，找不到返回错误。
 func (c Collection[T]) FindOrFail(id any) (T, error) {
 	var zero T
 	item, ok := c.Find(id)
@@ -136,14 +135,14 @@ func (c Collection[T]) Contains(pred func(T) bool) bool {
 	return ok
 }
 
-// ContainsWhere 字段条件形态的 contains（对应 Laravel contains('field', 'value')
-// 与 contains('field', '>', value)）。
+// ContainsWhere 字段条件形态的 contains（支持 ('field', 'value')
+// 与 ('field', '>', value) 两种形态）。
 func (c Collection[T]) ContainsWhere(field string, args ...any) bool {
 	_, ok := c.FirstWhere(field, args...)
 	return ok
 }
 
-// ContainsValue 精确值形态（对应 Laravel contains($item)，DeepEqual 比较）。
+// ContainsValue 精确值形态（DeepEqual 比较）。
 func (c Collection[T]) ContainsValue(want T) bool {
 	for _, item := range c {
 		if reflect.DeepEqual(item, want) {
@@ -153,7 +152,7 @@ func (c Collection[T]) ContainsValue(want T) bool {
 	return false
 }
 
-// DoesntContain contains 的否定形态（对应 Laravel doesntContain）。
+// DoesntContain contains 的否定形态。
 func (c Collection[T]) DoesntContain(pred func(T) bool) bool {
 	return !c.Contains(pred)
 }
@@ -163,7 +162,7 @@ func (c Collection[T]) DoesntContainWhere(field string, args ...any) bool {
 	return !c.ContainsWhere(field, args...)
 }
 
-// Merge 追加合并（对应 Laravel merge）。
+// Merge 追加合并。
 func (c Collection[T]) Merge(other Collection[T]) Collection[T] {
 	out := make(Collection[T], 0, len(c)+len(other))
 	out = append(out, c...)
@@ -171,17 +170,17 @@ func (c Collection[T]) Merge(other Collection[T]) Collection[T] {
 	return out
 }
 
-// Union 合并去重（保留首次出现，对应 Laravel union；Go 侧按 Sprint 键判定重复）。
+// Union 合并去重（保留首次出现；Go 侧按 Sprint 键判定重复）。
 func (c Collection[T]) Union(other Collection[T]) Collection[T] {
 	return c.Merge(other).Unique()
 }
 
-// Unique 去重（保留首次出现；对应 Laravel unique）。
+// Unique 去重（保留首次出现）。
 func (c Collection[T]) Unique() Collection[T] {
 	return c.UniqueBy(func(item T) any { return item })
 }
 
-// UniqueBy 按键函数去重（对应 Laravel unique($key)）。
+// UniqueBy 按键函数去重。
 func (c Collection[T]) UniqueBy(key func(T) any) Collection[T] {
 	out := make(Collection[T], 0, len(c))
 	seen := map[string]bool{}
@@ -196,7 +195,7 @@ func (c Collection[T]) UniqueBy(key func(T) any) Collection[T] {
 	return out
 }
 
-// Diff 差集：本集合有、other 没有的元素（对应 Laravel diff）。
+// Diff 差集：本集合有、other 没有的元素。
 func (c Collection[T]) Diff(other Collection[T]) Collection[T] {
 	otherKeys := map[string]bool{}
 	for _, item := range other {
@@ -211,7 +210,7 @@ func (c Collection[T]) Diff(other Collection[T]) Collection[T] {
 	return out
 }
 
-// Intersect 交集：两边都有的元素，保留本集合顺序（对应 Laravel intersect）。
+// Intersect 交集：两边都有的元素，保留本集合顺序。
 func (c Collection[T]) Intersect(other Collection[T]) Collection[T] {
 	otherKeys := map[string]bool{}
 	for _, item := range other {
@@ -229,7 +228,7 @@ func (c Collection[T]) Intersect(other Collection[T]) Collection[T] {
 	return out
 }
 
-// Only 取每项的指定字段投影为 map（对应 Laravel only；结构体集合上按
+// Only 取每项的指定字段投影为 map（结构体集合上按
 // Go 字段名/torm 列名提取）。
 func (c Collection[T]) Only(keys ...string) []map[string]any {
 	out := make([]map[string]any, 0, len(c))
@@ -245,7 +244,7 @@ func (c Collection[T]) Only(keys ...string) []map[string]any {
 	return out
 }
 
-// Except 排除指定字段后的投影（对应 Laravel except）。
+// Except 排除指定字段后的投影。
 func (c Collection[T]) Except(keys ...string) []map[string]any {
 	skip := map[string]bool{}
 	for _, k := range keys {
@@ -264,7 +263,7 @@ func (c Collection[T]) Except(keys ...string) []map[string]any {
 	return out
 }
 
-// Partition 按谓词一分为二：(满足, 不满足)（对应 Laravel partition）。
+// Partition 按谓词一分为二：(满足, 不满足)。
 func (c Collection[T]) Partition(pred func(T) bool) (Collection[T], Collection[T]) {
 	passed := make(Collection[T], 0, len(c))
 	rest := make(Collection[T], 0, len(c))
@@ -278,7 +277,7 @@ func (c Collection[T]) Partition(pred func(T) bool) (Collection[T], Collection[T
 	return passed, rest
 }
 
-// Zip 与另一切片按位配对，长度取较小者（对应 Laravel zip；Go 侧不产生
+// Zip 与另一切片按位配对，长度取较小者（Go 侧不产生
 // null 占位，多余元素丢弃）。
 func (c Collection[T]) Zip[U any](other []U) []ZipPair[T, U] {
 	n := len(c)
@@ -298,13 +297,13 @@ type ZipPair[T any, U any] struct {
 	Second U
 }
 
-// Tap 副作用钩子：调用 fn(c) 后原样返回集合（对应 Laravel tap）。
+// Tap 副作用钩子：调用 fn(c) 后原样返回集合。
 func (c Collection[T]) Tap(fn func(Collection[T])) Collection[T] {
 	fn(c)
 	return c
 }
 
-// When 条件为真时应用变换（对应 Laravel when）。
+// When 条件为真时应用变换。
 func (c Collection[T]) When(cond bool, fn func(Collection[T]) Collection[T]) Collection[T] {
 	if cond {
 		return fn(c)
@@ -312,7 +311,7 @@ func (c Collection[T]) When(cond bool, fn func(Collection[T]) Collection[T]) Col
 	return c
 }
 
-// Unless 条件为假时应用变换（对应 Laravel unless）。
+// Unless 条件为假时应用变换。
 func (c Collection[T]) Unless(cond bool, fn func(Collection[T]) Collection[T]) Collection[T] {
 	if !cond {
 		return fn(c)
@@ -320,7 +319,7 @@ func (c Collection[T]) Unless(cond bool, fn func(Collection[T]) Collection[T]) C
 	return c
 }
 
-// Flatten 展开嵌套切片（对应 Laravel flatten；depth 缺省 1 层，
+// Flatten 展开嵌套切片（depth 缺省 1 层，
 // 元素展开为 any）。
 func (c Collection[T]) Flatten(depth ...int) Collection[any] {
 	d := 1
@@ -349,9 +348,9 @@ func flattenInto(rv reflect.Value, depth int, out *Collection[any]) {
 	}
 }
 
-// SliceRange 子切片（对应 Laravel slice($offset, $length)）：offset 起始，
-// length 为个数，负值 length 表示取到末尾（Laravel null 语义）。
-// 与 Slice()（返回底层切片）并存，取 Laravel 语义名加 Range 后缀。
+// SliceRange 子切片（slice($offset, $length) 语义）：offset 起始，
+// length 为个数，负值 length 表示取到末尾（等价 null 语义）。
+// 与 Slice()（返回底层切片）并存，以 Range 后缀区分。
 func (c Collection[T]) SliceRange(offset, length int) Collection[T] {
 	if offset < 0 {
 		offset = len(c) + offset
@@ -372,10 +371,10 @@ func (c Collection[T]) SliceRange(offset, length int) Collection[T] {
 	return Collection[T](c[offset:end:end])
 }
 
-// Take 取前 n 个（对应 Laravel take）。
+// Take 取前 n 个。
 func (c Collection[T]) Take(n int) Collection[T] {
 	if n < 0 {
-		// Laravel take(-n) 取末尾 n 个
+		// n 为负时取末尾 n 个
 		if -n > len(c) {
 			return c.Clone()
 		}
@@ -387,7 +386,7 @@ func (c Collection[T]) Take(n int) Collection[T] {
 	return c.Clone()[:n]
 }
 
-// Skip 跳过前 n 个（对应 Laravel skip）。
+// Skip 跳过前 n 个。
 func (c Collection[T]) Skip(n int) Collection[T] {
 	if n < 0 {
 		n = 0
@@ -398,7 +397,7 @@ func (c Collection[T]) Skip(n int) Collection[T] {
 	return c.Clone()[n:]
 }
 
-// Reverse 倒序（对应 Laravel reverse）。
+// Reverse 倒序。
 func (c Collection[T]) Reverse() Collection[T] {
 	out := c.Clone()
 	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
@@ -407,7 +406,7 @@ func (c Collection[T]) Reverse() Collection[T] {
 	return out
 }
 
-// SortBy 比较函数排序（稳定，对应 Laravel sortBy；Go 侧传 less 闭包）。
+// SortBy 比较函数排序（稳定；Go 侧传 less 闭包）。
 func (c Collection[T]) SortBy(less func(a, b T) bool) Collection[T] {
 	out := c.Clone()
 	sort.SliceStable(out, func(i, j int) bool { return less(out[i], out[j]) })
@@ -422,7 +421,7 @@ func (c Collection[T]) Clone() Collection[T] {
 }
 
 // Sum 数值求和：无字段名时直接对元素求和，有字段名时按字段提取
-// （对应 Laravel sum('field') / sum(fn)；非数值跳过）。
+// （非数值跳过）。
 func (c Collection[T]) Sum(fields ...string) float64 {
 	total := 0.0
 	for _, item := range c {
@@ -441,7 +440,7 @@ func (c Collection[T]) Sum(fields ...string) float64 {
 	return total
 }
 
-// Average 数值平均（对应 Laravel avg；空集合返回 0）。
+// Average 数值平均（空集合返回 0）。
 func (c Collection[T]) Average(fields ...string) float64 {
 	total, n := 0.0, 0
 	for _, item := range c {
@@ -464,13 +463,13 @@ func (c Collection[T]) Average(fields ...string) float64 {
 	return total / float64(n)
 }
 
-// Min 最小值（对应 Laravel min）：无字段名时比较元素本身，
+// Min 最小值：无字段名时比较元素本身，
 // 返回 any（空集合返回 nil）。
 func (c Collection[T]) Min(fields ...string) any {
 	return c.extreme(fields, func(a, b float64) bool { return a < b }, func(a, b any) bool { return lessAny(a, b) })
 }
 
-// Max 最大值（对应 Laravel max）。
+// Max 最大值。
 func (c Collection[T]) Max(fields ...string) any {
 	return c.extreme(fields, func(a, b float64) bool { return a > b }, func(a, b any) bool { return !lessAny(a, b) })
 }
@@ -505,7 +504,7 @@ func (c Collection[T]) extreme(fields []string, numBetter func(a, b float64) boo
 	return best
 }
 
-// Implode 拼接（对应 Laravel implode）：给定时按字段提取，否则对元素
+// Implode 拼接：给定时按字段提取，否则对元素
 // Sprint 后拼接。
 func (c Collection[T]) Implode(glue string, fields ...string) string {
 	parts := make([]string, 0, len(c))
@@ -521,7 +520,7 @@ func (c Collection[T]) Implode(glue string, fields ...string) string {
 	return strings.Join(parts, glue)
 }
 
-// ToJson 序列化为 JSON（对应 Laravel toJson）。
+// ToJson 序列化为 JSON。
 func (c Collection[T]) ToJson() (string, error) {
 	b, err := json.Marshal([]T(c))
 	if err != nil {
@@ -541,7 +540,7 @@ func (c Collection[T]) Pluck(field string) []any {
 	return out
 }
 
-// ModelKeys 提取主键集合（对应 Laravel Eloquent Collection::modelKeys）。
+// ModelKeys 提取主键集合。
 func (c Collection[T]) ModelKeys() []any {
 	out := make([]any, 0, len(c))
 	for _, item := range c {
@@ -571,9 +570,9 @@ func (c Collection[T]) ModelKeys() []any {
 	return out
 }
 
-// ---- Laravel Collection 补全（countBy/collapse/flip/keys/pad 等）----
+// ---- Collection 补全（countBy/collapse/flip/keys/pad 等）----
 
-// CountBy 按回调结果分组计数（对应 Laravel countBy：返回 map[回调值]计数；
+// CountBy 按回调结果分组计数（返回 map[回调值]计数；
 // 仅有 bool 谓词形态时键为 "true"/"false"）。
 func (c Collection[T]) CountBy(keyFn func(T) string) map[string]int {
 	out := map[string]int{}
@@ -594,7 +593,7 @@ func (c Collection[T]) CountWhere(pred func(T) bool) int {
 	return n
 }
 
-// Collapse 展开嵌套集合一层（对应 Laravel collect([[1,2],[3]])->collapse()）。
+// Collapse 展开嵌套集合一层。
 // 集合元素为切片类型时的包级形态（Go 方法不能按 T 约束特化）。
 func Collapse[T any](nested Collection[[]T]) Collection[T] {
 	out := make(Collection[T], 0, len(nested))
@@ -604,8 +603,8 @@ func Collapse[T any](nested Collection[[]T]) Collection[T] {
 	return out
 }
 
-// Flip 值翻转为键（对应 Laravel flip）：元素值 → 首次出现的下标；
-// 重复值保留首次出现（Laravel 同语义）。Go 方法不能新增 comparable 约束，
+// Flip 值翻转为键：元素值 → 首次出现的下标；
+// 重复值保留首次出现。Go 方法不能新增 comparable 约束，
 // 以包级泛型函数提供。
 func Flip[K comparable](c Collection[K]) map[K]int {
 	out := make(map[K]int, len(c))
@@ -617,7 +616,7 @@ func Flip[K comparable](c Collection[K]) map[K]int {
 	return out
 }
 
-// Keys 键序列（对应 Laravel keys）：Go 集合底座为切片，键即下标 0..n-1。
+// Keys 键序列：Go 集合底座为切片，键即下标 0..n-1。
 func (c Collection[T]) Keys() []int {
 	out := make([]int, len(c))
 	for i := range c {
@@ -626,8 +625,8 @@ func (c Collection[T]) Keys() []int {
 	return out
 }
 
-// Pad 补齐到指定长度（对应 Laravel pad）：size 为正从尾部补 def，
-// 为负从头部补；|size| 不大于原长度时截断（Laravel pad 同为截断语义）。
+// Pad 补齐到指定长度：size 为正从尾部补 def，
+// 为负从头部补；|size| 不大于原长度时截断。
 func (c Collection[T]) Pad(size int, def T) Collection[T] {
 	n := size
 	if n < 0 {
@@ -653,7 +652,7 @@ func (c Collection[T]) Pad(size int, def T) Collection[T] {
 	return out
 }
 
-// ToQuery 首个模型的新查询构造器（对应 Laravel toQuery()：以集合首模型
+// ToQuery 首个模型的新查询构造器（以集合首模型
 // 的 newQuery 为底座）。集合为空、conn 为 nil 或元素不是模型时报错
 // （Go 模型不内嵌连接，需显式传入连接上下文）。
 func (c Collection[T]) ToQuery(conn *Connection) (*Builder, error) {
@@ -670,9 +669,8 @@ func (c Collection[T]) ToQuery(conn *Connection) (*Builder, error) {
 	return conn.Model(first), nil
 }
 
-// Fresh 按主键重查每个模型为新集合（对应 Laravel fresh，
-// Eloquent/Collection.php:1571）：原集合不变；行未命中的位置保留
-// 零值占位（指针元素为 nil，对齐 Laravel 保留 null 键位的语义）。
+// Fresh 按主键重查每个模型为新集合：原集合不变；行未命中的位置保留
+// 零值占位（指针元素为 nil，保留原键位）。
 func (c Collection[T]) Fresh(conn *Connection) (Collection[T], error) {
 	if conn == nil {
 		return nil, fmt.Errorf("torm: fresh requires a connection")
@@ -684,7 +682,7 @@ func (c Collection[T]) Fresh(conn *Connection) (Collection[T], error) {
 			return nil, err
 		}
 		if f == nil {
-			// 行消失/未持久化：保留零值占位（Laravel fresh 的 null 键位）
+			// 行消失/未持久化：保留零值占位
 			var zero T
 			out = append(out, zero)
 			continue
@@ -708,8 +706,7 @@ func (c Collection[T]) Fresh(conn *Connection) (Collection[T], error) {
 	return out, nil
 }
 
-// GetDictionary 按主键的字典 map（对应 Laravel getDictionary /
-// InteractsWithDictionary）：键 = 模型主键的 Sprint 形式；非模型元素
+// GetDictionary 按主键的字典 map：键 = 模型主键的 Sprint 形式；非模型元素
 // 以元素本身的 Sprint 为键。
 func (c Collection[T]) GetDictionary() map[string]T {
 	out := make(map[string]T, len(c))
@@ -725,8 +722,8 @@ func (c Collection[T]) GetDictionary() map[string]T {
 	return out
 }
 
-// ---- 模型属性转发（对应 Eloquent Collection 的 makeHidden/makeVisible
-// 等向每个模型转发的形态；torm 的 hidden 为类型级注册表，效果等价）----
+// ---- 模型属性转发（makeHidden/makeVisible 等向每个模型转发的形态；
+// torm 的 hidden 为类型级注册表，效果等价）----
 
 // collectionEachModel 对集合逐元素应用 fn（元素须为模型指针；非模型类型
 // 返回 error，与 ToQuery 的风格一致）。
@@ -744,19 +741,19 @@ func (c Collection[T]) collectionEachModel(op string, fn func(model any)) error 
 	return nil
 }
 
-// MakeHidden 集合内全部模型追加隐藏列（对应 makeHidden）。
+// MakeHidden 集合内全部模型追加隐藏列。
 func (c Collection[T]) MakeHidden(keys ...string) (Collection[T], error) {
 	err := c.collectionEachModel("makeHidden", func(model any) { MakeHidden(model, keys...) })
 	return c, err
 }
 
-// MakeVisible 集合内全部模型解除隐藏列（对应 makeVisible）。
+// MakeVisible 集合内全部模型解除隐藏列。
 func (c Collection[T]) MakeVisible(keys ...string) (Collection[T], error) {
 	err := c.collectionEachModel("makeVisible", func(model any) { MakeVisible(model, keys...) })
 	return c, err
 }
 
-// SetHidden 替换集合内全部模型的隐藏列集（对应 setHidden）：先全量
+// SetHidden 替换集合内全部模型的隐藏列集：先全量
 // MakeVisible 清空再追加新集。
 func (c Collection[T]) SetHidden(keys ...string) (Collection[T], error) {
 	err := c.collectionEachModel("setHidden", func(model any) {
@@ -769,13 +766,13 @@ func (c Collection[T]) SetHidden(keys ...string) (Collection[T], error) {
 	return c, err
 }
 
-// MergeHidden 集合内全部模型合并隐藏列（对应 mergeHidden，语义与
-// makeHidden 一致，追加去重）。
+// MergeHidden 集合内全部模型合并隐藏列（语义与
+// MakeHidden 一致，追加去重）。
 func (c Collection[T]) MergeHidden(keys ...string) (Collection[T], error) {
 	return c.MakeHidden(keys...)
 }
 
-// GetVisible 可见列集（对应 Laravel getVisible 返回 $visible；torm 只维护
+// GetVisible 可见列集（torm 只维护
 // hidden 注册表，此处返回首模型全部列减去隐藏列的可见集）。
 func (c Collection[T]) GetVisible() ([]string, error) {
 	if c.IsEmpty() {

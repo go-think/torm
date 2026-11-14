@@ -63,7 +63,7 @@ func TestLazyPagesThrough(t *testing.T) {
 
 func TestLazyByIdUsesIdCursor(t *testing.T) {
 	b, st := execBaseBuilder(t)
-	st.On(`select * from "users" where "id" > ? order by "id" asc limit 2`, rowsUsers([2]driver.Value{int64(1), "A"}, [2]driver.Value{int64(2), "B"}))
+	st.On(`select * from "users" where "id" is not null order by "id" asc limit 2`, rowsUsers([2]driver.Value{int64(1), "A"}, [2]driver.Value{int64(2), "B"}))
 	st.On(`select * from "users" where "id" > ? order by "id" asc limit 2`, rowsUsers([2]driver.Value{int64(3), "C"}))
 
 	// 第二页打桩（顺序队列）
@@ -92,7 +92,7 @@ func TestLazyByIdUsesIdCursor(t *testing.T) {
 
 func TestChunkByIdWalksCursor(t *testing.T) {
 	b, st := execBaseBuilder(t)
-	st.On(`select * from "users" where "id" > ? order by "id" asc limit 2`, rowsUsers([2]driver.Value{int64(1), "A"}, [2]driver.Value{int64(2), "B"}))
+	st.On(`select * from "users" where "id" is not null order by "id" asc limit 2`, rowsUsers([2]driver.Value{int64(1), "A"}, [2]driver.Value{int64(2), "B"}))
 	// 第二页基于游标 id > 2
 	st.On(`select * from "users" where "id" > ? order by "id" asc limit 2`, rowsUsers([2]driver.Value{int64(3), "C"}))
 
@@ -116,7 +116,7 @@ func TestChunkByIdWalksCursor(t *testing.T) {
 
 func TestChunkByIdEarlyStop(t *testing.T) {
 	b, st := execBaseBuilder(t)
-	st.On(`select * from "users" where "id" > ? order by "id" asc limit 2`, rowsUsers([2]driver.Value{int64(1), "A"}, [2]driver.Value{int64(2), "B"}))
+	st.On(`select * from "users" where "id" is not null order by "id" asc limit 2`, rowsUsers([2]driver.Value{int64(1), "A"}, [2]driver.Value{int64(2), "B"}))
 
 	calls := 0
 	err := b.From("users").ChunkById(2,
@@ -135,7 +135,7 @@ func TestChunkByIdEarlyStop(t *testing.T) {
 
 func TestEachById(t *testing.T) {
 	b, st := execBaseBuilder(t)
-	st.On(`select * from "users" where "id" > ? order by "id" asc limit 1000`, rowsUsers([2]driver.Value{int64(1), "A"}))
+	st.On(`select * from "users" where "id" is not null order by "id" asc limit 1000`, rowsUsers([2]driver.Value{int64(1), "A"}))
 
 	var names []string
 	err := b.From("users").EachById(
@@ -156,7 +156,7 @@ func TestCursorSurfacesScanError(t *testing.T) {
 	b, st := execBaseBuilder(t)
 	st.On(`select * from "users"`, &fakeResult{
 		Columns: []string{"id"},
-		Rows:   [][]driver.Value{{int64(1)}},
+		Rows:    [][]driver.Value{{int64(1)}},
 	})
 
 	seq, err := b.From("users").Cursor()

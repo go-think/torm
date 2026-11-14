@@ -5,10 +5,10 @@ import (
 	"strings"
 )
 
-// ---- SQL Server Schema 内省编译（对齐 Illuminate\Database\Schema\Grammars\SqlServerGrammar.php:44-197 / :366-559） ----
+// ---- SQL Server Schema 内省编译 ----
 //
 // 方言说明：
-//   - schema 为空时 Laravel 以 schema_name()（当前 schema）过滤（:121-142 等）；
+//   - schema 为空时以 schema_name()（当前 schema）过滤；
 //   - FK 动作值不做语义映射：SQL 直接输出 update_referential_action_desc /
 //     delete_referential_action_desc 原始形态（NO_ACTION / CASCADE / SET_NULL ...），
 //     下划线→空格 + 小写的处理在 processor 层（SqlServerProcessor.processForeignKeys）。

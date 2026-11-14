@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// ---- SQL Server Schema 编译（对齐 Illuminate\Database\Schema\Grammars\SqlServerGrammar） ----
+// ---- SQL Server Schema 编译 ----
 //
 // 方言要点：[标识符]（wrapValueFn 已由 SqlServerGrammar 查询侧注入）、
 // nvarchar/nchar/max、identity 自增、datetime2/datetimeoffset、
@@ -162,7 +162,7 @@ func (g *SqlServerGrammar) CompileCreate(b *Blueprint) []string {
 
 	tableName := g.schemaWrapTable(b.Table)
 	if b.Temporary {
-		// Laravel SqlServerGrammar.php:206-212：临时表用 # 前缀命名
+		// 临时表用 # 前缀命名
 		tableName = "#" + tableName
 	}
 	out := []string{"create table " + tableName + " (" + joinComma(cols) + ")"}
@@ -405,13 +405,13 @@ func schemaWrapAll(g *SqlServerGrammar, cols []string) []string {
 	return wrapped
 }
 
-// schemaQuoteString 字符串字面量（DDL 内省/改名用）。
+// schemaQuoteString 字符串字面量（DDL 内省/改名用）；内部单引号双写转义。
 func (g *SqlServerGrammar) schemaQuoteString(v any) string {
-	return "N'" + fmt.Sprint(v) + "'"
+	return "N'" + strings.ReplaceAll(fmt.Sprint(v), "'", "''") + "'"
 }
 
-// schemaWrapValue Laravel 13 Schema\Grammars\SqlServerGrammar 不覆写
-// wrapValue：DDL 标识符使用标准双引号（查询侧 [] 包裹不影响 DDL）。
+// schemaWrapValue DDL 侧不覆写 wrapValue：
+// DDL 标识符使用标准双引号（查询侧 [] 包裹不影响 DDL）。
 func (g *SqlServerGrammar) schemaWrapValue(v string) string {
 	return `"` + strings.ReplaceAll(v, `"`, `""`) + `"`
 }
@@ -462,11 +462,12 @@ func (g *SqlServerGrammar) schemaWrap(value any) string {
 	return g.schemaWrapValue(v)
 }
 
-// QuoteStringN SQL Server N'...' 前缀字符串字面量（enum check 用）。
+// QuoteStringN SQL Server N'...' 前缀字符串字面量（enum check 用）；
+// 内部单引号双写转义。
 func (g *BaseGrammar) QuoteStringN(values []string) string {
 	parts := make([]string, len(values))
 	for i, v := range values {
-		parts[i] = "N'" + v + "'"
+		parts[i] = "N'" + strings.ReplaceAll(v, "'", "''") + "'"
 	}
 	return joinComma(parts)
 }

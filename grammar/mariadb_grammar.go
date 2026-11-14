@@ -1,6 +1,6 @@
 package grammar
 
-// MariaDbGrammar 对应 Illuminate\Database\Query\Grammars\MariaDbGrammar。
+// MariaDbGrammar 为 MariaDB 方言查询编译器。
 // 与 MySQL 的差异点：JSON 选择器走 json_value、JSON 值 cast 走 json_query、
 // lateral join 不支持；其余（straight join、timeout 提示等）继承 MySQL。
 type MariaDbGrammar struct {

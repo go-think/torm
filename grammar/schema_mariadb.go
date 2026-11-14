@@ -1,10 +1,10 @@
 package grammar
 
-// ---- MariaDB Schema 编译（对齐 Illuminate\Database\Schema\Grammars\MariaDbGrammar） ----
+// ---- MariaDB Schema 编译 ----
 //
-// MariaDB 的 Schema 编译继承 MySqlGrammar（对齐 Laravel：MariaDbGrammar 未覆写任何
+// MariaDB 的 Schema 编译继承 MySqlGrammar（MariaDB 方言未覆写任何
 // schema compile 方法）。与任务书“json→longtext with json_check”的差异说明：
-// Laravel 13.30 的 MariaDbGrammar 继承 MySqlGrammar::typeJson 返回 `json`
+// 上游参考实现的 typeJson 继承自 MySQL 方言、返回 `json`
 // （MariaDB 10.5+ 的 `json` 本身就是 longtext + json_valid check 的服务端别名），
 // 因此本实现同样输出 `json`，语义等价于 longtext with json_valid 校验。
 //
